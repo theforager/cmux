@@ -409,6 +409,7 @@ USAGE:
     cmux new [path]          Create new session (default: current dir)
     cmux list                List all sessions
     cmux attach <name>       Attach to session
+    cmux switch              Switch sessions (inside tmux)
     cmux kill <name>         Kill a session
     cmux rename <name>       Rename current session
     cmux title <text>        Set session title

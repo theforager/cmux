@@ -284,8 +284,36 @@ cmd_info() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Interactive Selector
+# Interactive Selector (arrow key navigation)
 # ─────────────────────────────────────────────────────────────────────────────
+
+# Read a single keypress (handles arrow keys)
+read_key() {
+    local key
+    IFS= read -rsn1 key 2>/dev/null || return 1
+
+    # Handle escape sequences (arrow keys)
+    if [[ "$key" == $'\e' ]]; then
+        read -rsn2 -t 0.1 key 2>/dev/null || true
+        case "$key" in
+            '[A') echo "up" ;;
+            '[B') echo "down" ;;
+            *) echo "escape" ;;
+        esac
+    elif [[ "$key" == "" ]]; then
+        echo "enter"
+    elif [[ "$key" == "q" || "$key" == "Q" ]]; then
+        echo "quit"
+    elif [[ "$key" == "n" || "$key" == "N" ]]; then
+        echo "new"
+    elif [[ "$key" == "j" ]]; then
+        echo "down"
+    elif [[ "$key" == "k" ]]; then
+        echo "up"
+    else
+        echo "$key"
+    fi
+}
 
 show_selector() {
     local mode="${1:-attach}"  # attach or switch
@@ -293,12 +321,10 @@ show_selector() {
     local sessions
     sessions=$(get_sessions)
 
-    # Build menu
-    echo ""
-    echo "CMUX Sessions"
-    echo ""
-
     if [[ -z "$sessions" ]]; then
+        echo ""
+        echo "CMUX Sessions"
+        echo ""
         echo "  No active sessions"
         echo ""
         echo "────────────────────────"
@@ -314,21 +340,16 @@ show_selector() {
                 read -r path
                 cmd_new "${path:-.}"
                 ;;
-            q|Q|"")
-                return 0
-                ;;
             *)
-                echo "Invalid choice"
-                return 1
+                return 0
                 ;;
         esac
         return 0
     fi
 
-    # Build session list (bash 3.2 compatible - no associative arrays)
+    # Build session list (bash 3.2 compatible)
+    local session_count=0
     local session_data=""
-    local session_list=""
-    local idx=1
 
     while IFS='|' read -r name created; do
         local parent child title age
@@ -337,67 +358,148 @@ show_selector() {
         title=$(get_session_title "$name")
         age=$(format_age "$created")
 
+        session_count=$((session_count + 1))
         # Store: idx|parent|child|title|age|fullname
-        session_data="${session_data}${idx}|${parent}|${child}|${title}|${age}|${name}"$'\n'
-        session_list="${session_list}${name}"$'\n'
-        idx=$((idx + 1))
+        session_data="${session_data}${session_count}|${parent}|${child}|${title}|${age}|${name}"$'\n'
     done <<< "$sessions"
 
-    # Get unique parents (sorted)
-    local parents
-    parents=$(echo "$session_data" | cut -d'|' -f2 | sort -u)
+    # Menu items: sessions + "New session" + "Quit"
+    local total_items=$((session_count + 2))
+    local new_idx=$((session_count + 1))
+    local quit_idx=$((session_count + 2))
+    local selected=1
 
-    # Display grouped by parent
-    for parent in $parents; do
-        echo "$parent"
-        echo "$session_data" | while IFS='|' read -r num p child title age fullname; do
-            [[ -z "$num" ]] && continue
-            [[ "$p" != "$parent" ]] && continue
-            if [[ -n "$title" ]]; then
-                printf "  %2s) %-20s [%-20s] %s\n" "$num" "$child" "$title" "$age"
-            else
-                printf "  %2s) %-20s %-22s %s\n" "$num" "$child" "—" "$age"
-            fi
-        done
+    # Hide cursor
+    printf '\e[?25l'
+
+    # Cleanup on exit
+    trap 'printf "\e[?25h"; stty echo 2>/dev/null' EXIT INT TERM
+
+    # Disable echo for key reading
+    stty -echo 2>/dev/null || true
+
+    while true; do
+        # Clear screen and draw menu
+        printf '\e[H\e[2J'
         echo ""
-    done
+        echo "CMUX Sessions  (↑/↓ or j/k to move, Enter to select)"
+        echo ""
 
-    echo "────────────────────────"
-    echo "[n] New session"
-    echo "[q] Quit"
-    echo ""
-    printf "Select: "
-    read -r choice
+        # Get unique parents (sorted)
+        local parents
+        parents=$(echo "$session_data" | cut -d'|' -f2 | sort -u)
 
-    case "$choice" in
-        n|N)
-            printf "Path: "
-            read -r path
-            cmd_new "${path:-.}"
-            ;;
-        q|Q|"")
-            return 0
-            ;;
-        [0-9]*)
-            # Get session by index from session_data (idx is field 1, fullname is field 6)
-            local target_session
-            target_session=$(echo "$session_data" | awk -F'|' -v idx="$choice" '$1 == idx {print $6}')
-            if [[ -n "$target_session" ]]; then
-                if [[ "$mode" == "switch" ]] || is_inside_tmux; then
-                    tmux switch-client -t "$target_session"
-                else
-                    tmux attach-session -t "$target_session"
+        # Display grouped by parent
+        local display_idx=0
+        for parent in $parents; do
+            echo "$parent"
+            echo "$session_data" | while IFS='|' read -r num p child title age fullname; do
+                [[ -z "$num" ]] && continue
+                [[ "$p" != "$parent" ]] && continue
+
+                local prefix="  "
+                local suffix=""
+                if [[ "$num" -eq "$selected" ]]; then
+                    prefix="> "
+                    suffix=" <"
                 fi
-            else
-                echo "Invalid selection"
-                return 1
-            fi
-            ;;
-        *)
-            echo "Invalid choice"
-            return 1
-            ;;
-    esac
+
+                if [[ -n "$title" ]]; then
+                    printf "%s%2s) %-20s [%-20s] %s%s\n" "$prefix" "$num" "$child" "$title" "$age" "$suffix"
+                else
+                    printf "%s%2s) %-20s %-22s %s%s\n" "$prefix" "$num" "$child" "—" "$age" "$suffix"
+                fi
+            done
+            echo ""
+        done
+
+        echo "────────────────────────"
+
+        # New session option
+        if [[ "$selected" -eq "$new_idx" ]]; then
+            echo "> [n] New session <"
+        else
+            echo "  [n] New session"
+        fi
+
+        # Quit option
+        if [[ "$selected" -eq "$quit_idx" ]]; then
+            echo "> [q] Quit <"
+        else
+            echo "  [q] Quit"
+        fi
+
+        # Read key
+        local key
+        key=$(read_key)
+
+        case "$key" in
+            up)
+                selected=$((selected - 1))
+                [[ "$selected" -lt 1 ]] && selected=$total_items
+                ;;
+            down)
+                selected=$((selected + 1))
+                [[ "$selected" -gt "$total_items" ]] && selected=1
+                ;;
+            enter)
+                # Restore terminal
+                printf '\e[?25h'
+                stty echo 2>/dev/null || true
+
+                if [[ "$selected" -eq "$quit_idx" ]]; then
+                    return 0
+                elif [[ "$selected" -eq "$new_idx" ]]; then
+                    printf "Path: "
+                    read -r path
+                    cmd_new "${path:-.}"
+                    return 0
+                else
+                    # Get session by index
+                    local target_session
+                    target_session=$(echo "$session_data" | awk -F'|' -v idx="$selected" '$1 == idx {print $6}')
+                    if [[ -n "$target_session" ]]; then
+                        if [[ "$mode" == "switch" ]] || is_inside_tmux; then
+                            tmux switch-client -t "$target_session"
+                        else
+                            tmux attach-session -t "$target_session"
+                        fi
+                    fi
+                    return 0
+                fi
+                ;;
+            quit)
+                printf '\e[?25h'
+                stty echo 2>/dev/null || true
+                return 0
+                ;;
+            new)
+                printf '\e[?25h'
+                stty echo 2>/dev/null || true
+                printf "Path: "
+                read -r path
+                cmd_new "${path:-.}"
+                return 0
+                ;;
+            [1-9])
+                # Direct number selection
+                if [[ "$key" -le "$session_count" ]]; then
+                    printf '\e[?25h'
+                    stty echo 2>/dev/null || true
+                    local target_session
+                    target_session=$(echo "$session_data" | awk -F'|' -v idx="$key" '$1 == idx {print $6}')
+                    if [[ -n "$target_session" ]]; then
+                        if [[ "$mode" == "switch" ]] || is_inside_tmux; then
+                            tmux switch-client -t "$target_session"
+                        else
+                            tmux attach-session -t "$target_session"
+                        fi
+                    fi
+                    return 0
+                fi
+                ;;
+        esac
+    done
 }
 
 cmd_help() {

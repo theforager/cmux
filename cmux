@@ -409,12 +409,15 @@ USAGE:
     cmux new [path]          Create new session (default: current dir)
     cmux list                List all sessions
     cmux attach <name>       Attach to session
-    cmux switch              Switch sessions (inside tmux)
     cmux kill <name>         Kill a session
     cmux rename <name>       Rename current session
     cmux title <text>        Set session title
     cmux info                Show current session info
     cmux help                Show this help
+
+ALIASES:
+    s = selector (same as cmux), sw = switch, ls = list, a = attach
+    k = kill, t = title, i = info
 
 EXAMPLES:
     cmux new ~/projects/my-app    Create session for my-app
@@ -439,9 +442,7 @@ main() {
 
     case "$cmd" in
         "")
-            if is_inside_tmux; then
-                die "Already in tmux. Run: cmux switch"
-            fi
+            # Show selector - uses switch if inside tmux, attach otherwise
             show_selector attach
             ;;
         new)
@@ -456,6 +457,10 @@ main() {
             ;;
         switch|sw)
             cmd_switch
+            ;;
+        selector|s)
+            # Selector works from anywhere - uses switch if inside tmux, attach otherwise
+            show_selector attach
             ;;
         kill|k)
             [[ -z "${1:-}" ]] && die "Usage: cmux kill <name>"

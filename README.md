@@ -97,15 +97,16 @@ cp commands/cmux_name.md ~/.claude/commands/
 
 ## Commands Reference
 
-| Command | Description |
-|---------|-------------|
-| `cmux` | Interactive session selector |
-| `cmux new [path]` | Create new session (default: cwd) |
-| `cmux list` | List all sessions |
-| `cmux attach <name>` | Attach to session |
-| `cmux switch` | Switch sessions (inside tmux) |
-| `cmux kill <name>` | Kill a session |
-| `cmux rename <name>` | Rename current session |
-| `cmux title <text>` | Set session title |
-| `cmux info` | Show current session info |
-| `cmux help` | Show help |
+| Command | Alias | Description |
+|---------|-------|-------------|
+| `cmux` | | Interactive session selector (outside tmux) |
+| `cmux selector` | `s` | Interactive session selector (works anywhere) |
+| `cmux new [path]` | | Create new session (default: cwd) |
+| `cmux list` | `ls` | List all sessions |
+| `cmux attach <name>` | `a` | Attach to session |
+| `cmux switch` | `sw` | Switch sessions (inside tmux only) |
+| `cmux kill <name>` | `k` | Kill a session |
+| `cmux rename <name>` | | Rename current session |
+| `cmux title <text>` | `t` | Set session title |
+| `cmux info` | `i` | Show current session info |
+| `cmux help` | | Show help |

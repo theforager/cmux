@@ -325,35 +325,34 @@ show_selector() {
         return 0
     fi
 
-    # Group sessions by parent
-    declare -A parents
-    declare -a session_list
+    # Build session list (bash 3.2 compatible - no associative arrays)
+    local session_data=""
+    local session_list=""
     local idx=1
 
     while IFS='|' read -r name created; do
-        local parent
+        local parent child title age
         parent=$(get_session_parent "$name")
-        local child
         child=$(get_session_child "$name")
-        local title
         title=$(get_session_title "$name")
-        local age
         age=$(format_age "$created")
 
-        session_list+=("$name")
-
-        if [[ -z "${parents[$parent]:-}" ]]; then
-            parents[$parent]=""
-        fi
-        parents[$parent]+="${idx}|${child}|${title}|${age}\n"
-        ((idx++))
+        # Store: idx|parent|child|title|age|fullname
+        session_data="${session_data}${idx}|${parent}|${child}|${title}|${age}|${name}"$'\n'
+        session_list="${session_list}${name}"$'\n'
+        idx=$((idx + 1))
     done <<< "$sessions"
 
-    # Display grouped
-    for parent in $(echo "${!parents[@]}" | tr ' ' '\n' | sort); do
+    # Get unique parents (sorted)
+    local parents
+    parents=$(echo "$session_data" | cut -d'|' -f2 | sort -u)
+
+    # Display grouped by parent
+    for parent in $parents; do
         echo "$parent"
-        echo -e "${parents[$parent]}" | while IFS='|' read -r num child title age; do
+        echo "$session_data" | while IFS='|' read -r num p child title age fullname; do
             [[ -z "$num" ]] && continue
+            [[ "$p" != "$parent" ]] && continue
             if [[ -n "$title" ]]; then
                 printf "  %2s) %-20s [%-20s] %s\n" "$num" "$child" "$title" "$age"
             else
@@ -380,9 +379,10 @@ show_selector() {
             return 0
             ;;
         [0-9]*)
-            local target_idx=$((choice - 1))
-            if ((target_idx >= 0 && target_idx < ${#session_list[@]})); then
-                local target_session="${session_list[$target_idx]}"
+            # Get session by index from session_data (idx is field 1, fullname is field 6)
+            local target_session
+            target_session=$(echo "$session_data" | awk -F'|' -v idx="$choice" '$1 == idx {print $6}')
+            if [[ -n "$target_session" ]]; then
                 if [[ "$mode" == "switch" ]] || is_inside_tmux; then
                     tmux switch-client -t "$target_session"
                 else

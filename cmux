@@ -1,0 +1,487 @@
+#!/usr/bin/env bash
+#
+# cmux - Claude Tmux Session Manager
+# Manage multiple Claude Code sessions via tmux
+#
+
+set -euo pipefail
+
+VERSION="1.0.0"
+# Using @ as separator since colons conflict with tmux session:window syntax
+# and underscores are common in directory names
+CMUX_PREFIX="cmux"
+CMUX_SEP="@"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+die() {
+    echo "Error: $1" >&2
+    exit 1
+}
+
+is_inside_tmux() {
+    [[ -n "${TMUX:-}" ]]
+}
+
+# Get all cmux sessions (sessions starting with cmux prefix)
+get_sessions() {
+    tmux list-sessions -F "#{session_name}|#{session_created}" 2>/dev/null | \
+        grep "^${CMUX_PREFIX}${CMUX_SEP}" || true
+}
+
+# Get session title from tmux environment
+get_session_title() {
+    local session="$1"
+    tmux show-environment -t "$session" CMUX_TITLE 2>/dev/null | sed 's/^CMUX_TITLE=//' || echo ""
+}
+
+# Get session working directory
+get_session_dir() {
+    local session="$1"
+    tmux show-environment -t "$session" CMUX_DIR 2>/dev/null | sed 's/^CMUX_DIR=//' || echo ""
+}
+
+# Format age from seconds to human readable
+format_age() {
+    local created="$1"
+    local now
+    now=$(date +%s)
+    local diff=$((now - created))
+
+    if ((diff < 60)); then
+        echo "${diff}s"
+    elif ((diff < 3600)); then
+        echo "$((diff / 60))m"
+    elif ((diff < 86400)); then
+        echo "$((diff / 3600))h"
+    else
+        echo "$((diff / 86400))d"
+    fi
+}
+
+# Generate session name from path
+# /projects/rebar-cosmos/aggregation-logic → cmux_rebar-cosmos_aggregation-logic
+generate_session_name() {
+    local path="$1"
+    local abs_path
+    abs_path=$(cd "$path" && pwd)
+
+    local parent
+    parent=$(basename "$(dirname "$abs_path")")
+    local child
+    child=$(basename "$abs_path")
+
+    local base_name="${CMUX_PREFIX}${CMUX_SEP}${parent}${CMUX_SEP}${child}"
+    local name="$base_name"
+    local counter=2
+
+    # Handle duplicates
+    while tmux has-session -t "$name" 2>/dev/null; do
+        name="${base_name}-${counter}"
+        ((counter++))
+    done
+
+    echo "$name"
+}
+
+# Extract parent from session name for grouping
+# cmux@rebar-cosmos@aggregation-logic → rebar-cosmos
+get_session_parent() {
+    local session="$1"
+    echo "$session" | cut -d"${CMUX_SEP}" -f2
+}
+
+# Extract child from session name
+# cmux@rebar-cosmos@aggregation-logic → aggregation-logic
+get_session_child() {
+    local session="$1"
+    echo "$session" | cut -d"${CMUX_SEP}" -f3-
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Commands
+# ─────────────────────────────────────────────────────────────────────────────
+
+cmd_new() {
+    local path="${1:-.}"
+
+    # Validate path
+    if [[ ! -d "$path" ]]; then
+        die "Directory does not exist: $path"
+    fi
+
+    local abs_path
+    abs_path=$(cd "$path" && pwd)
+
+    local session_name
+    session_name=$(generate_session_name "$abs_path")
+
+    # Create session
+    tmux new-session -d -s "$session_name" -c "$abs_path"
+
+    # Set environment variables
+    tmux set-environment -t "$session_name" CMUX_SESSION "$session_name"
+    tmux set-environment -t "$session_name" CMUX_DIR "$abs_path"
+
+    # Launch claude in the session
+    tmux send-keys -t "$session_name" "claude" Enter
+
+    echo "Created session: $session_name"
+
+    # Attach or switch
+    if is_inside_tmux; then
+        tmux switch-client -t "$session_name"
+    else
+        tmux attach-session -t "$session_name"
+    fi
+}
+
+cmd_list() {
+    local sessions
+    sessions=$(get_sessions)
+
+    if [[ -z "$sessions" ]]; then
+        echo "No cmux sessions"
+        return 0
+    fi
+
+    echo "$sessions" | while IFS='|' read -r name created; do
+        local title
+        title=$(get_session_title "$name")
+        local age
+        age=$(format_age "$created")
+        local child
+        child=$(get_session_child "$name")
+
+        if [[ -n "$title" ]]; then
+            printf "%s\t[%s]\t%s\n" "$child" "$title" "$age"
+        else
+            printf "%s\t\t%s\n" "$child" "$age"
+        fi
+    done
+}
+
+cmd_attach() {
+    local target="$1"
+
+    # Try exact match first (full name with any parent)
+    local session=""
+    session=$(get_sessions | cut -d'|' -f1 | grep -E "${CMUX_SEP}${target}\$" | head -1)
+
+    if [[ -z "$session" ]]; then
+        # Try partial match
+        session=$(get_sessions | cut -d'|' -f1 | grep -F "$target" | head -1)
+    fi
+
+    if [[ -z "$session" ]]; then
+        die "No session matching: $target"
+    fi
+
+    if is_inside_tmux; then
+        tmux switch-client -t "$session"
+    else
+        tmux attach-session -t "$session"
+    fi
+}
+
+cmd_switch() {
+    if ! is_inside_tmux; then
+        die "Not inside tmux. Use 'cmux' instead."
+    fi
+
+    show_selector switch
+}
+
+cmd_kill() {
+    local target="$1"
+
+    # Try exact match first (full name with any parent)
+    local session=""
+    session=$(get_sessions | cut -d'|' -f1 | grep -E "${CMUX_SEP}${target}\$" | head -1)
+
+    if [[ -z "$session" ]]; then
+        # Try partial match
+        session=$(get_sessions | cut -d'|' -f1 | grep -F "$target" | head -1)
+    fi
+
+    if [[ -z "$session" ]]; then
+        die "No session matching: $target"
+    fi
+
+    tmux kill-session -t "$session"
+    echo "Killed session: $session"
+}
+
+cmd_rename() {
+    local new_name="$1"
+
+    if ! is_inside_tmux; then
+        die "Not inside tmux session"
+    fi
+
+    local current
+    current=$(tmux display-message -p '#{session_name}')
+
+    if [[ ! "$current" =~ ^${CMUX_PREFIX}${CMUX_SEP} ]]; then
+        die "Not in a cmux session"
+    fi
+
+    # Build new full name preserving prefix structure
+    local parent
+    parent=$(get_session_parent "$current")
+    local new_full="${CMUX_PREFIX}${CMUX_SEP}${parent}${CMUX_SEP}${new_name}"
+
+    tmux rename-session -t "$current" "$new_full"
+    tmux set-environment -t "$new_full" CMUX_SESSION "$new_full"
+    echo "Renamed to: $new_full"
+}
+
+cmd_title() {
+    local title="$1"
+
+    if ! is_inside_tmux; then
+        die "Not inside tmux session"
+    fi
+
+    local current
+    current=$(tmux display-message -p '#{session_name}')
+
+    if [[ ! "$current" =~ ^${CMUX_PREFIX}${CMUX_SEP} ]]; then
+        die "Not in a cmux session"
+    fi
+
+    tmux set-environment -t "$current" CMUX_TITLE "$title"
+    echo "Title set: $title"
+}
+
+cmd_info() {
+    if ! is_inside_tmux; then
+        die "Not inside tmux session"
+    fi
+
+    local current
+    current=$(tmux display-message -p '#{session_name}')
+
+    if [[ ! "$current" =~ ^${CMUX_PREFIX}${CMUX_SEP} ]]; then
+        die "Not in a cmux session"
+    fi
+
+    local title
+    title=$(get_session_title "$current")
+    local dir
+    dir=$(get_session_dir "$current")
+    local created
+    created=$(tmux display-message -p -t "$current" '#{session_created}')
+    local age
+    age=$(format_age "$created")
+
+    echo "Session: $current"
+    echo "Directory: $dir"
+    echo "Title: ${title:-<not set>}"
+    echo "Age: $age"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Interactive Selector
+# ─────────────────────────────────────────────────────────────────────────────
+
+show_selector() {
+    local mode="${1:-attach}"  # attach or switch
+
+    local sessions
+    sessions=$(get_sessions)
+
+    # Build menu
+    echo ""
+    echo "CMUX Sessions"
+    echo ""
+
+    if [[ -z "$sessions" ]]; then
+        echo "  No active sessions"
+        echo ""
+        echo "────────────────────────"
+        echo "[n] New session"
+        echo "[q] Quit"
+        echo ""
+        printf "Select: "
+        read -r choice
+
+        case "$choice" in
+            n|N)
+                printf "Path: "
+                read -r path
+                cmd_new "${path:-.}"
+                ;;
+            q|Q|"")
+                return 0
+                ;;
+            *)
+                echo "Invalid choice"
+                return 1
+                ;;
+        esac
+        return 0
+    fi
+
+    # Group sessions by parent
+    declare -A parents
+    declare -a session_list
+    local idx=1
+
+    while IFS='|' read -r name created; do
+        local parent
+        parent=$(get_session_parent "$name")
+        local child
+        child=$(get_session_child "$name")
+        local title
+        title=$(get_session_title "$name")
+        local age
+        age=$(format_age "$created")
+
+        session_list+=("$name")
+
+        if [[ -z "${parents[$parent]:-}" ]]; then
+            parents[$parent]=""
+        fi
+        parents[$parent]+="${idx}|${child}|${title}|${age}\n"
+        ((idx++))
+    done <<< "$sessions"
+
+    # Display grouped
+    for parent in $(echo "${!parents[@]}" | tr ' ' '\n' | sort); do
+        echo "$parent"
+        echo -e "${parents[$parent]}" | while IFS='|' read -r num child title age; do
+            [[ -z "$num" ]] && continue
+            if [[ -n "$title" ]]; then
+                printf "  %2s) %-20s [%-20s] %s\n" "$num" "$child" "$title" "$age"
+            else
+                printf "  %2s) %-20s %-22s %s\n" "$num" "$child" "—" "$age"
+            fi
+        done
+        echo ""
+    done
+
+    echo "────────────────────────"
+    echo "[n] New session"
+    echo "[q] Quit"
+    echo ""
+    printf "Select: "
+    read -r choice
+
+    case "$choice" in
+        n|N)
+            printf "Path: "
+            read -r path
+            cmd_new "${path:-.}"
+            ;;
+        q|Q|"")
+            return 0
+            ;;
+        [0-9]*)
+            local target_idx=$((choice - 1))
+            if ((target_idx >= 0 && target_idx < ${#session_list[@]})); then
+                local target_session="${session_list[$target_idx]}"
+                if [[ "$mode" == "switch" ]] || is_inside_tmux; then
+                    tmux switch-client -t "$target_session"
+                else
+                    tmux attach-session -t "$target_session"
+                fi
+            else
+                echo "Invalid selection"
+                return 1
+            fi
+            ;;
+        *)
+            echo "Invalid choice"
+            return 1
+            ;;
+    esac
+}
+
+cmd_help() {
+    cat <<EOF
+cmux v${VERSION} - Claude Tmux Session Manager
+
+USAGE:
+    cmux                     Interactive session selector
+    cmux new [path]          Create new session (default: current dir)
+    cmux list                List all sessions
+    cmux attach <name>       Attach to session
+    cmux switch              Switch sessions (inside tmux)
+    cmux kill <name>         Kill a session
+    cmux rename <name>       Rename current session
+    cmux title <text>        Set session title
+    cmux info                Show current session info
+    cmux help                Show this help
+
+EXAMPLES:
+    cmux new ~/projects/my-app    Create session for my-app
+    cmux attach my-app            Attach to my-app session
+    cmux title "fixing auth bug"  Set descriptive title
+
+EOF
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
+main() {
+    # Check tmux is available
+    if ! command -v tmux &>/dev/null; then
+        die "tmux is not installed"
+    fi
+
+    local cmd="${1:-}"
+    shift || true
+
+    case "$cmd" in
+        "")
+            if is_inside_tmux; then
+                die "Already in tmux. Run: cmux switch"
+            fi
+            show_selector attach
+            ;;
+        new)
+            cmd_new "${1:-.}"
+            ;;
+        list|ls)
+            cmd_list
+            ;;
+        attach|a)
+            [[ -z "${1:-}" ]] && die "Usage: cmux attach <name>"
+            cmd_attach "$1"
+            ;;
+        switch|sw)
+            cmd_switch
+            ;;
+        kill|k)
+            [[ -z "${1:-}" ]] && die "Usage: cmux kill <name>"
+            cmd_kill "$1"
+            ;;
+        rename)
+            [[ -z "${1:-}" ]] && die "Usage: cmux rename <new-name>"
+            cmd_rename "$1"
+            ;;
+        title|t)
+            [[ -z "${1:-}" ]] && die "Usage: cmux title <text>"
+            cmd_title "$1"
+            ;;
+        info|i)
+            cmd_info
+            ;;
+        help|--help|-h)
+            cmd_help
+            ;;
+        version|--version|-v)
+            echo "cmux v${VERSION}"
+            ;;
+        *)
+            die "Unknown command: $cmd. Run 'cmux help' for usage."
+            ;;
+    esac
+}
+
+main "$@"

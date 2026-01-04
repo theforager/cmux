@@ -47,12 +47,12 @@ cmux info                     # Show current session info
 ```
 CMUX Sessions
 
-rebar-cosmos
-   1) aggregation-logic  [fixing auth bug]     2h
-   2) builtins           [adding test suite]   15m
+my-project
+   1) api                 [fixing auth bug]     2h
+   2) worker              [adding test suite]   15m
 
-rebar-cosmos-frontend
-   3) dashboard          —                     1d
+my-project-frontend
+   3) dashboard           —                     1d
 
 ────────────────────────
 [n] New session
@@ -71,10 +71,10 @@ Sessions are grouped by parent directory and show:
 Sessions are named based on directory structure using `@` as separator:
 
 ```
-/projects/rebar-cosmos/aggregation-logic → cmux@rebar-cosmos@aggregation-logic
+/projects/my-project/api → cmux@my-project@api
 ```
 
-If a duplicate exists, a numeric suffix is added (e.g., `cmux@rebar-cosmos@aggregation-logic-2`).
+If a duplicate exists, a numeric suffix is added (e.g., `cmux@my-project@api-2`).
 
 ## Terminus Setup
 

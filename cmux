@@ -385,68 +385,73 @@ show_selector() {
     local quit_idx=$((session_count + 2))
     local selected=1
 
-    # Hide cursor
-    printf '\e[?25l'
+    # Hide cursor and clear screen once
+    printf '\e[?25l\e[2J'
 
     # Cleanup on exit
-    trap 'printf "\e[?25h"; stty echo 2>/dev/null' EXIT INT TERM
+    trap 'printf "\e[?25h\e[?1049l"; stty echo 2>/dev/null' EXIT INT TERM
 
     # Disable echo for key reading
     stty -echo 2>/dev/null || true
 
-    while true; do
-        # Clear screen and draw menu
-        printf '\e[H\e[2J'
-        echo ""
-        printf "${C_BOLD}${C_CYAN}CMUX Sessions${C_RESET}  ${C_DIM}↑/↓ move · enter select · q quit${C_RESET}\n"
-        echo ""
+    # Get unique parents (sorted) - compute once
+    local parents
+    parents=$(echo "$session_data" | cut -d'|' -f2 | sort -u)
 
-        # Get unique parents (sorted)
-        local parents
-        parents=$(echo "$session_data" | cut -d'|' -f2 | sort -u)
+    while true; do
+        # Move cursor to home (no clear - just overwrite)
+        printf '\e[H'
+
+        # Build output in variable to reduce flicker
+        local output=""
+        output+="\n"
+        output+="${C_BOLD}${C_CYAN}CMUX Sessions${C_RESET}  ${C_DIM}↑/↓ move · enter select · q quit${C_RESET}\e[K\n"
+        output+="\n"
 
         # Display grouped by parent
-        local display_idx=0
         for parent in $parents; do
-            printf "${C_BOLD}${C_BLUE}%s${C_RESET}\n" "$parent"
-            echo "$session_data" | while IFS='|' read -r num p child title age fullname; do
+            output+="${C_BOLD}${C_BLUE}${parent}${C_RESET}\e[K\n"
+            while IFS='|' read -r num p child title age fullname; do
                 [[ -z "$num" ]] && continue
                 [[ "$p" != "$parent" ]] && continue
 
                 if [[ "$num" -eq "$selected" ]]; then
                     # Selected item - highlighted
                     if [[ -n "$title" ]]; then
-                        printf "${C_GREEN}▸ %2s) ${C_BOLD}%-20s${C_RESET} ${C_DIM}[%-20s]${C_RESET} ${C_DIM}%s${C_RESET}\n" "$num" "$child" "$title" "$age"
+                        output+="${C_GREEN}▸ $(printf '%2s' "$num")) ${C_BOLD}$(printf '%-20s' "$child")${C_RESET} ${C_DIM}[$(printf '%-20s' "$title")]${C_RESET} ${C_DIM}${age}${C_RESET}\e[K\n"
                     else
-                        printf "${C_GREEN}▸ %2s) ${C_BOLD}%-20s${C_RESET} ${C_DIM}%-22s${C_RESET} ${C_DIM}%s${C_RESET}\n" "$num" "$child" "" "$age"
+                        output+="${C_GREEN}▸ $(printf '%2s' "$num")) ${C_BOLD}$(printf '%-20s' "$child")${C_RESET} ${C_DIM}$(printf '%-22s' "")${C_RESET} ${C_DIM}${age}${C_RESET}\e[K\n"
                     fi
                 else
                     # Normal item
                     if [[ -n "$title" ]]; then
-                        printf "  %2s) ${C_CYAN}%-20s${C_RESET} ${C_DIM}[%-20s]${C_RESET} ${C_DIM}%s${C_RESET}\n" "$num" "$child" "$title" "$age"
+                        output+="  $(printf '%2s' "$num")) ${C_CYAN}$(printf '%-20s' "$child")${C_RESET} ${C_DIM}[$(printf '%-20s' "$title")]${C_RESET} ${C_DIM}${age}${C_RESET}\e[K\n"
                     else
-                        printf "  %2s) ${C_CYAN}%-20s${C_RESET} ${C_DIM}%-22s${C_RESET} ${C_DIM}%s${C_RESET}\n" "$num" "$child" "" "$age"
+                        output+="  $(printf '%2s' "$num")) ${C_CYAN}$(printf '%-20s' "$child")${C_RESET} ${C_DIM}$(printf '%-22s' "")${C_RESET} ${C_DIM}${age}${C_RESET}\e[K\n"
                     fi
                 fi
-            done
-            echo ""
+            done <<< "$session_data"
+            output+="\e[K\n"
         done
 
-        printf "${C_DIM}────────────────────────${C_RESET}\n"
+        output+="${C_DIM}────────────────────────${C_RESET}\e[K\n"
 
         # New session option
         if [[ "$selected" -eq "$new_idx" ]]; then
-            printf "${C_GREEN}▸${C_RESET} ${C_YELLOW}[n]${C_RESET} ${C_BOLD}New session${C_RESET}\n"
+            output+="${C_GREEN}▸${C_RESET} ${C_YELLOW}[n]${C_RESET} ${C_BOLD}New session${C_RESET}\e[K\n"
         else
-            printf "  ${C_DIM}[n]${C_RESET} New session\n"
+            output+="  ${C_DIM}[n]${C_RESET} New session\e[K\n"
         fi
 
         # Quit option
         if [[ "$selected" -eq "$quit_idx" ]]; then
-            printf "${C_GREEN}▸${C_RESET} ${C_DIM}[q]${C_RESET} ${C_BOLD}Quit${C_RESET}\n"
+            output+="${C_GREEN}▸${C_RESET} ${C_DIM}[q]${C_RESET} ${C_BOLD}Quit${C_RESET}\e[K\n"
         else
-            printf "  ${C_DIM}[q]${C_RESET} Quit\n"
+            output+="  ${C_DIM}[q]${C_RESET} Quit\e[K\n"
         fi
+
+        # Print all at once
+        printf '%b' "$output"
 
         # Read key
         local key

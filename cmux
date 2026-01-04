@@ -303,26 +303,32 @@ read_key() {
     IFS= read -rsn1 key 2>/dev/null || return 1
 
     # Handle escape sequences (arrow keys)
+    # Note: bash 3.2 doesn't support fractional -t, so we use -t1
+    # but read the escape sequence bytes immediately
     if [[ "$key" == $'\e' ]]; then
-        read -rsn2 -t 0.1 key 2>/dev/null || true
-        case "$key" in
-            '[A') echo "up" ;;
-            '[B') echo "down" ;;
-            *) echo "escape" ;;
-        esac
-    elif [[ "$key" == "" ]]; then
-        echo "enter"
-    elif [[ "$key" == "q" || "$key" == "Q" ]]; then
-        echo "quit"
-    elif [[ "$key" == "n" || "$key" == "N" ]]; then
-        echo "new"
-    elif [[ "$key" == "j" ]]; then
-        echo "down"
-    elif [[ "$key" == "k" ]]; then
-        echo "up"
-    else
-        echo "$key"
+        local seq
+        read -rsn1 -t1 seq 2>/dev/null || true
+        if [[ "$seq" == "[" ]]; then
+            read -rsn1 -t1 seq 2>/dev/null || true
+            case "$seq" in
+                'A') echo "up"; return ;;
+                'B') echo "down"; return ;;
+                'C') echo "right"; return ;;
+                'D') echo "left"; return ;;
+            esac
+        fi
+        echo "escape"
+        return
     fi
+
+    case "$key" in
+        '') echo "enter" ;;
+        q|Q) echo "quit" ;;
+        n|N) echo "new" ;;
+        j) echo "down" ;;
+        k) echo "up" ;;
+        *) echo "$key" ;;
+    esac
 }
 
 show_selector() {

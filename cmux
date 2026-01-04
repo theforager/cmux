@@ -12,6 +12,16 @@ VERSION="1.0.0"
 CMUX_PREFIX="cmux"
 CMUX_SEP="@"
 
+# Colors (subtle, modern palette)
+C_RESET='\e[0m'
+C_BOLD='\e[1m'
+C_DIM='\e[2m'
+C_CYAN='\e[36m'
+C_GREEN='\e[32m'
+C_YELLOW='\e[33m'
+C_BLUE='\e[34m'
+C_MAGENTA='\e[35m'
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -323,15 +333,15 @@ show_selector() {
 
     if [[ -z "$sessions" ]]; then
         echo ""
-        echo "CMUX Sessions"
+        printf "${C_BOLD}${C_CYAN}CMUX Sessions${C_RESET}\n"
         echo ""
-        echo "  No active sessions"
+        printf "  ${C_DIM}No active sessions${C_RESET}\n"
         echo ""
-        echo "────────────────────────"
-        echo "[n] New session"
-        echo "[q] Quit"
+        printf "${C_DIM}────────────────────────${C_RESET}\n"
+        printf "  ${C_YELLOW}[n]${C_RESET} New session\n"
+        printf "  ${C_DIM}[q]${C_RESET} Quit\n"
         echo ""
-        printf "Select: "
+        printf "${C_DIM}Select:${C_RESET} "
         read -r choice
 
         case "$choice" in
@@ -382,7 +392,7 @@ show_selector() {
         # Clear screen and draw menu
         printf '\e[H\e[2J'
         echo ""
-        echo "CMUX Sessions  (↑/↓ or j/k to move, Enter to select)"
+        printf "${C_BOLD}${C_CYAN}CMUX Sessions${C_RESET}  ${C_DIM}↑/↓ move · enter select · q quit${C_RESET}\n"
         echo ""
 
         # Get unique parents (sorted)
@@ -392,41 +402,44 @@ show_selector() {
         # Display grouped by parent
         local display_idx=0
         for parent in $parents; do
-            echo "$parent"
+            printf "${C_BOLD}${C_BLUE}%s${C_RESET}\n" "$parent"
             echo "$session_data" | while IFS='|' read -r num p child title age fullname; do
                 [[ -z "$num" ]] && continue
                 [[ "$p" != "$parent" ]] && continue
 
-                local prefix="  "
-                local suffix=""
                 if [[ "$num" -eq "$selected" ]]; then
-                    prefix="> "
-                    suffix=" <"
-                fi
-
-                if [[ -n "$title" ]]; then
-                    printf "%s%2s) %-20s [%-20s] %s%s\n" "$prefix" "$num" "$child" "$title" "$age" "$suffix"
+                    # Selected item - highlighted
+                    if [[ -n "$title" ]]; then
+                        printf "${C_GREEN}▸ %2s) ${C_BOLD}%-20s${C_RESET} ${C_DIM}[%-20s]${C_RESET} ${C_DIM}%s${C_RESET}\n" "$num" "$child" "$title" "$age"
+                    else
+                        printf "${C_GREEN}▸ %2s) ${C_BOLD}%-20s${C_RESET} ${C_DIM}%-22s${C_RESET} ${C_DIM}%s${C_RESET}\n" "$num" "$child" "" "$age"
+                    fi
                 else
-                    printf "%s%2s) %-20s %-22s %s%s\n" "$prefix" "$num" "$child" "—" "$age" "$suffix"
+                    # Normal item
+                    if [[ -n "$title" ]]; then
+                        printf "  %2s) ${C_CYAN}%-20s${C_RESET} ${C_DIM}[%-20s]${C_RESET} ${C_DIM}%s${C_RESET}\n" "$num" "$child" "$title" "$age"
+                    else
+                        printf "  %2s) ${C_CYAN}%-20s${C_RESET} ${C_DIM}%-22s${C_RESET} ${C_DIM}%s${C_RESET}\n" "$num" "$child" "" "$age"
+                    fi
                 fi
             done
             echo ""
         done
 
-        echo "────────────────────────"
+        printf "${C_DIM}────────────────────────${C_RESET}\n"
 
         # New session option
         if [[ "$selected" -eq "$new_idx" ]]; then
-            echo "> [n] New session <"
+            printf "${C_GREEN}▸${C_RESET} ${C_YELLOW}[n]${C_RESET} ${C_BOLD}New session${C_RESET}\n"
         else
-            echo "  [n] New session"
+            printf "  ${C_DIM}[n]${C_RESET} New session\n"
         fi
 
         # Quit option
         if [[ "$selected" -eq "$quit_idx" ]]; then
-            echo "> [q] Quit <"
+            printf "${C_GREEN}▸${C_RESET} ${C_DIM}[q]${C_RESET} ${C_BOLD}Quit${C_RESET}\n"
         else
-            echo "  [q] Quit"
+            printf "  ${C_DIM}[q]${C_RESET} Quit\n"
         fi
 
         # Read key

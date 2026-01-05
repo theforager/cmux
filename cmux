@@ -12,6 +12,10 @@ VERSION="1.0.0"
 CMUX_PREFIX="cmux"
 CMUX_SEP="@"
 
+# Mobile-friendly terminal width (used with --mobile flag)
+# Claude Code doesn't handle resize well, so mobile sessions start narrow
+CMUX_MOBILE_WIDTH=78
+
 # Colors (subtle, modern palette)
 C_RESET='\e[0m'
 C_BOLD='\e[1m'
@@ -115,7 +119,24 @@ get_session_child() {
 # ─────────────────────────────────────────────────────────────────────────────
 
 cmd_new() {
-    local path="${1:-.}"
+    local mobile=false
+    local path=""
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --mobile|-m)
+                mobile=true
+                shift
+                ;;
+            *)
+                path="$1"
+                shift
+                ;;
+        esac
+    done
+
+    path="${path:-.}"
 
     # Validate path
     if [[ ! -d "$path" ]]; then
@@ -129,7 +150,16 @@ cmd_new() {
     session_name=$(generate_session_name "$abs_path")
 
     # Create session
-    tmux new-session -d -s "$session_name" -c "$abs_path"
+    # For mobile: use fixed width; otherwise: use current terminal size
+    if [[ "$mobile" == true ]]; then
+        tmux new-session -d -s "$session_name" -c "$abs_path" -x "$CMUX_MOBILE_WIDTH"
+    else
+        # Capture current terminal size so claude starts at correct dimensions
+        local cols lines
+        cols=$(tput cols 2>/dev/null || echo 80)
+        lines=$(tput lines 2>/dev/null || echo 24)
+        tmux new-session -d -s "$session_name" -c "$abs_path" -x "$cols" -y "$lines"
+    fi
 
     # Set environment variables
     tmux set-environment -t "$session_name" CMUX_SESSION "$session_name"
@@ -532,7 +562,7 @@ cmux v${VERSION} - Claude Tmux Session Manager
 
 USAGE:
     cmux                     Interactive session selector
-    cmux new [path]          Create new session (default: current dir)
+    cmux new [-m] [path]     Create new session (default: current dir)
     cmux list                List all sessions
     cmux attach <name>       Attach to session
     cmux switch              Switch sessions (inside tmux)
@@ -542,14 +572,17 @@ USAGE:
     cmux info                Show current session info
     cmux help                Show this help
 
+OPTIONS:
+    -m, --mobile             Create session at fixed 78-col width
+
 ALIASES:
-    s = selector (same as cmux), sw = switch, ls = list, a = attach
-    k = kill, t = title, i = info
+    s = selector, sw = switch, ls = list, a = attach, k = kill, t = title, i = info
 
 EXAMPLES:
-    cmux new ~/projects/my-app    Create session for my-app
-    cmux attach my-app            Attach to my-app session
-    cmux title "fixing auth bug"  Set descriptive title
+    cmux new ~/projects/my-app       Create session for my-app
+    cmux new --mobile ~/my-app       Create mobile-friendly session (78 cols)
+    cmux attach my-app               Attach to my-app session
+    cmux title "fixing auth bug"     Set descriptive title
 
 EOF
 }
@@ -573,7 +606,7 @@ main() {
             show_selector attach
             ;;
         new)
-            cmd_new "${1:-.}"
+            cmd_new "$@"
             ;;
         list|ls)
             cmd_list

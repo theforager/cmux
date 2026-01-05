@@ -25,6 +25,13 @@ C_GREEN='\e[32m'
 C_YELLOW='\e[33m'
 C_BLUE='\e[34m'
 C_MAGENTA='\e[35m'
+C_RED='\e[31m'
+
+# Status indicators (inspired by agent-deck)
+STATUS_RUNNING="●"    # Claude is actively outputting
+STATUS_WAITING="◐"    # Waiting for user input
+STATUS_IDLE="○"       # Idle/no recent activity
+STATUS_ERROR="✕"      # Error state
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -114,13 +121,149 @@ get_session_child() {
     echo "$session" | cut -d"${CMUX_SEP}" -f3-
 }
 
+# Get session status (running/waiting/idle/error)
+# Returns: status_symbol|color
+get_session_status() {
+    local session="$1"
+
+    # Get pane activity timestamp
+    local last_activity
+    last_activity=$(tmux display-message -t "$session" -p '#{pane_last_activity}' 2>/dev/null) || {
+        echo "${STATUS_ERROR}|${C_RED}"
+        return
+    }
+
+    local now
+    now=$(date +%s)
+    local idle_seconds=$((now - last_activity))
+
+    # Capture last few lines of the pane to detect state
+    local pane_content
+    pane_content=$(tmux capture-pane -t "$session" -p -S -5 2>/dev/null | tr -d '\0') || {
+        echo "${STATUS_ERROR}|${C_RED}"
+        return
+    }
+
+    # Get the last non-empty line
+    local last_line
+    last_line=$(echo "$pane_content" | grep -v '^[[:space:]]*$' | tail -1)
+
+    # Check for error patterns
+    if echo "$last_line" | grep -qiE '(error|exception|failed|panic|fatal)'; then
+        echo "${STATUS_ERROR}|${C_RED}"
+        return
+    fi
+
+    # Activity within last 2 seconds = running
+    if [[ $idle_seconds -lt 2 ]]; then
+        echo "${STATUS_RUNNING}|${C_GREEN}"
+        return
+    fi
+
+    # Check if waiting for input (prompt patterns)
+    # Claude Code shows ">" when waiting for input
+    if echo "$last_line" | grep -qE '(^>|› |% ?$|\$ ?$|❯ ?$)'; then
+        echo "${STATUS_WAITING}|${C_YELLOW}"
+        return
+    fi
+
+    # Idle for more than 30 seconds
+    if [[ $idle_seconds -gt 30 ]]; then
+        echo "${STATUS_IDLE}|${C_DIM}"
+        return
+    fi
+
+    # Default: waiting (recently active but not at prompt)
+    echo "${STATUS_WAITING}|${C_YELLOW}"
+}
+
+# Get a brief preview of the session (last meaningful content)
+# Shows last few lines of actual text content
+get_session_preview() {
+    local session="$1"
+    local max_len="${2:-70}"
+    local max_lines="${3:-3}"
+
+    # Capture pane content and strip ANSI escapes
+    local pane_content
+    pane_content=$(tmux capture-pane -t "$session" -p -S -20 2>/dev/null | \
+        sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' | \
+        tr -d '\000-\010\013-\037') || {
+        echo ""
+        return
+    }
+
+    # Collect meaningful lines
+    local -a lines=()
+    while IFS= read -r line; do
+        # Skip empty/whitespace lines
+        [[ -z "${line// }" ]] && continue
+
+        # Count alphanumeric chars - skip lines that are mostly special chars
+        local alnum="${line//[^a-zA-Z0-9 ]/}"
+        [[ ${#alnum} -lt 5 ]] && continue
+
+        # Skip known Claude UI elements
+        [[ "$line" == *"for shortcuts"* ]] && continue
+        [[ "$line" == *"for help"* ]] && continue
+        [[ "$line" =~ ^[[:space:]]*\?[[:space:]] ]] && continue
+
+        # Clean and truncate
+        line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr '|' '-' | tr '␤' ' ')
+        [[ ${#line} -gt $max_len ]] && line="${line:0:$((max_len - 1))}…"
+        [[ -n "$line" ]] && lines+=("$line")
+    done <<< "$pane_content"
+
+    # Get last N lines
+    local count=${#lines[@]}
+    local start=$((count > max_lines ? count - max_lines : 0))
+    local preview=""
+    for ((i = start; i < count; i++)); do
+        [[ -n "$preview" ]] && preview+="␤"
+        preview+="${lines[$i]}"
+    done
+
+    echo "$preview"
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Commands
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Simple new session prompt
+# Sets _CMUX_PICKED_DIR and _CMUX_PICKED_TITLE
+_CMUX_PICKED_DIR=""
+_CMUX_PICKED_TITLE=""
+
+prompt_for_path() {
+    _CMUX_PICKED_DIR=""
+    _CMUX_PICKED_TITLE=""
+
+    printf "${C_BOLD}New Session${C_RESET}\n\n"
+    printf "${C_DIM}Path (blank=current dir, q=cancel):${C_RESET} "
+    read -r _CMUX_PICKED_DIR
+
+    # Handle cancel
+    if [[ "$_CMUX_PICKED_DIR" == "q" || "$_CMUX_PICKED_DIR" == "Q" ]]; then
+        _CMUX_PICKED_DIR=""
+        return 1
+    fi
+
+    # Default to current dir, expand ~
+    _CMUX_PICKED_DIR="${_CMUX_PICKED_DIR:-.}"
+    _CMUX_PICKED_DIR="${_CMUX_PICKED_DIR/#\~/$HOME}"
+
+    # Ask for optional title
+    printf "${C_DIM}Title (blank=auto):${C_RESET} "
+    read -r _CMUX_PICKED_TITLE
+
+    return 0
+}
+
 cmd_new() {
     local mobile=false
     local path=""
+    local title=""
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
@@ -128,6 +271,10 @@ cmd_new() {
             --mobile|-m)
                 mobile=true
                 shift
+                ;;
+            --title|-t)
+                title="$2"
+                shift 2
                 ;;
             *)
                 path="$1"
@@ -164,6 +311,7 @@ cmd_new() {
     # Set environment variables
     tmux set-environment -t "$session_name" CMUX_SESSION "$session_name"
     tmux set-environment -t "$session_name" CMUX_DIR "$abs_path"
+    [[ -n "$title" ]] && tmux set-environment -t "$session_name" CMUX_TITLE "$title"
 
     # Launch claude in the session
     tmux send-keys -t "$session_name" "claude" Enter
@@ -187,18 +335,24 @@ cmd_list() {
         return 0
     fi
 
-    echo "$sessions" | while IFS='|' read -r name created; do
-        local title
-        title=$(get_session_title "$name")
-        local age
-        age=$(format_age "$created")
-        local child
-        child=$(get_session_child "$name")
+    # Print legend
+    printf "${C_GREEN}${STATUS_RUNNING}${C_RESET}running ${C_YELLOW}${STATUS_WAITING}${C_RESET}waiting ${C_DIM}${STATUS_IDLE}idle${C_RESET} ${C_RED}${STATUS_ERROR}${C_RESET}error\n\n"
 
+    echo "$sessions" | while IFS='|' read -r name created; do
+        local title age child status_info status_sym status_color display_name
+        title=$(get_session_title "$name")
+        age=$(format_age "$created")
+        child=$(get_session_child "$name")
+        status_info=$(get_session_status "$name")
+        status_sym=$(echo "$status_info" | cut -d'|' -f1)
+        status_color=$(echo "$status_info" | cut -d'|' -f2)
+
+        # Title is primary if set
         if [[ -n "$title" ]]; then
-            printf "%s\t[%s]\t%s\n" "$child" "$title" "$age"
+            display_name="$title"
+            printf "${status_color}${status_sym}${C_RESET} %s\t${C_DIM}(%s)${C_RESET}\t%s\n" "$display_name" "$child" "$age"
         else
-            printf "%s\t\t%s\n" "$child" "$age"
+            printf "${status_color}${status_sym}${C_RESET} %s\t\t%s\n" "$child" "$age"
         fi
     done
 }
@@ -355,6 +509,7 @@ read_key() {
         '') echo "enter" ;;
         q|Q) echo "quit" ;;
         n|N) echo "new" ;;
+        d|D) echo "delete" ;;
         j) echo "down" ;;
         k) echo "up" ;;
         *) echo "$key" ;;
@@ -382,9 +537,14 @@ show_selector() {
 
         case "$choice" in
             n|N)
-                printf "Path: "
-                read -r path
-                cmd_new "${path:-.}"
+                prompt_for_path
+                if [[ -n "$_CMUX_PICKED_DIR" ]]; then
+                    if [[ -n "$_CMUX_PICKED_TITLE" ]]; then
+                        cmd_new "$_CMUX_PICKED_DIR" --title "$_CMUX_PICKED_TITLE"
+                    else
+                        cmd_new "$_CMUX_PICKED_DIR"
+                    fi
+                fi
                 ;;
             *)
                 return 0
@@ -398,15 +558,21 @@ show_selector() {
     local session_data=""
 
     while IFS='|' read -r name created; do
-        local parent child title age
+        local parent child title age status_info status_sym status_color preview
         parent=$(get_session_parent "$name")
         child=$(get_session_child "$name")
         title=$(get_session_title "$name")
         age=$(format_age "$created")
+        status_info=$(get_session_status "$name")
+        status_sym="${status_info%%|*}"
+        status_color="${status_info#*|}"
+        preview=$(get_session_preview "$name" 80 6)
+        # Ensure preview has no newlines
+        preview="${preview//$'\n'/ }"
 
         session_count=$((session_count + 1))
-        # Store: idx|parent|child|title|age|fullname
-        session_data="${session_data}${session_count}|${parent}|${child}|${title}|${age}|${name}"$'\n'
+        # Store as tab-separated for reliability (previews may have special chars)
+        session_data+="${session_count}|${parent}|${child}|${title}|${age}|${name}|${status_sym}|${status_color}|${preview}"$'\n'
     done <<< "$sessions"
 
     # Menu items: sessions + "New session" + "Quit"
@@ -428,59 +594,86 @@ show_selector() {
     local parents
     parents=$(echo "$session_data" | cut -d'|' -f2 | sort -u)
 
+    # Track selected preview for bottom panel
+    local selected_preview=""
+
+    # Get terminal height for adaptive preview
+    local term_lines
+    term_lines=$(tput lines 2>/dev/null || echo 24)
+
+    # Calculate max preview lines: total - header(4) - sessions - footer(3) - buffer(2)
+    # Minimum 2 lines, maximum 8 lines
+    local max_preview_lines=$(( term_lines - session_count - 12 ))
+    [[ $max_preview_lines -lt 2 ]] && max_preview_lines=2
+    [[ $max_preview_lines -gt 8 ]] && max_preview_lines=8
+
     while true; do
         # Move cursor to home (no clear - just overwrite)
         printf '\e[H'
 
         # Build output in variable to reduce flicker
         local output=""
-        output+="\n"
-        output+="${C_BOLD}${C_CYAN}CMUX Sessions${C_RESET}  ${C_DIM}↑/↓ move · enter select · q quit${C_RESET}\e[K\n"
-        output+="\n"
+        output+="${C_BOLD}${C_CYAN}CMUX${C_RESET} ${C_DIM}↑↓ nav · enter sel · n new · d del · q quit${C_RESET}\e[K\n"
+        output+="${C_GREEN}${STATUS_RUNNING}${C_RESET}${C_DIM}run${C_RESET} ${C_YELLOW}${STATUS_WAITING}${C_RESET}${C_DIM}wait${C_RESET} ${C_DIM}${STATUS_IDLE}idle${C_RESET} ${C_RED}${STATUS_ERROR}${C_RESET}${C_DIM}err${C_RESET}\e[K\n"
 
-        # Display grouped by parent
+        # === SESSION LIST (compact, no inline preview) ===
+        selected_preview=""
         for parent in $parents; do
             output+="${C_BOLD}${C_BLUE}${parent}${C_RESET}\e[K\n"
-            while IFS='|' read -r num p child title age fullname; do
+            while IFS='|' read -r num p child title age fullname status_sym status_color preview; do
                 [[ -z "$num" ]] && continue
                 [[ "$p" != "$parent" ]] && continue
 
+                # Build display name - title is primary if set
+                local display_name="" display_secondary=""
+                if [[ -n "$title" ]]; then
+                    display_name="$title"
+                    display_secondary="($child)"
+                else
+                    display_name="$child"
+                fi
+
                 if [[ "$num" -eq "$selected" ]]; then
-                    # Selected item - highlighted
-                    if [[ -n "$title" ]]; then
-                        output+="${C_GREEN}▸ $(printf '%2s' "$num")) ${C_BOLD}$(printf '%-20s' "$child")${C_RESET} ${C_DIM}[$(printf '%-20s' "$title")]${C_RESET} ${C_DIM}${age}${C_RESET}\e[K\n"
-                    else
-                        output+="${C_GREEN}▸ $(printf '%2s' "$num")) ${C_BOLD}$(printf '%-20s' "$child")${C_RESET} ${C_DIM}$(printf '%-22s' "")${C_RESET} ${C_DIM}${age}${C_RESET}\e[K\n"
-                    fi
+                    # Selected item
+                    output+="${status_color}${status_sym}${C_RESET} ${C_GREEN}▸${C_RESET}$(printf '%2s' "$num")  ${C_BOLD}${display_name}${C_RESET}"
+                    [[ -n "$display_secondary" ]] && output+=" ${C_DIM}${display_secondary}${C_RESET}"
+                    output+="  ${C_DIM}${age}${C_RESET}\e[K\n"
+                    selected_preview="$preview"
                 else
                     # Normal item
-                    if [[ -n "$title" ]]; then
-                        output+="  $(printf '%2s' "$num")) ${C_CYAN}$(printf '%-20s' "$child")${C_RESET} ${C_DIM}[$(printf '%-20s' "$title")]${C_RESET} ${C_DIM}${age}${C_RESET}\e[K\n"
-                    else
-                        output+="  $(printf '%2s' "$num")) ${C_CYAN}$(printf '%-20s' "$child")${C_RESET} ${C_DIM}$(printf '%-22s' "")${C_RESET} ${C_DIM}${age}${C_RESET}\e[K\n"
-                    fi
+                    output+="${status_color}${status_sym}${C_RESET}  $(printf '%2s' "$num")  ${C_CYAN}${display_name}${C_RESET}"
+                    [[ -n "$display_secondary" ]] && output+=" ${C_DIM}${display_secondary}${C_RESET}"
+                    output+="  ${C_DIM}${age}${C_RESET}\e[K\n"
                 fi
             done <<< "$session_data"
-            output+="\e[K\n"
         done
 
-        output+="${C_DIM}────────────────────────${C_RESET}\e[K\n"
+        # === PREVIEW PANEL (adaptive height) ===
+        output+="${C_DIM}──────────────────────────────────────────────────────────────${C_RESET}\e[K\n"
+        local preview_line_count=0
+        if [[ -n "$selected_preview" ]]; then
+            while IFS= read -r pline; do
+                ((preview_line_count++))
+                [[ $preview_line_count -gt $max_preview_lines ]] && break
+                output+="${C_DIM}${pline}${C_RESET}\e[K\n"
+            done <<< "${selected_preview//␤/$'\n'}"
+        fi
+        # Pad remaining preview lines to prevent ghosting
+        while [[ $preview_line_count -lt $max_preview_lines ]]; do
+            output+="\e[K\n"
+            ((preview_line_count++))
+        done
 
-        # New session option
+        # === FOOTER ===
+        output+="${C_DIM}──────────────────────────────────────────────────────────────${C_RESET}\e[K\n"
         if [[ "$selected" -eq "$new_idx" ]]; then
-            output+="${C_GREEN}▸${C_RESET} ${C_YELLOW}[n]${C_RESET} ${C_BOLD}New session${C_RESET}\e[K\n"
+            output+="${C_GREEN}▸${C_RESET}${C_BOLD}[n] New${C_RESET}  ${C_DIM}[d] Delete  [q] Quit${C_RESET}\e[K\n"
+        elif [[ "$selected" -eq "$quit_idx" ]]; then
+            output+="${C_DIM}[n] New  [d] Delete${C_RESET}  ${C_GREEN}▸${C_RESET}${C_BOLD}[q] Quit${C_RESET}\e[K\n"
         else
-            output+="  ${C_DIM}[n]${C_RESET} New session\e[K\n"
+            output+="${C_DIM}[n] New  [d] Delete  [q] Quit${C_RESET}\e[K\n"
         fi
 
-        # Quit option
-        if [[ "$selected" -eq "$quit_idx" ]]; then
-            output+="${C_GREEN}▸${C_RESET} ${C_DIM}[q]${C_RESET} ${C_BOLD}Quit${C_RESET}\e[K\n"
-        else
-            output+="  ${C_DIM}[q]${C_RESET} Quit\e[K\n"
-        fi
-
-        # Print all at once
         printf '%b' "$output"
 
         # Read key
@@ -504,9 +697,15 @@ show_selector() {
                 if [[ "$selected" -eq "$quit_idx" ]]; then
                     return 0
                 elif [[ "$selected" -eq "$new_idx" ]]; then
-                    printf "Path: "
-                    read -r path
-                    cmd_new "${path:-.}"
+                    printf '\e[2J\e[H'  # Clear screen
+                    prompt_for_path
+                    if [[ -n "$_CMUX_PICKED_DIR" ]]; then
+                        if [[ -n "$_CMUX_PICKED_TITLE" ]]; then
+                            cmd_new "$_CMUX_PICKED_DIR" --title "$_CMUX_PICKED_TITLE"
+                        else
+                            cmd_new "$_CMUX_PICKED_DIR"
+                        fi
+                    fi
                     return 0
                 else
                     # Get session by index
@@ -528,12 +727,48 @@ show_selector() {
                 return 0
                 ;;
             new)
-                printf '\e[?25h'
+                printf '\e[?25h\e[2J\e[H'  # Show cursor, clear screen
                 stty echo 2>/dev/null || true
-                printf "Path: "
-                read -r path
-                cmd_new "${path:-.}"
+                prompt_for_path
+                if [[ -n "$_CMUX_PICKED_DIR" ]]; then
+                    if [[ -n "$_CMUX_PICKED_TITLE" ]]; then
+                        cmd_new "$_CMUX_PICKED_DIR" --title "$_CMUX_PICKED_TITLE"
+                    else
+                        cmd_new "$_CMUX_PICKED_DIR"
+                    fi
+                fi
                 return 0
+                ;;
+            delete)
+                # Only delete if a session is selected (not new/quit)
+                if [[ "$selected" -le "$session_count" ]]; then
+                    local target_session target_name
+                    target_session=$(echo "$session_data" | awk -F'|' -v idx="$selected" '$1 == idx {print $6}')
+                    target_name=$(echo "$session_data" | awk -F'|' -v idx="$selected" '$1 == idx { if ($4 != "") print $4; else print $3 }')
+
+                    if [[ -n "$target_session" ]]; then
+                        # Show confirmation prompt
+                        printf '\e[?25h'  # Show cursor
+                        stty echo 2>/dev/null || true
+                        printf "\n${C_YELLOW}Delete session '${target_name}'? [y/N]:${C_RESET} "
+                        local confirm
+                        read -r confirm
+                        if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+                            tmux kill-session -t "$target_session" 2>/dev/null && \
+                                printf "${C_GREEN}Deleted.${C_RESET}\n" || \
+                                printf "${C_RED}Failed to delete.${C_RESET}\n"
+                            sleep 0.5
+                            # Restart selector with refreshed data
+                            printf '\e[?25l'  # Hide cursor
+                            stty -echo 2>/dev/null || true
+                            show_selector "$mode"
+                            return 0
+                        fi
+                        # Re-hide cursor and continue
+                        printf '\e[?25l'
+                        stty -echo 2>/dev/null || true
+                    fi
+                fi
                 ;;
             [1-9])
                 # Direct number selection
@@ -562,7 +797,7 @@ cmux v${VERSION} - Claude Tmux Session Manager
 
 USAGE:
     cmux                     Interactive session selector
-    cmux new [-m] [path]     Create new session (default: current dir)
+    cmux new [opts] [path]   Create new session (default: current dir)
     cmux list                List all sessions
     cmux attach <name>       Attach to session
     cmux switch              Switch sessions (inside tmux)
@@ -574,6 +809,13 @@ USAGE:
 
 OPTIONS:
     -m, --mobile             Create session at fixed 78-col width
+    -t, --title <text>       Set session title on creation
+
+STATUS INDICATORS:
+    ●  Running   - Claude is actively generating output
+    ◐  Waiting   - Claude is waiting for your input
+    ○  Idle      - Session has been idle for a while
+    ✕  Error     - Error detected in session
 
 ALIASES:
     s = selector, sw = switch, ls = list, a = attach, k = kill, t = title, i = info

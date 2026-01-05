@@ -21,17 +21,19 @@ The installer will:
 ### Session Selector
 
 ```bash
-cmux              # Show interactive session selector (from outside tmux)
-cmux switch       # Switch sessions (from inside tmux, mobile-friendly)
+cmux              # Show interactive session selector
+cmux switch       # Switch sessions (from inside tmux)
 ```
 
 ### Session Management
 
 ```bash
-cmux new ~/projects/my-app    # Create new session, auto-launches claude
-cmux list                     # List all sessions
-cmux attach my-app            # Attach to session
-cmux kill my-app              # Kill a session
+cmux new ~/projects/my-app           # Create new session
+cmux new -m ~/projects/my-app        # Create mobile-friendly session (78 cols)
+cmux new -t "fixing bugs" ~/my-app   # Create session with title
+cmux list                            # List all sessions
+cmux attach my-app                   # Attach to session
+cmux kill my-app                     # Kill a session
 ```
 
 ### Session Info
@@ -42,29 +44,45 @@ cmux rename new-name          # Rename current session
 cmux info                     # Show current session info
 ```
 
+## Status Indicators
+
+The selector shows real-time session status:
+
+| Symbol | Status | Description |
+|--------|--------|-------------|
+| ● | Running | Claude is actively generating output |
+| ◐ | Waiting | Claude is waiting for your input |
+| ○ | Idle | Session has been idle for a while |
+| ✕ | Error | Error detected in session |
+
 ## Selector UI
 
 ```
-CMUX Sessions
-
+CMUX ↑↓ nav · enter sel · n new · d del · q quit
+●run ◐wait ○idle ✕err
 my-project
-   1) api                 [fixing auth bug]     2h
-   2) worker              [adding test suite]   15m
-
-my-project-frontend
-   3) dashboard           —                     1d
-
-────────────────────────
-[n] New session
-[q] Quit
-
-Select: _
+◐ ▸ 1  fixing auth bug (api)  2h
+○   2  worker  15m
+──────────────────────────────────────────────────────────────
+I'll help you fix the authentication bug. Let me start by
+looking at the auth middleware to understand the current flow.
+──────────────────────────────────────────────────────────────
+[n] New  [d] Delete  [q] Quit
 ```
 
-Sessions are grouped by parent directory and show:
-- Session name (child directory)
-- Title in brackets (if set)
-- Session age
+Features:
+- **Status indicators** - See which sessions are active at a glance
+- **Session preview** - View recent conversation content for selected session
+- **Adaptive layout** - Preview height adjusts to terminal size (2-8 lines)
+- **Title as primary name** - Custom titles display prominently with folder in parentheses
+- **Keyboard navigation** - Arrow keys, vim keys (j/k), or number keys
+
+## Options
+
+| Flag | Description |
+|------|-------------|
+| `-m, --mobile` | Create session at fixed 78-col width (for mobile clients) |
+| `-t, --title` | Set session title on creation |
 
 ## Session Naming
 
@@ -99,12 +117,12 @@ cp commands/cmux_name.md ~/.claude/commands/
 
 | Command | Alias | Description |
 |---------|-------|-------------|
-| `cmux` | | Interactive session selector (outside tmux) |
-| `cmux selector` | `s` | Interactive session selector (works anywhere) |
-| `cmux new [path]` | | Create new session (default: cwd) |
-| `cmux list` | `ls` | List all sessions |
+| `cmux` | | Interactive session selector |
+| `cmux selector` | `s` | Interactive session selector |
+| `cmux new [opts] [path]` | | Create new session (default: cwd) |
+| `cmux list` | `ls` | List all sessions with status |
 | `cmux attach <name>` | `a` | Attach to session |
-| `cmux switch` | `sw` | Switch sessions (inside tmux only) |
+| `cmux switch` | `sw` | Switch sessions (inside tmux) |
 | `cmux kill <name>` | `k` | Kill a session |
 | `cmux rename <name>` | | Rename current session |
 | `cmux title <text>` | `t` | Set session title |

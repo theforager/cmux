@@ -239,8 +239,15 @@ prompt_for_path() {
     _CMUX_PICKED_DIR=""
     _CMUX_PICKED_TITLE=""
 
+    # Show current context
+    local cwd default_name
+    cwd=$(pwd)
+    default_name=$(basename "$(dirname "$cwd")")@$(basename "$cwd")
+
     printf "${C_BOLD}New Session${C_RESET}\n\n"
-    printf "${C_DIM}Path (blank=current dir, q=cancel):${C_RESET} "
+    printf "${C_DIM}Current:${C_RESET} %s\n" "$cwd"
+    printf "${C_DIM}Default name:${C_RESET} ${C_CYAN}%s${C_RESET}\n\n" "$default_name"
+    printf "${C_DIM}Path (enter=current, q=cancel):${C_RESET} "
     read -r _CMUX_PICKED_DIR
 
     # Handle cancel
@@ -253,8 +260,16 @@ prompt_for_path() {
     _CMUX_PICKED_DIR="${_CMUX_PICKED_DIR:-.}"
     _CMUX_PICKED_DIR="${_CMUX_PICKED_DIR/#\~/$HOME}"
 
+    # Update default name if path changed
+    if [[ "$_CMUX_PICKED_DIR" != "." ]]; then
+        local abs_path
+        abs_path=$(cd "$_CMUX_PICKED_DIR" 2>/dev/null && pwd) || abs_path="$_CMUX_PICKED_DIR"
+        default_name=$(basename "$(dirname "$abs_path")")@$(basename "$abs_path")
+        printf "${C_DIM}Name:${C_RESET} ${C_CYAN}%s${C_RESET}\n" "$default_name"
+    fi
+
     # Ask for optional title
-    printf "${C_DIM}Title (blank=auto):${C_RESET} "
+    printf "${C_DIM}Title (enter=auto):${C_RESET} "
     read -r _CMUX_PICKED_TITLE
 
     return 0
@@ -613,8 +628,7 @@ show_selector() {
 
         # Build output in variable to reduce flicker
         local output=""
-        output+="${C_BOLD}${C_CYAN}CMUX${C_RESET} ${C_DIM}↑↓ nav · enter sel · n new · d del · q quit${C_RESET}\e[K\n"
-        output+="${C_GREEN}${STATUS_RUNNING}${C_RESET}${C_DIM}run${C_RESET} ${C_YELLOW}${STATUS_WAITING}${C_RESET}${C_DIM}wait${C_RESET} ${C_DIM}${STATUS_IDLE}idle${C_RESET} ${C_RED}${STATUS_ERROR}${C_RESET}${C_DIM}err${C_RESET}\e[K\n"
+        output+="${C_BOLD}${C_CYAN}CMUX${C_RESET}  ${C_GREEN}${STATUS_RUNNING}${C_RESET} ${C_DIM}running${C_RESET}  ${C_YELLOW}${STATUS_WAITING}${C_RESET} ${C_DIM}waiting${C_RESET}  ${C_DIM}${STATUS_IDLE} idle${C_RESET}  ${C_RED}${STATUS_ERROR}${C_RESET} ${C_DIM}error${C_RESET}\e[K\n"
 
         # === SESSION LIST (compact, no inline preview) ===
         selected_preview=""
@@ -655,7 +669,14 @@ show_selector() {
             while IFS= read -r pline; do
                 ((preview_line_count++))
                 [[ $preview_line_count -gt $max_preview_lines ]] && break
-                output+="${C_DIM}${pline}${C_RESET}\e[K\n"
+                # Simple styling: user prompts (>), shell ($), or Claude response
+                if [[ "$pline" =~ ^[\>] ]]; then
+                    output+="${C_CYAN}${pline}${C_RESET}\e[K\n"
+                elif [[ "$pline" =~ ^[\$\%] ]]; then
+                    output+="${C_YELLOW}${pline}${C_RESET}\e[K\n"
+                else
+                    output+="${C_DIM}${pline}${C_RESET}\e[K\n"
+                fi
             done <<< "${selected_preview//␤/$'\n'}"
         fi
         # Pad remaining preview lines to prevent ghosting
@@ -667,11 +688,11 @@ show_selector() {
         # === FOOTER ===
         output+="${C_DIM}──────────────────────────────────────────────────────────────${C_RESET}\e[K\n"
         if [[ "$selected" -eq "$new_idx" ]]; then
-            output+="${C_GREEN}▸${C_RESET}${C_BOLD}[n] New${C_RESET}  ${C_DIM}[d] Delete  [q] Quit${C_RESET}\e[K\n"
+            output+="${C_DIM}↑↓ navigate · enter select ·${C_RESET} ${C_GREEN}▸[n] new${C_RESET} ${C_DIM}· [d] delete · [q] quit${C_RESET}\e[K\n"
         elif [[ "$selected" -eq "$quit_idx" ]]; then
-            output+="${C_DIM}[n] New  [d] Delete${C_RESET}  ${C_GREEN}▸${C_RESET}${C_BOLD}[q] Quit${C_RESET}\e[K\n"
+            output+="${C_DIM}↑↓ navigate · enter select · [n] new · [d] delete ·${C_RESET} ${C_GREEN}▸[q] quit${C_RESET}\e[K\n"
         else
-            output+="${C_DIM}[n] New  [d] Delete  [q] Quit${C_RESET}\e[K\n"
+            output+="${C_DIM}↑↓ navigate · enter select · [n] new · [d] delete · [q] quit${C_RESET}\e[K\n"
         fi
 
         printf '%b' "$output"

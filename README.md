@@ -58,16 +58,16 @@ The selector shows real-time session status:
 ## Selector UI
 
 ```
-CMUX ↑↓ nav · enter sel · n new · d del · q quit
-●run ◐wait ○idle ✕err
+CMUX  ● running  ◐ waiting  ○ idle  ✕ error
 my-project
 ◐ ▸ 1  fixing auth bug (api)  2h
 ○   2  worker  15m
 ──────────────────────────────────────────────────────────────
+> Can you help me fix the auth bug?
 I'll help you fix the authentication bug. Let me start by
 looking at the auth middleware to understand the current flow.
 ──────────────────────────────────────────────────────────────
-[n] New  [d] Delete  [q] Quit
+↑↓ navigate · enter select · [n] new · [d] delete · [q] quit
 ```
 
 Features:

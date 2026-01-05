@@ -572,6 +572,13 @@ show_selector() {
     local session_count=0
     local session_data=""
 
+    # Get terminal width for preview truncation (leave margin)
+    local term_cols
+    term_cols=$(tput cols 2>/dev/null || echo 80)
+    local preview_width=$((term_cols - 4))
+    [[ $preview_width -gt 100 ]] && preview_width=100
+    [[ $preview_width -lt 40 ]] && preview_width=40
+
     while IFS='|' read -r name created; do
         local parent child title age status_info status_sym status_color preview
         parent=$(get_session_parent "$name")
@@ -581,7 +588,7 @@ show_selector() {
         status_info=$(get_session_status "$name")
         status_sym="${status_info%%|*}"
         status_color="${status_info#*|}"
-        preview=$(get_session_preview "$name" 80 6)
+        preview=$(get_session_preview "$name" "$preview_width" 6)
         # Ensure preview has no newlines
         preview="${preview//$'\n'/ }"
 
@@ -694,6 +701,8 @@ show_selector() {
         else
             output+="${C_DIM}↑↓ navigate · enter select · [n] new · [d] delete · [q] quit${C_RESET}\e[K\n"
         fi
+        # Extra clear lines to prevent ghosting on small terminals
+        output+="\e[K\n\e[K"
 
         printf '%b' "$output"
 

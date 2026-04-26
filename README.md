@@ -14,7 +14,6 @@ cd cmux
 
 The installer will:
 - Symlink `cmux` to `~/bin`
-- Optionally install the `/cmux_name` slash command for Claude Code
 
 ## Usage
 
@@ -43,6 +42,64 @@ cmux title "fixing auth bug"  # Set session title
 cmux rename new-name          # Rename current session
 cmux info                     # Show current session info
 ```
+
+### One-step SSH
+
+```bash
+cmux ssh dev@devship          # SSH into host and open selector in one step
+cmux ssh dev                  # Same, using an alias from ~/.config/cmux/hosts
+```
+
+Define aliases in `~/.config/cmux/hosts`, one per line:
+
+```
+dev=dev@devship
+prod=-p 2222 user@prod.example.com
+```
+
+The value is passed to `ssh -t` so it can include flags like `-p`.
+
+### Popup switcher (jump back from inside a session)
+
+From inside any cmux session, press **prefix + g** to pop the selector as
+a floating window. Pick a session, popup closes, you're switched — no
+detaching, no exiting Claude.
+
+> The tmux **prefix** is whatever key combo opens tmux commands. By default
+> it's `Ctrl-b`, so press `Ctrl-b` then `g`. If you've remapped your prefix
+> (e.g. to `Ctrl-a`), use that instead. Check yours with
+> `tmux show-options -g prefix`.
+
+**No setup required.** cmux registers the binding on your tmux server
+automatically every time you run it. The binding lives until the tmux
+server dies (typically only on reboot or `tmux kill-server`), and the
+next `cmux` invocation re-registers it. We deliberately use `prefix + g`
+rather than `prefix + s` so we don't clobber tmux's built-in session
+picker — `g` has no default mapping in tmux.
+
+If you want the binding to survive `tmux kill-server` without running
+cmux first, paste this one line into `~/.tmux.conf` yourself:
+
+```
+bind-key g display-popup -E -w 85% -h 85% "cmux switch"
+```
+
+Requires tmux 3.2+ for `display-popup`.
+
+## Session Lifecycle
+
+cmux has three layers — a selector, tmux sessions, and Claude running inside
+each session. Knowing which "close" maps to which layer keeps things tidy:
+
+| You want to… | Do this | What happens |
+|---|---|---|
+| **End this session for good** | Quit Claude (`Ctrl-D` or `/exit`) | Claude exits; the tmux session auto-ends and disappears from the selector |
+| **Step away, keep working later** | `prefix d` (default `Ctrl-b d`) | Detaches the tmux client; session keeps running in the background |
+| **Close the selector without picking** | `q` or `esc` | Just closes the selector view; nothing else changes |
+| **Force-kill another session** | `d` on it in the selector (or `cmux kill <name>`) | Confirms, then destroys that session |
+
+Because cmux launches Claude with `exec`, ending Claude ends the session —
+no orphaned shell prompts to clean up.
 
 ## Status Indicators
 
@@ -75,7 +132,11 @@ Features:
 - **Session preview** - View recent conversation content for selected session
 - **Adaptive layout** - Preview height adjusts to terminal size (2-8 lines)
 - **Title as primary name** - Custom titles display prominently with folder in parentheses
-- **Keyboard navigation** - Arrow keys, vim keys (j/k), or number keys
+- **Keyboard navigation** - Arrow keys, vim keys (j/k), home/end, pgup/pgdn
+- **Multi-digit jump** - Type `12` to jump to session #12
+- **`/` filter** - Live filter sessions by parent / child / title
+- **In-selector rename / title / delete** - `r`, `t`, `d` act on the selected row
+- **Help overlay** - `?` shows the full key map
 
 ## Options
 
@@ -101,18 +162,6 @@ To show the session selector on connect via Terminus:
 1. Open Terminus settings for your host
 2. Set "Startup Command" to: `cmux`
 
-## Claude Auto-Title
-
-The installer can add a `/cmux_name` slash command to your Claude Code setup.
-
-When you run `/cmux_name`, Claude will analyze the current conversation and set an appropriate session title using `cmux title`.
-
-To manually add it later:
-
-```bash
-cp commands/cmux_name.md ~/.claude/commands/
-```
-
 ## Commands Reference
 
 | Command | Alias | Description |
@@ -127,4 +176,5 @@ cp commands/cmux_name.md ~/.claude/commands/
 | `cmux rename <name>` | | Rename current session |
 | `cmux title <text>` | `t` | Set session title |
 | `cmux info` | `i` | Show current session info |
+| `cmux ssh <host\|alias>` | | One-step SSH + selector |
 | `cmux help` | | Show help |

@@ -32,18 +32,6 @@ if [[ ":$PATH:" != *":${HOME}/bin:"* ]]; then
     echo ""
 fi
 
-# Offer to install slash command
-echo ""
-read -p "Install Claude Code slash command /cmux_name? [y/N] " -n 1 -r
-echo ""
-
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-    CLAUDE_CMD_DIR="${HOME}/.claude/commands"
-    mkdir -p "$CLAUDE_CMD_DIR"
-    cp "${SCRIPT_DIR}/commands/cmux_name.md" "$CLAUDE_CMD_DIR/"
-    echo "Installed /cmux_name command to $CLAUDE_CMD_DIR"
-fi
-
 echo ""
 echo "Installation complete!"
 echo ""
@@ -51,5 +39,6 @@ echo "Quick start:"
 echo "  cmux new ~/projects/my-app    # Create a new session"
 echo "  cmux                          # Open session selector"
 echo "  cmux switch                   # Switch sessions (inside tmux)"
+echo "  cmux ssh dev@devship          # SSH into a host and open selector"
 echo "  cmux help                     # See all commands"
 echo ""

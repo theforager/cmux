@@ -6,7 +6,7 @@
 
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 # Using @ as separator since colons conflict with tmux session:window syntax
 # and underscores are common in directory names
 CMUX_PREFIX="cmux"
@@ -132,39 +132,65 @@ get_session_status() {
 get_session_preview() {
     local session="$1"
     local max_len="${2:-70}"
-    local max_lines="${3:-3}"
+    local max_lines="${3:-30}"
 
+    # Capture the visible pane plus a bit of scrollback. We don't pull the
+    # whole history because the preview only ever shows the last screenful.
     local pane_content
-    # -S -100 so we have enough scrollback to show ~30 meaningful lines after
-    # filtering out empty/decoration rows.
-    pane_content=$(tmux capture-pane -t "$session" -p -S -100 2>/dev/null | \
+    pane_content=$(tmux capture-pane -t "$session" -p -S -50 2>/dev/null | \
         sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' | \
         tr -d '\000-\010\013-\037') || {
         echo ""
         return
     }
 
-    local -a lines=()
+    local -a raw=()
     while IFS= read -r line; do
-        [[ -z "${line// }" ]] && continue
-        local alnum="${line//[^a-zA-Z0-9 ]/}"
-        [[ ${#alnum} -lt 5 ]] && continue
-        [[ "$line" == *"for shortcuts"* ]] && continue
-        [[ "$line" == *"for help"* ]] && continue
-        [[ "$line" =~ ^[[:space:]]*\?[[:space:]] ]] && continue
-        line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr '|' '-' | tr '␤' ' ')
-        [[ ${#line} -gt $max_len ]] && line="${line:0:$((max_len - 1))}…"
-        [[ -n "$line" ]] && lines+=("$line")
+        raw+=("$line")
     done <<< "$pane_content"
 
-    local count=${#lines[@]}
-    local start=$((count > max_lines ? count - max_lines : 0))
-    local preview=""
-    for ((i = start; i < count; i++)); do
-        [[ -n "$preview" ]] && preview+="␤"
-        preview+="${lines[$i]}"
+    local total=${#raw[@]}
+
+    # The bottom of a Claude pane is always: an input box (drawn with box
+    # characters), plus the "? for shortcuts" hint row. Walk backwards and
+    # eat those — anything with no alphanumerics (box borders, blank rows)
+    # and the explicit shortcut/help footer rows. Stop at the first row of
+    # actual conversational content.
+    while [[ $total -gt 0 ]]; do
+        local last="${raw[$((total-1))]}"
+        if ! [[ "$last" =~ [a-zA-Z0-9] ]] \
+           || [[ "$last" == *"for shortcuts"* ]] \
+           || [[ "$last" == *"for help"* ]]; then
+            total=$((total - 1))
+        else
+            break
+        fi
     done
-    echo "$preview"
+
+    # Take the last max_lines of what's left, preserving order and any blank
+    # rows in between (those are conversational spacing, not noise).
+    local start=$((total > max_lines ? total - max_lines : 0))
+    local preview=""
+    local i
+    for ((i = start; i < total; i++)); do
+        local line="${raw[$i]}"
+        line="${line//|/-}"
+        line="${line//␤/ }"
+        # Trim outer whitespace so the gutter sits flush
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ ${#line} -gt $max_len ]] && line="${line:0:$((max_len - 1))}…"
+        [[ -n "$preview" ]] && preview+="␤"
+        preview+="$line"
+    done
+    # Double any backslashes so the renderer (printf '%b') doesn't interpret
+    # literal "\e[…" text from a Claude pane (ANSI examples, escape codes in
+    # code blocks, etc.) as real escape sequences. Without this, a preview
+    # containing the string "\e[2J" would *actually clear the screen* when
+    # rendered. This was the cause of the "top half cut off when selecting
+    # session #1" bug.
+    preview="${preview//\\/\\\\}"
+    printf '%s' "$preview"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -180,18 +206,24 @@ TTY_STATE_SAVED=""
 
 selector_setup_tty() {
     TTY_STATE_SAVED=$(stty -g 2>/dev/null || true)
-    # Disable input-mangling modes the terminal might already have on
-    printf '\e[?2004l\e[?1l\e[>4;0m\e[<u'
-    # Enter alternate screen, home cursor, hide cursor
-    printf '\e[?1049h\e[H\e[?25l'
+    # Disable bracketed paste in case the user's terminal has it on — its
+    # "[200~ ... [201~" markers were the actual cause of the original
+    # U → [226~ symptom. Other speculative resets (kitty keyboard pop,
+    # modifyOtherKeys, cursor-key application mode) are deliberately *not*
+    # sent: some terminals respond to them with bytes that get buffered for
+    # the next process (tmux/Claude), causing visible redraw artifacts when
+    # we switch into a session.
+    printf '\e[?2004l'
+    # Enter alternate screen, then explicitly clear it. `\e[?1049h` is
+    # spec'd to clear on entry, but some tmux/SSH/terminal combos don't,
+    # leaving the underlying shell scrollback visible behind our selector
+    # (looks like "ghosting"). \e[2J forces a clean slate.
+    printf '\e[?1049h\e[2J\e[H\e[?25l'
     stty -echo 2>/dev/null || true
 }
 
 selector_restore_tty() {
-    # Reset the modes again on the way out — defense in depth, since the
-    # selector itself never enables them but child commands or terminals
-    # can.
-    printf '\e[?2004l\e[?1l\e[>4;0m\e[<u'
+    printf '\e[?2004l'   # keep bracketed paste off through prompt_for_path
     printf '\e[?25h'
     printf '\e[?1049l'
     if [[ -n "$TTY_STATE_SAVED" ]]; then
@@ -267,29 +299,98 @@ read_key() {
 # Commands
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Single-prompt new-session entry. Title is now set later via the selector
-# ('t' key) so creation is just one Enter from the 'n' shortcut.
+# Two-prompt new-session entry: path, then agent. Title is set later via the
+# selector ('t' key). Agent prompt defaults to $CMUX_AGENT (then claude) so
+# Enter-Enter is still the fast path.
 _CMUX_PICKED_DIR=""
+_CMUX_PICKED_AGENT=""
 
 prompt_for_path() {
     _CMUX_PICKED_DIR=""
+    _CMUX_PICKED_AGENT=""
     local cwd default_name
     cwd=$(pwd)
     default_name=$(basename "$(dirname "$cwd")")@$(basename "$cwd")
-    printf "${C_BOLD}New Session${C_RESET}  ${C_DIM}%s${C_RESET}\n" "$default_name"
-    printf "${C_DIM}Path (Enter=cwd, q=cancel):${C_RESET} "
+    local default_agent="${CMUX_AGENT:-claude}"
+
+    printf "${C_BOLD}new session${C_RESET}  ${C_DIM}%s${C_RESET}\n\n" "$default_name"
+
+    # Path: line input. cwd is shown in brackets as the default; Enter
+    # accepts it; typing a path overrides; q cancels.
+    printf "  ${C_DIM}path${C_RESET}    ${C_DIM}[%s]${C_RESET} " "$cwd"
     local input
     read -r input
     if [[ "$input" == "q" || "$input" == "Q" ]]; then
         return 1
     fi
-    input="${input:-.}"
+    input="${input:-$cwd}"
     input="${input/#\~/$HOME}"
     if [[ ! -d "$input" ]]; then
-        printf "${C_RED}Not a directory: %s${C_RESET}\n" "$input"
+        printf "  ${C_RED}not a directory: %s${C_RESET}\n" "$input"
         return 1
     fi
     _CMUX_PICKED_DIR="$input"
+
+    printf "\n  ${C_DIM}agent${C_RESET}\n"
+
+    # Agent picker: arrow keys to navigate, Enter to pick, 1/2/3 to jump,
+    # q/esc to cancel. Three options — claude, codex, other (custom command).
+    local -a agents=("claude" "codex" "other (custom command)")
+    local agent_idx=0
+    [[ "$default_agent" == "codex" ]] && agent_idx=1
+
+    printf '\e[?25l'  # hide cursor while navigating
+
+    local i first=1
+    while true; do
+        if [[ $first -eq 0 ]]; then
+            printf '\e[%dA' "${#agents[@]}"  # move up to first agent line
+        fi
+        first=0
+        for ((i = 0; i < ${#agents[@]}; i++)); do
+            local n=$((i + 1))
+            if [[ $i -eq $agent_idx ]]; then
+                printf "    ${C_DIM}%d${C_RESET} ${C_GREEN}▸${C_RESET} ${C_BOLD}%s${C_RESET}\e[K\n" "$n" "${agents[$i]}"
+            else
+                printf "    ${C_DIM}%d${C_RESET}   %s\e[K\n" "$n" "${agents[$i]}"
+            fi
+        done
+
+        local key
+        key=$(read_key)
+        case "$key" in
+            up|k)
+                agent_idx=$((agent_idx - 1))
+                [[ $agent_idx -lt 0 ]] && agent_idx=$((${#agents[@]} - 1))
+                ;;
+            down|j)
+                agent_idx=$((agent_idx + 1))
+                [[ $agent_idx -ge ${#agents[@]} ]] && agent_idx=0
+                ;;
+            1) agent_idx=0; break ;;
+            2) agent_idx=1; break ;;
+            3) agent_idx=2; break ;;
+            enter) break ;;
+            q|Q|escape)
+                printf '\e[?25h\n'
+                return 1
+                ;;
+        esac
+    done
+    printf '\e[?25h'
+
+    if [[ $agent_idx -eq 2 ]]; then
+        # Custom: prompt for the actual command
+        printf "\n  ${C_DIM}command${C_RESET}  "
+        local custom_cmd
+        read -r custom_cmd
+        if [[ -z "$custom_cmd" || "$custom_cmd" == "q" || "$custom_cmd" == "Q" ]]; then
+            return 1
+        fi
+        _CMUX_PICKED_AGENT="$custom_cmd"
+    else
+        _CMUX_PICKED_AGENT="${agents[$agent_idx]}"
+    fi
     return 0
 }
 
@@ -297,14 +398,37 @@ cmd_new() {
     local mobile=false
     local path=""
     local title=""
+    local agent="${CMUX_AGENT:-claude}"
+    local no_attach=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --mobile|-m) mobile=true; shift ;;
             --title|-t)  title="$2"; shift 2 ;;
+            --agent|-a)  agent="$2"; shift 2 ;;
+            --no-attach) no_attach=true; shift ;;
             *)           path="$1"; shift ;;
         esac
     done
+
+    # Map agent name → command. claude/codex are well-known; anything else
+    # is treated as a custom command (potentially with args). Validation
+    # checks the first word exists on PATH (or is an executable abs path).
+    local agent_lc
+    agent_lc=$(printf '%s' "$agent" | tr '[:upper:]' '[:lower:]')
+    local agent_cmd
+    case "$agent_lc" in
+        claude) agent_cmd="claude" ;;
+        codex)  agent_cmd="codex" ;;
+        *)      agent_cmd="$agent" ;;
+    esac
+    local first_word="${agent_cmd%% *}"
+    if [[ "$first_word" == /* ]]; then
+        [[ -x "$first_word" ]] || die "Agent command not executable: $first_word"
+    else
+        command -v "$first_word" >/dev/null 2>&1 || \
+            die "Agent command not found in PATH: $first_word"
+    fi
 
     path="${path:-.}"
     [[ -d "$path" ]] || die "Directory does not exist: $path"
@@ -326,17 +450,23 @@ cmd_new() {
 
     tmux set-environment -t "$session_name" CMUX_SESSION "$session_name"
     tmux set-environment -t "$session_name" CMUX_DIR "$abs_path"
+    tmux set-environment -t "$session_name" CMUX_AGENT "$agent_lc"
     [[ -n "$title" ]] && tmux set-environment -t "$session_name" CMUX_TITLE "$title"
 
     ensure_popup_binding
 
-    # `exec` replaces the shell with claude so when claude exits (Ctrl-D,
-    # /exit, crash) the pane has no remaining process and tmux's default
-    # `remain-on-exit off` ends the session — no orphaned shell prompts
-    # cluttering the selector. To keep a session running while stepping
-    # away, detach with `prefix d` instead.
-    tmux send-keys -t "$session_name" "exec claude" Enter
-    echo "Created session: $session_name"
+    # `exec` replaces the shell with the agent so when the agent exits
+    # (Ctrl-D, /exit, crash) the pane has no remaining process and tmux's
+    # default `remain-on-exit off` ends the session — no orphaned shell
+    # prompts cluttering the selector. To keep a session running while
+    # stepping away, detach with `prefix d` instead.
+    tmux send-keys -t "$session_name" "exec $agent_cmd" Enter
+    _CMUX_LAST_CREATED="$session_name"
+    echo "Created session: $session_name (agent: $agent_lc)"
+
+    if $no_attach; then
+        return 0
+    fi
 
     if is_inside_tmux; then
         tmux switch-client -t "$session_name"
@@ -344,6 +474,10 @@ cmd_new() {
         tmux attach-session -t "$session_name"
     fi
 }
+
+# Set by cmd_new so the selector can attach to the just-created session
+# after a confirmation step (rather than auto-attaching).
+_CMUX_LAST_CREATED=""
 
 cmd_list() {
     local sessions
@@ -433,6 +567,10 @@ cmd_title() {
     echo "Title set: $title"
 }
 
+get_session_agent() {
+    tmux show-environment -t "$1" CMUX_AGENT 2>/dev/null | sed 's/^CMUX_AGENT=//' || echo ""
+}
+
 cmd_info() {
     is_inside_tmux || die "Not inside tmux session"
 
@@ -440,15 +578,17 @@ cmd_info() {
     current=$(tmux display-message -p '#{session_name}')
     [[ "$current" =~ ^${CMUX_PREFIX}${CMUX_SEP} ]] || die "Not in a cmux session"
 
-    local title dir created age
+    local title dir agent created age
     title=$(get_session_title "$current")
     dir=$(get_session_dir "$current")
+    agent=$(get_session_agent "$current")
     created=$(tmux display-message -p -t "$current" '#{session_created}')
     age=$(format_age "$created")
 
     echo "Session: $current"
     echo "Directory: $dir"
     echo "Title: ${title:-<not set>}"
+    echo "Agent: ${agent:-claude}"
     echo "Age: $age"
 }
 
@@ -591,11 +731,11 @@ _selector_render() {
     # Header — title + session count, no inline legend (legend lives in `?`)
     output+="${C_BOLD}${C_CYAN}cmux${C_RESET}  ${C_DIM}${count_label}${C_RESET}\e[K\n"
 
+    # Filter line only when actually filtering — saves a row of vertical space
+    # for preview when not in filter mode.
     if [[ -n "$SEL_FILTER" || "$SEL_MODE" == "filter" ]]; then
         output+="${C_YELLOW}/${C_RESET}${SEL_FILTER}"
         [[ "$SEL_MODE" == "filter" ]] && output+="${C_BOLD}_${C_RESET}"
-        output+="\e[K\n"
-    else
         output+="\e[K\n"
     fi
 
@@ -762,18 +902,45 @@ _selector_commit_text() {
 }
 
 _selector_run_new() {
-    # Leave alt screen and restore tty so prompt_for_path can read normally.
+    # Stay inside the alt screen — clear it and switch to line-input mode
+    # for the prompts. Previously we exited the alt screen, which briefly
+    # exposed the user's pre-cmux shell scrollback under the prompts.
+    printf '\e[H\e[2J\e[?25h'
+    stty echo 2>/dev/null || true
+
+    if ! prompt_for_path; then
+        # Cancelled — restore selector mode (raw input, hidden cursor)
+        printf '\e[?25l'
+        stty -echo 2>/dev/null || true
+        return 1
+    fi
+
+    # Create the session but don't attach yet — the user explicitly asked
+    # for an Enter-to-attach beat instead of auto-jumping into the session.
+    local agent_args=()
+    [[ -n "$_CMUX_PICKED_AGENT" ]] && agent_args=(--agent "$_CMUX_PICKED_AGENT")
+    cmd_new --no-attach "$_CMUX_PICKED_DIR" "${agent_args[@]}"
+
+    local target="$_CMUX_LAST_CREATED"
+    printf "\n  ${C_DIM}press enter to attach, q to leave it running${C_RESET}\n  "
+    local confirm
+    read -r confirm
+
     selector_restore_tty
     trap - EXIT INT TERM HUP
-    printf '\n'
-    if prompt_for_path; then
-        cmd_new "$_CMUX_PICKED_DIR"
+
+    if [[ "$confirm" == "q" || "$confirm" == "Q" ]]; then
+        echo "Session left running. Use 'cmux' to attach later."
         return 0
     fi
-    # Cancelled — return to selector view
-    selector_setup_tty
-    trap 'selector_restore_tty' EXIT INT TERM HUP
-    return 1
+    if [[ -n "$target" ]]; then
+        if is_inside_tmux; then
+            tmux switch-client -t "$target"
+        else
+            tmux attach-session -t "$target"
+        fi
+    fi
+    return 0
 }
 
 _selector_show_help() {
@@ -881,12 +1048,13 @@ show_selector() {
                 [[ $selected -gt $visible_count ]] && selected=$visible_count
             fi
 
-            # Preview takes whatever vertical space is left after header (2),
-            # rules (2), footer + status (3), and the session list. Floor at
-            # 3 (otherwise pointless) and ceiling at 30 (sanity).
-            local max_preview_lines=$(( term_lines - visible_count - 9 ))
-            [[ $max_preview_lines -lt 3 ]] && max_preview_lines=3
-            [[ $max_preview_lines -gt 30 ]] && max_preview_lines=30
+            # Preview takes whatever vertical space is left after header (1),
+            # rules (2), footer + status (2), and the session list (each row
+            # plus ~1 group-header line per parent). Floor at 4 (otherwise
+            # pointless) and ceiling at 40 (sanity).
+            local max_preview_lines=$(( term_lines - visible_count - 7 ))
+            [[ $max_preview_lines -lt 4 ]] && max_preview_lines=4
+            [[ $max_preview_lines -gt 40 ]] && max_preview_lines=40
 
             _selector_render "$visible_data" "$visible_count" "$selected" "$max_preview_lines" "$term_cols"
 
@@ -1075,6 +1243,10 @@ USAGE:
 OPTIONS:
     -m, --mobile               Create session at fixed 78-col width
     -t, --title <text>         Set session title on creation
+    -a, --agent <name|cmd>     Agent to launch: claude (default), codex, or
+                               any custom command (overridable via
+                               \$CMUX_AGENT env var)
+        --no-attach            Create the session but don't attach to it
 
 SELECTOR KEYS:
     ↑↓/j k       navigate          enter   open selected
@@ -1104,10 +1276,12 @@ ALIASES:
     s = selector, sw = switch, ls = list, a = attach, k = kill, t = title, i = info
 
 EXAMPLES:
-    cmux new ~/projects/my-app       Create session for my-app
+    cmux new ~/projects/my-app       Create session for my-app (claude)
+    cmux new -a codex ~/my-app       Create session running codex instead
     cmux new --mobile ~/my-app       Create mobile-friendly session (78 cols)
     cmux ssh dev@devship             SSH and open the selector in one step
     cmux ssh dev                     Same, using an alias from the hosts file
+    CMUX_AGENT=codex cmux new        Default to codex for this shell
 
 EOF
 }

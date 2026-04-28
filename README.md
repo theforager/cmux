@@ -27,13 +27,39 @@ cmux switch       # Switch sessions (from inside tmux)
 ### Session Management
 
 ```bash
-cmux new ~/projects/my-app           # Create new session
+cmux new ~/projects/my-app           # Create new session (claude by default)
+cmux new -a codex ~/projects/my-app  # Create session running codex instead
 cmux new -m ~/projects/my-app        # Create mobile-friendly session (78 cols)
 cmux new -t "fixing bugs" ~/my-app   # Create session with title
 cmux list                            # List all sessions
 cmux attach my-app                   # Attach to session
 cmux kill my-app                     # Kill a session
 ```
+
+### Agents
+
+cmux launches Claude Code by default. Pass `-a codex` (or set `CMUX_AGENT=codex`)
+to run [Codex](https://github.com/openai/codex) instead. You can also pass any
+custom command (`-a "myagent --flag"`) — cmux just `exec`s whatever you give it.
+
+The selector's `n` (new) flow shows a small picker after the path prompt:
+
+```
+  agent
+    1 ▸ claude
+    2   codex
+    3   other (custom command)
+```
+
+Use `↑/↓` (or `j/k`, or press `1`/`2`/`3`) and Enter to pick. Picking `other`
+prompts for the command to run. The agent binary's first word must be on
+`$PATH`; cmux verifies before creating the session so typos fail clearly.
+
+After a session is created, cmux asks you to **press Enter to attach** rather
+than throwing you in automatically. Press `q` to leave the session running in
+the background; you can attach later from the selector.
+
+`cmux info` shows which agent the current session is running.
 
 ### Session Info
 

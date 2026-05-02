@@ -1,8 +1,22 @@
 # cmux
 
-Claude Tmux Session Manager - manage multiple Claude Code sessions via tmux.
+Terminal-first workbench for long-lived coding-agent sessions.
 
-Designed for remote access via Terminus (iOS) and other SSH clients.
+cmux still manages Claude/Codex sessions in tmux, but v2 adds structured
+agent orchestration:
+
+- Linear issue-backed sessions
+- task-backed and scratch sessions
+- git worktree isolation
+- durable local session registry
+- `.agent/RUNBOOK.md` per real workspace
+- status transitions and hooks
+- Linear status/comment sync
+- lightweight Linear polling daemon
+- Ink-based session dashboard
+
+The original Bash implementation is preserved at `legacy/cmux.bash` and can be
+run with `cmux legacy ...`.
 
 ## Installation
 
@@ -12,195 +26,186 @@ cd cmux
 ./install.sh
 ```
 
-The installer will:
-- Symlink `cmux` to `~/bin`
+The installer runs `npm install`, builds the TypeScript CLI, and symlinks
+`cmux` into `~/bin`.
 
-## Usage
-
-### Session Selector
+For development:
 
 ```bash
-cmux              # Show interactive session selector
-cmux switch       # Switch sessions (from inside tmux)
+npm install
+npm run build
+./cmux help
 ```
 
-### Session Management
+## Basic Usage
 
 ```bash
-cmux new ~/projects/my-app           # Create new session (claude by default)
-cmux new -a codex ~/projects/my-app  # Create session running codex instead
-cmux new -m ~/projects/my-app        # Create mobile-friendly session (78 cols)
-cmux new -t "fixing bugs" ~/my-app   # Create session with title
-cmux list                            # List all sessions
-cmux attach my-app                   # Attach to session
-cmux kill my-app                     # Kill a session
+cmux                         # Interactive Ink selector
+cmux new ~/projects/app       # Create a plain tmux agent session
+cmux new -a codex .           # Use Codex instead of Claude
+cmux list                     # List tmux sessions
+cmux attach app               # Attach/switch to a session
+cmux switch                   # Open selector from inside tmux
 ```
 
-### Agents
+## Dashboard Keys
 
-cmux launches Claude Code by default. Pass `-a codex` (or set `CMUX_AGENT=codex`)
-to run [Codex](https://github.com/openai/codex) instead. You can also pass any
-custom command (`-a "myagent --flag"`) — cmux just `exec`s whatever you give it.
+The selector is still optimized for fast session switching:
 
-The selector's `n` (new) flow shows a small picker after the path prompt:
-
+```text
+↑↓ / j k       navigate
+home / end     first / last
+pgup / pgdn    move by 5
+1-9 digits     jump to row number
+enter          open selected session
+/              filter
+n              create scratch session
+a              start Linear issue-backed or task-backed agent
+r              rename selected tmux session
+t              set selected title
+d              delete selected session
+b              mark structured agent blocked
+f              mark structured agent tests_failed
+v              mark structured agent ready_for_review
+x              mark structured agent done
+R              refresh
+?              help
+q / esc        quit
 ```
-  agent
-    1 ▸ claude
-    2   codex
-    3   other (custom command)
-```
 
-Use `↑/↓` (or `j/k`, or press `1`/`2`/`3`) and Enter to pick. Picking `other`
-prompts for the command to run. The agent binary's first word must be on
-`$PATH`; cmux verifies before creating the session so typos fail clearly.
+Inside any cmux tmux session, press `prefix + g` to open the popup switcher.
+By default tmux prefix is `Ctrl-b`, so press `Ctrl-b` then `g`.
 
-After a session is created, cmux asks you to **press Enter to attach** rather
-than throwing you in automatically. Press `q` to leave the session running in
-the background; you can attach later from the selector.
-
-`cmux info` shows which agent the current session is running.
-
-### Session Info
+## Agent Orchestration
 
 ```bash
-cmux title "fixing auth bug"  # Set session title
-cmux rename new-name          # Rename current session
-cmux info                     # Show current session info
+cmux agent start REB-123
+cmux agent start --title "Investigate Vercel build failure" --worktree
+cmux agent start REB-123 --prepare
+cmux agent scratch --title "Explore SDK publishing bug"
+cmux agent list
+cmux agent open REB-123
+cmux agent status REB-123 blocked "Need API shape decision"
+cmux agent review REB-123 "Ready for review"
+cmux agent done REB-123
+cmux agent promote scratch-20260502-1 --issue REB-123
+cmux agent sync REB-123
 ```
 
-### One-step SSH
+Session types:
+
+- `issue-backed`: Linear issue, branch/worktree, runbook, Linear sync.
+- `task-backed`: manually named goal, optional worktree.
+- `scratch`: quick current-directory session.
+
+For issue-backed and task-backed workspaces, cmux writes:
+
+```text
+.agent/RUNBOOK.md
+.agent/cmux.json
+```
+
+The initial agent prompt tells the agent to keep the runbook updated and to set
+cmux statuses when blocked, failed, or ready for review.
+
+## State And Config
+
+Local session state is stored outside the repo:
+
+```text
+~/.local/state/cmux/agents/*.json
+```
+
+Config lives at:
+
+```text
+~/.config/cmux/config.json
+```
+
+Example:
+
+```json
+{
+  "defaultAgent": "claude",
+  "worktreeRoot": "../worktrees",
+  "linear": {
+    "apiKeyEnv": "LINEAR_API_KEY",
+    "moveToStateOnStart": "In Progress",
+    "managedComment": true,
+    "syncStatus": true,
+    "statusMap": {
+      "running": "In Progress",
+      "blocked": "Blocked",
+      "tests_failed": "Blocked",
+      "ready_for_review": "In Review",
+      "done": "Done"
+    },
+    "autoStart": {
+      "enabled": true,
+      "mode": "prepare",
+      "intervalSeconds": 60,
+      "teamKeys": ["REB"],
+      "states": ["Ready for Agent"],
+      "labels": ["cmux"],
+      "maxConcurrent": 3
+    }
+  }
+}
+```
+
+Set your Linear token with:
 
 ```bash
-cmux ssh dev@devship          # SSH into host and open selector in one step
-cmux ssh dev                  # Same, using an alias from ~/.config/cmux/hosts
+export LINEAR_API_KEY=lin_api_xxx
 ```
 
-Define aliases in `~/.config/cmux/hosts`, one per line:
+## Linear Daemon
 
-```
-dev=dev@devship
-prod=-p 2222 user@prod.example.com
-```
-
-The value is passed to `ssh -t` so it can include flags like `-p`.
-
-### Popup switcher (jump back from inside a session)
-
-From inside any cmux session, press **prefix + g** to pop the selector as
-a floating window. Pick a session, popup closes, you're switched — no
-detaching, no exiting Claude.
-
-> The tmux **prefix** is whatever key combo opens tmux commands. By default
-> it's `Ctrl-b`, so press `Ctrl-b` then `g`. If you've remapped your prefix
-> (e.g. to `Ctrl-a`), use that instead. Check yours with
-> `tmux show-options -g prefix`.
-
-**No setup required.** cmux registers the binding on your tmux server
-automatically every time you run it. The binding lives until the tmux
-server dies (typically only on reboot or `tmux kill-server`), and the
-next `cmux` invocation re-registers it. We deliberately use `prefix + g`
-rather than `prefix + s` so we don't clobber tmux's built-in session
-picker — `g` has no default mapping in tmux.
-
-If you want the binding to survive `tmux kill-server` without running
-cmux first, paste this one line into `~/.tmux.conf` yourself:
-
-```
-bind-key g display-popup -E -w 85% -h 85% "cmux switch"
+```bash
+cmux daemon --once     # Poll once and exit
+cmux daemon            # Poll continuously
 ```
 
-Requires tmux 3.2+ for `display-popup`.
+The daemon reads `linear.autoStart` from config. In `prepare` mode it creates
+the registry/worktree/runbook without launching an agent. In `start` mode it
+also launches the configured agent in tmux.
 
-## Session Lifecycle
+## Status Hooks
 
-cmux has three layers — a selector, tmux sessions, and Claude running inside
-each session. Knowing which "close" maps to which layer keeps things tidy:
+cmux runs this hook when a structured session changes status:
 
-| You want to… | Do this | What happens |
-|---|---|---|
-| **End this session for good** | Quit Claude (`Ctrl-D` or `/exit`) | Claude exits; the tmux session auto-ends and disappears from the selector |
-| **Step away, keep working later** | `prefix d` (default `Ctrl-b d`) | Detaches the tmux client; session keeps running in the background |
-| **Close the selector without picking** | `q` or `esc` | Just closes the selector view; nothing else changes |
-| **Force-kill another session** | `d` on it in the selector (or `cmux kill <name>`) | Confirms, then destroys that session |
-
-Because cmux launches Claude with `exec`, ending Claude ends the session —
-no orphaned shell prompts to clean up.
-
-## Status Indicators
-
-The selector shows real-time session status:
-
-| Symbol | Status | Description |
-|--------|--------|-------------|
-| ● | Running | Claude is actively generating output |
-| ◐ | Waiting | Claude is waiting for your input |
-| ○ | Idle | Session has been idle for a while |
-| ✕ | Error | Error detected in session |
-
-## Selector UI
-
-```
-CMUX  ● running  ◐ waiting  ○ idle  ✕ error
-my-project
-◐ ▸ 1  fixing auth bug (api)  2h
-○   2  worker  15m
-──────────────────────────────────────────────────────────────
-> Can you help me fix the auth bug?
-I'll help you fix the authentication bug. Let me start by
-looking at the auth middleware to understand the current flow.
-──────────────────────────────────────────────────────────────
-↑↓ navigate · enter select · [n] new · [d] delete · [q] quit
+```text
+~/.config/cmux/hooks/on-status-change
 ```
 
-Features:
-- **Status indicators** - See which sessions are active at a glance
-- **Session preview** - View recent conversation content for selected session
-- **Adaptive layout** - Preview height adjusts to terminal size (2-8 lines)
-- **Title as primary name** - Custom titles display prominently with folder in parentheses
-- **Keyboard navigation** - Arrow keys, vim keys (j/k), home/end, pgup/pgdn
-- **Multi-digit jump** - Type `12` to jump to session #12
-- **`/` filter** - Live filter sessions by parent / child / title
-- **In-selector rename / title / delete** - `r`, `t`, `d` act on the selected row
-- **Help overlay** - `?` shows the full key map
+Environment:
 
-## Options
-
-| Flag | Description |
-|------|-------------|
-| `-m, --mobile` | Create session at fixed 78-col width (for mobile clients) |
-| `-t, --title` | Set session title on creation |
-
-## Session Naming
-
-Sessions are named based on directory structure using `@` as separator:
-
-```
-/projects/my-project/api → cmux@my-project@api
+```text
+CMUX_SESSION_ID
+CMUX_OLD_STATUS
+CMUX_NEW_STATUS
+CMUX_LINEAR_ISSUE_ID
+CMUX_WORKTREE
 ```
 
-If a duplicate exists, a numeric suffix is added (e.g., `cmux@my-project@api-2`).
+Use this for macOS notifications, Slack, Linear comments, or other local
+automation.
 
-## Terminus Setup
+## Commands
 
-To show the session selector on connect via Terminus:
-
-1. Open Terminus settings for your host
-2. Set "Startup Command" to: `cmux`
-
-## Commands Reference
-
-| Command | Alias | Description |
-|---------|-------|-------------|
-| `cmux` | | Interactive session selector |
-| `cmux selector` | `s` | Interactive session selector |
-| `cmux new [opts] [path]` | | Create new session (default: cwd) |
-| `cmux list` | `ls` | List all sessions with status |
-| `cmux attach <name>` | `a` | Attach to session |
-| `cmux switch` | `sw` | Switch sessions (inside tmux) |
-| `cmux kill <name>` | `k` | Kill a session |
-| `cmux rename <name>` | | Rename current session |
-| `cmux title <text>` | `t` | Set session title |
-| `cmux info` | `i` | Show current session info |
-| `cmux ssh <host\|alias>` | | One-step SSH + selector |
-| `cmux help` | | Show help |
+```text
+cmux
+cmux new [--agent|-a <cmd>] [--title|-t <text>] [--mobile|-m] [--no-attach] [path]
+cmux list
+cmux attach <name>
+cmux switch
+cmux kill <name>
+cmux rename <name>
+cmux title <text>
+cmux info
+cmux ssh <host|alias>
+cmux agent ...
+cmux daemon [--once]
+cmux legacy ...
+cmux help
+```

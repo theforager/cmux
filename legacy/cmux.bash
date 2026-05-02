@@ -1,0 +1,1351 @@
+#!/usr/bin/env bash
+#
+# cmux - Claude Tmux Session Manager
+# Manage multiple Claude Code sessions via tmux
+#
+
+set -euo pipefail
+
+VERSION="1.2.0"
+# Using @ as separator since colons conflict with tmux session:window syntax
+# and underscores are common in directory names
+CMUX_PREFIX="cmux"
+CMUX_SEP="@"
+
+# Mobile-friendly terminal width (used with --mobile flag)
+CMUX_MOBILE_WIDTH=78
+
+# SSH host alias config (alias=user@host[ ssh-args])
+CMUX_HOSTS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/cmux/hosts"
+
+# Colors
+C_RESET='\e[0m'
+C_BOLD='\e[1m'
+C_DIM='\e[2m'
+C_CYAN='\e[36m'
+C_GREEN='\e[32m'
+C_YELLOW='\e[33m'
+C_BLUE='\e[34m'
+C_MAGENTA='\e[35m'
+C_RED='\e[31m'
+
+# Status indicators
+STATUS_RUNNING="●"    # Claude is actively outputting
+STATUS_WAITING="◐"    # Waiting for user input
+STATUS_IDLE="○"       # Idle/no recent activity
+STATUS_ERROR="✕"      # Error state
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+die() {
+    echo "Error: $1" >&2
+    exit 1
+}
+
+is_inside_tmux() {
+    [[ -n "${TMUX:-}" ]]
+}
+
+get_sessions() {
+    tmux list-sessions -F "#{session_name}|#{session_created}" 2>/dev/null | \
+        grep "^${CMUX_PREFIX}${CMUX_SEP}" || true
+}
+
+get_session_title() {
+    tmux show-environment -t "$1" CMUX_TITLE 2>/dev/null | sed 's/^CMUX_TITLE=//' || echo ""
+}
+
+get_session_dir() {
+    tmux show-environment -t "$1" CMUX_DIR 2>/dev/null | sed 's/^CMUX_DIR=//' || echo ""
+}
+
+format_age() {
+    local diff=$(( $(date +%s) - $1 ))
+    if ((diff < 60)); then echo "${diff}s"
+    elif ((diff < 3600)); then echo "$((diff / 60))m"
+    elif ((diff < 86400)); then echo "$((diff / 3600))h"
+    else echo "$((diff / 86400))d"
+    fi
+}
+
+# /projects/foo/bar → cmux@foo@bar (with -2, -3 suffix on collision)
+generate_session_name() {
+    local abs_path
+    abs_path=$(cd "$1" && pwd)
+    local parent child
+    parent=$(basename "$(dirname "$abs_path")")
+    child=$(basename "$abs_path")
+    local base="${CMUX_PREFIX}${CMUX_SEP}${parent}${CMUX_SEP}${child}"
+    local name="$base"
+    local counter=2
+    while tmux has-session -t "$name" 2>/dev/null; do
+        name="${base}-${counter}"
+        ((counter++))
+    done
+    echo "$name"
+}
+
+get_session_parent() { echo "$1" | cut -d"${CMUX_SEP}" -f2; }
+get_session_child()  { echo "$1" | cut -d"${CMUX_SEP}" -f3-; }
+
+get_session_status() {
+    local session="$1"
+
+    local last_activity
+    last_activity=$(tmux display-message -t "$session" -p '#{pane_last_activity}' 2>/dev/null) || {
+        echo "${STATUS_ERROR}|${C_RED}"
+        return
+    }
+
+    local idle_seconds=$(( $(date +%s) - last_activity ))
+
+    local pane_content
+    pane_content=$(tmux capture-pane -t "$session" -p -S -5 2>/dev/null | tr -d '\0') || {
+        echo "${STATUS_ERROR}|${C_RED}"
+        return
+    }
+
+    local last_line
+    last_line=$(echo "$pane_content" | grep -v '^[[:space:]]*$' | tail -1)
+
+    if echo "$last_line" | grep -qiE '(error|exception|failed|panic|fatal)'; then
+        echo "${STATUS_ERROR}|${C_RED}"
+        return
+    fi
+    if [[ $idle_seconds -lt 2 ]]; then
+        echo "${STATUS_RUNNING}|${C_GREEN}"
+        return
+    fi
+    if echo "$last_line" | grep -qE '(^>|› |% ?$|\$ ?$|❯ ?$)'; then
+        echo "${STATUS_WAITING}|${C_YELLOW}"
+        return
+    fi
+    if [[ $idle_seconds -gt 30 ]]; then
+        echo "${STATUS_IDLE}|${C_DIM}"
+        return
+    fi
+    echo "${STATUS_WAITING}|${C_YELLOW}"
+}
+
+get_session_preview() {
+    local session="$1"
+    local max_len="${2:-70}"
+    local max_lines="${3:-30}"
+
+    # Capture the visible pane plus a bit of scrollback. We don't pull the
+    # whole history because the preview only ever shows the last screenful.
+    local pane_content
+    pane_content=$(tmux capture-pane -t "$session" -p -S -50 2>/dev/null | \
+        sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' | \
+        tr -d '\000-\010\013-\037') || {
+        echo ""
+        return
+    }
+
+    local -a raw=()
+    while IFS= read -r line; do
+        raw+=("$line")
+    done <<< "$pane_content"
+
+    local total=${#raw[@]}
+
+    # The bottom of a Claude pane is always: an input box (drawn with box
+    # characters), plus the "? for shortcuts" hint row. Walk backwards and
+    # eat those — anything with no alphanumerics (box borders, blank rows)
+    # and the explicit shortcut/help footer rows. Stop at the first row of
+    # actual conversational content.
+    while [[ $total -gt 0 ]]; do
+        local last="${raw[$((total-1))]}"
+        if ! [[ "$last" =~ [a-zA-Z0-9] ]] \
+           || [[ "$last" == *"for shortcuts"* ]] \
+           || [[ "$last" == *"for help"* ]]; then
+            total=$((total - 1))
+        else
+            break
+        fi
+    done
+
+    # Take the last max_lines of what's left, preserving order and any blank
+    # rows in between (those are conversational spacing, not noise).
+    local start=$((total > max_lines ? total - max_lines : 0))
+    local preview=""
+    local i
+    for ((i = start; i < total; i++)); do
+        local line="${raw[$i]}"
+        line="${line//|/-}"
+        line="${line//␤/ }"
+        # Trim outer whitespace so the gutter sits flush
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ ${#line} -gt $max_len ]] && line="${line:0:$((max_len - 1))}…"
+        [[ -n "$preview" ]] && preview+="␤"
+        preview+="$line"
+    done
+    # Double any backslashes so the renderer (printf '%b') doesn't interpret
+    # literal "\e[…" text from a Claude pane (ANSI examples, escape codes in
+    # code blocks, etc.) as real escape sequences. Without this, a preview
+    # containing the string "\e[2J" would *actually clear the screen* when
+    # rendered. This was the cause of the "top half cut off when selecting
+    # session #1" bug.
+    preview="${preview//\\/\\\\}"
+    printf '%s' "$preview"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Terminal state. The selector enters the alternate screen with hidden cursor
+# and stty -echo. Mobile/SSH terminals (Terminus, Blink, kitty, etc.) can
+# leave bracketed-paste, modifyOtherKeys, or kitty-keyboard protocol modes
+# enabled — those modes encode plain keystrokes as CSI sequences ("U" arriving
+# as "[226~"), which mangles any subsequent `read -r`. We disable each mode
+# explicitly on entry and exit.
+# ─────────────────────────────────────────────────────────────────────────────
+
+TTY_STATE_SAVED=""
+
+selector_setup_tty() {
+    TTY_STATE_SAVED=$(stty -g 2>/dev/null || true)
+    # Disable bracketed paste in case the user's terminal has it on — its
+    # "[200~ ... [201~" markers were the actual cause of the original
+    # U → [226~ symptom. Other speculative resets (kitty keyboard pop,
+    # modifyOtherKeys, cursor-key application mode) are deliberately *not*
+    # sent: some terminals respond to them with bytes that get buffered for
+    # the next process (tmux/Claude), causing visible redraw artifacts when
+    # we switch into a session.
+    printf '\e[?2004l'
+    # Enter alternate screen, then explicitly clear it. `\e[?1049h` is
+    # spec'd to clear on entry, but some tmux/SSH/terminal combos don't,
+    # leaving the underlying shell scrollback visible behind our selector
+    # (looks like "ghosting"). \e[2J forces a clean slate.
+    printf '\e[?1049h\e[2J\e[H\e[?25l'
+    stty -echo 2>/dev/null || true
+}
+
+selector_restore_tty() {
+    printf '\e[?2004l'   # keep bracketed paste off through prompt_for_path
+    printf '\e[?25h'
+    printf '\e[?1049l'
+    if [[ -n "$TTY_STATE_SAVED" ]]; then
+        stty "$TTY_STATE_SAVED" 2>/dev/null || stty echo 2>/dev/null || true
+    else
+        stty echo 2>/dev/null || true
+    fi
+    TTY_STATE_SAVED=""
+}
+
+# Read one keypress. Consumes complete CSI/SS3 escape sequences so unmapped
+# keys (modified F-keys, mouse events, kitty/CSI-u modifiers) don't leak as
+# stray bytes — that leakage is the source of the "U → [226~" symptom when a
+# stray ESC was eaten earlier.
+read_key() {
+    local key
+    IFS= read -rsn1 key 2>/dev/null || return 1
+
+    if [[ "$key" == $'\e' ]]; then
+        local b
+        if ! IFS= read -rsn1 -t1 b 2>/dev/null; then
+            echo "escape"; return
+        fi
+        case "$b" in
+            '[')
+                # CSI: read until final byte (0x40-0x7E)
+                local seq=""
+                while IFS= read -rsn1 -t1 b 2>/dev/null; do
+                    seq+="$b"
+                    case "$b" in
+                        [@A-Z\[\\\^_\`a-z\{\|\}\~]) break ;;
+                    esac
+                done
+                case "$seq" in
+                    A) echo "up" ;;
+                    B) echo "down" ;;
+                    C) echo "right" ;;
+                    D) echo "left" ;;
+                    H|1~|7~) echo "home" ;;
+                    F|4~|8~) echo "end" ;;
+                    5~) echo "pgup" ;;
+                    6~) echo "pgdown" ;;
+                    3~) echo "del" ;;
+                    *)  echo "unknown" ;;
+                esac
+                return
+                ;;
+            'O')
+                IFS= read -rsn1 -t1 b 2>/dev/null || true
+                case "$b" in
+                    A) echo "up" ;;
+                    B) echo "down" ;;
+                    C) echo "right" ;;
+                    D) echo "left" ;;
+                    *) echo "unknown" ;;
+                esac
+                return
+                ;;
+            *)
+                echo "escape"; return
+                ;;
+        esac
+    fi
+
+    case "$key" in
+        '')              echo "enter" ;;
+        $'\x7f'|$'\x08') echo "backspace" ;;
+        *)               echo "$key" ;;
+    esac
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Commands
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Two-prompt new-session entry: path, then agent. Title is set later via the
+# selector ('t' key). Agent prompt defaults to $CMUX_AGENT (then claude) so
+# Enter-Enter is still the fast path.
+_CMUX_PICKED_DIR=""
+_CMUX_PICKED_AGENT=""
+
+prompt_for_path() {
+    _CMUX_PICKED_DIR=""
+    _CMUX_PICKED_AGENT=""
+    local cwd default_name
+    cwd=$(pwd)
+    default_name=$(basename "$(dirname "$cwd")")@$(basename "$cwd")
+    local default_agent="${CMUX_AGENT:-claude}"
+
+    printf "${C_BOLD}new session${C_RESET}  ${C_DIM}%s${C_RESET}\n\n" "$default_name"
+
+    # Path: line input. cwd is shown in brackets as the default; Enter
+    # accepts it; typing a path overrides; q cancels.
+    printf "  ${C_DIM}path${C_RESET}    ${C_DIM}[%s]${C_RESET} " "$cwd"
+    local input
+    read -r input
+    if [[ "$input" == "q" || "$input" == "Q" ]]; then
+        return 1
+    fi
+    input="${input:-$cwd}"
+    input="${input/#\~/$HOME}"
+    if [[ ! -d "$input" ]]; then
+        printf "  ${C_RED}not a directory: %s${C_RESET}\n" "$input"
+        return 1
+    fi
+    _CMUX_PICKED_DIR="$input"
+
+    printf "\n  ${C_DIM}agent${C_RESET}\n"
+
+    # Agent picker: arrow keys to navigate, Enter to pick, 1/2/3 to jump,
+    # q/esc to cancel. Three options — claude, codex, other (custom command).
+    local -a agents=("claude" "codex" "other (custom command)")
+    local agent_idx=0
+    [[ "$default_agent" == "codex" ]] && agent_idx=1
+
+    printf '\e[?25l'  # hide cursor while navigating
+
+    local i first=1
+    while true; do
+        if [[ $first -eq 0 ]]; then
+            printf '\e[%dA' "${#agents[@]}"  # move up to first agent line
+        fi
+        first=0
+        for ((i = 0; i < ${#agents[@]}; i++)); do
+            local n=$((i + 1))
+            if [[ $i -eq $agent_idx ]]; then
+                printf "    ${C_DIM}%d${C_RESET} ${C_GREEN}▸${C_RESET} ${C_BOLD}%s${C_RESET}\e[K\n" "$n" "${agents[$i]}"
+            else
+                printf "    ${C_DIM}%d${C_RESET}   %s\e[K\n" "$n" "${agents[$i]}"
+            fi
+        done
+
+        local key
+        key=$(read_key)
+        case "$key" in
+            up|k)
+                agent_idx=$((agent_idx - 1))
+                [[ $agent_idx -lt 0 ]] && agent_idx=$((${#agents[@]} - 1))
+                ;;
+            down|j)
+                agent_idx=$((agent_idx + 1))
+                [[ $agent_idx -ge ${#agents[@]} ]] && agent_idx=0
+                ;;
+            1) agent_idx=0; break ;;
+            2) agent_idx=1; break ;;
+            3) agent_idx=2; break ;;
+            enter) break ;;
+            q|Q|escape)
+                printf '\e[?25h\n'
+                return 1
+                ;;
+        esac
+    done
+    printf '\e[?25h'
+
+    if [[ $agent_idx -eq 2 ]]; then
+        # Custom: prompt for the actual command
+        printf "\n  ${C_DIM}command${C_RESET}  "
+        local custom_cmd
+        read -r custom_cmd
+        if [[ -z "$custom_cmd" || "$custom_cmd" == "q" || "$custom_cmd" == "Q" ]]; then
+            return 1
+        fi
+        _CMUX_PICKED_AGENT="$custom_cmd"
+    else
+        _CMUX_PICKED_AGENT="${agents[$agent_idx]}"
+    fi
+    return 0
+}
+
+cmd_new() {
+    local mobile=false
+    local path=""
+    local title=""
+    local agent="${CMUX_AGENT:-claude}"
+    local no_attach=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --mobile|-m) mobile=true; shift ;;
+            --title|-t)  title="$2"; shift 2 ;;
+            --agent|-a)  agent="$2"; shift 2 ;;
+            --no-attach) no_attach=true; shift ;;
+            *)           path="$1"; shift ;;
+        esac
+    done
+
+    # Map agent name → command. claude/codex are well-known; anything else
+    # is treated as a custom command (potentially with args). Validation
+    # checks the first word exists on PATH (or is an executable abs path).
+    local agent_lc
+    agent_lc=$(printf '%s' "$agent" | tr '[:upper:]' '[:lower:]')
+    local agent_cmd
+    case "$agent_lc" in
+        claude) agent_cmd="claude" ;;
+        codex)  agent_cmd="codex" ;;
+        *)      agent_cmd="$agent" ;;
+    esac
+    local first_word="${agent_cmd%% *}"
+    if [[ "$first_word" == /* ]]; then
+        [[ -x "$first_word" ]] || die "Agent command not executable: $first_word"
+    else
+        command -v "$first_word" >/dev/null 2>&1 || \
+            die "Agent command not found in PATH: $first_word"
+    fi
+
+    path="${path:-.}"
+    [[ -d "$path" ]] || die "Directory does not exist: $path"
+
+    local abs_path
+    abs_path=$(cd "$path" && pwd)
+
+    local session_name
+    session_name=$(generate_session_name "$abs_path")
+
+    if [[ "$mobile" == true ]]; then
+        tmux new-session -d -s "$session_name" -c "$abs_path" -x "$CMUX_MOBILE_WIDTH"
+    else
+        local cols lines
+        cols=$(tput cols 2>/dev/null || echo 80)
+        lines=$(tput lines 2>/dev/null || echo 24)
+        tmux new-session -d -s "$session_name" -c "$abs_path" -x "$cols" -y "$lines"
+    fi
+
+    tmux set-environment -t "$session_name" CMUX_SESSION "$session_name"
+    tmux set-environment -t "$session_name" CMUX_DIR "$abs_path"
+    tmux set-environment -t "$session_name" CMUX_AGENT "$agent_lc"
+    [[ -n "$title" ]] && tmux set-environment -t "$session_name" CMUX_TITLE "$title"
+
+    ensure_popup_binding
+
+    # `exec` replaces the shell with the agent so when the agent exits
+    # (Ctrl-D, /exit, crash) the pane has no remaining process and tmux's
+    # default `remain-on-exit off` ends the session — no orphaned shell
+    # prompts cluttering the selector. To keep a session running while
+    # stepping away, detach with `prefix d` instead.
+    tmux send-keys -t "$session_name" "exec $agent_cmd" Enter
+    _CMUX_LAST_CREATED="$session_name"
+    echo "Created session: $session_name (agent: $agent_lc)"
+
+    if $no_attach; then
+        return 0
+    fi
+
+    if is_inside_tmux; then
+        tmux switch-client -t "$session_name"
+    else
+        tmux attach-session -t "$session_name"
+    fi
+}
+
+# Set by cmd_new so the selector can attach to the just-created session
+# after a confirmation step (rather than auto-attaching).
+_CMUX_LAST_CREATED=""
+
+cmd_list() {
+    local sessions
+    sessions=$(get_sessions)
+
+    if [[ -z "$sessions" ]]; then
+        echo "No cmux sessions"
+        return 0
+    fi
+
+    printf "${C_GREEN}${STATUS_RUNNING}${C_RESET}running ${C_YELLOW}${STATUS_WAITING}${C_RESET}waiting ${C_DIM}${STATUS_IDLE}idle${C_RESET} ${C_RED}${STATUS_ERROR}${C_RESET}error\n\n"
+
+    echo "$sessions" | while IFS='|' read -r name created; do
+        local title age child status_info status_sym status_color
+        title=$(get_session_title "$name")
+        age=$(format_age "$created")
+        child=$(get_session_child "$name")
+        status_info=$(get_session_status "$name")
+        status_sym=$(echo "$status_info" | cut -d'|' -f1)
+        status_color=$(echo "$status_info" | cut -d'|' -f2)
+
+        if [[ -n "$title" ]]; then
+            printf "${status_color}${status_sym}${C_RESET} %s\t${C_DIM}(%s)${C_RESET}\t%s\n" "$title" "$child" "$age"
+        else
+            printf "${status_color}${status_sym}${C_RESET} %s\t\t%s\n" "$child" "$age"
+        fi
+    done
+}
+
+cmd_attach() {
+    local target="$1"
+    local session=""
+    session=$(get_sessions | cut -d'|' -f1 | grep -E "${CMUX_SEP}${target}\$" | head -1)
+    [[ -z "$session" ]] && session=$(get_sessions | cut -d'|' -f1 | grep -F "$target" | head -1)
+    [[ -z "$session" ]] && die "No session matching: $target"
+
+    ensure_popup_binding
+    if is_inside_tmux; then
+        tmux switch-client -t "$session"
+    else
+        tmux attach-session -t "$session"
+    fi
+}
+
+cmd_switch() {
+    is_inside_tmux || die "Not inside tmux. Use 'cmux' instead."
+    show_selector switch
+}
+
+cmd_kill() {
+    local target="$1"
+    local session=""
+    session=$(get_sessions | cut -d'|' -f1 | grep -E "${CMUX_SEP}${target}\$" | head -1)
+    [[ -z "$session" ]] && session=$(get_sessions | cut -d'|' -f1 | grep -F "$target" | head -1)
+    [[ -z "$session" ]] && die "No session matching: $target"
+
+    tmux kill-session -t "$session"
+    echo "Killed session: $session"
+}
+
+cmd_rename() {
+    local new_name="$1"
+    is_inside_tmux || die "Not inside tmux session"
+
+    local current
+    current=$(tmux display-message -p '#{session_name}')
+    [[ "$current" =~ ^${CMUX_PREFIX}${CMUX_SEP} ]] || die "Not in a cmux session"
+
+    local parent new_full
+    parent=$(get_session_parent "$current")
+    new_full="${CMUX_PREFIX}${CMUX_SEP}${parent}${CMUX_SEP}${new_name}"
+
+    tmux rename-session -t "$current" "$new_full"
+    tmux set-environment -t "$new_full" CMUX_SESSION "$new_full"
+    echo "Renamed to: $new_full"
+}
+
+cmd_title() {
+    local title="$1"
+    is_inside_tmux || die "Not inside tmux session"
+
+    local current
+    current=$(tmux display-message -p '#{session_name}')
+    [[ "$current" =~ ^${CMUX_PREFIX}${CMUX_SEP} ]] || die "Not in a cmux session"
+
+    tmux set-environment -t "$current" CMUX_TITLE "$title"
+    echo "Title set: $title"
+}
+
+get_session_agent() {
+    tmux show-environment -t "$1" CMUX_AGENT 2>/dev/null | sed 's/^CMUX_AGENT=//' || echo ""
+}
+
+cmd_info() {
+    is_inside_tmux || die "Not inside tmux session"
+
+    local current
+    current=$(tmux display-message -p '#{session_name}')
+    [[ "$current" =~ ^${CMUX_PREFIX}${CMUX_SEP} ]] || die "Not in a cmux session"
+
+    local title dir agent created age
+    title=$(get_session_title "$current")
+    dir=$(get_session_dir "$current")
+    agent=$(get_session_agent "$current")
+    created=$(tmux display-message -p -t "$current" '#{session_created}')
+    age=$(format_age "$created")
+
+    echo "Session: $current"
+    echo "Directory: $dir"
+    echo "Title: ${title:-<not set>}"
+    echo "Agent: ${agent:-claude}"
+    echo "Age: $age"
+}
+
+# Resolve a host alias from ~/.config/cmux/hosts (format: alias=user@host).
+# Falls back to the literal argument if no alias matches.
+resolve_ssh_host() {
+    local target="$1"
+    if [[ -f "$CMUX_HOSTS_FILE" ]]; then
+        local line
+        line=$(grep -E "^${target}=" "$CMUX_HOSTS_FILE" 2>/dev/null | head -1)
+        if [[ -n "$line" ]]; then
+            echo "${line#*=}"
+            return
+        fi
+    fi
+    echo "$target"
+}
+
+cmd_ssh() {
+    [[ $# -ge 1 ]] || die "Usage: cmux ssh <host|alias> [cmux-args...]"
+    local host
+    host=$(resolve_ssh_host "$1")
+    shift
+    # -t forces TTY allocation so the remote selector renders correctly.
+    # Word-splitting on $host is intentional so an alias value can include ssh
+    # flags (e.g. "-p 2222 user@host"). The hosts file is user-controlled.
+    if [[ $# -eq 0 ]]; then
+        exec ssh -t $host cmux
+    else
+        exec ssh -t $host cmux "$@"
+    fi
+}
+
+# Idempotently register the popup-switcher binding on the running tmux server.
+# Uses `prefix g` because tmux has no default mapping for it, so we can't
+# clobber a user's binding by accident. The bind lives until the tmux server
+# dies (typically only on reboot or `tmux kill-server`); cmux re-registers on
+# every interactive run, so users effectively never have to think about it.
+ensure_popup_binding() {
+    tmux bind-key g display-popup -E -w "85%" -h "85%" "cmux switch" 2>/dev/null || true
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Interactive Selector
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Selector state lives at file scope so helpers can mutate without bash 3.2's
+# subshell-locals quirks getting in the way.
+SEL_MODE=""           # browse | filter | rename | title | confirm
+SEL_FILTER=""         # active filter substring
+SEL_TEXT=""           # text buffer for rename/title input
+SEL_TARGET=""         # session being acted on (rename/title/confirm)
+SEL_DIGITS=""         # multi-digit jump buffer
+SEL_MESSAGE=""        # transient footer message
+
+# Filter session_data → only matching rows, with sequential renumbering so the
+# digit-jump and selection cursor work over the visible set.
+_selector_filter_data() {
+    local data="$1"
+    local filter="$2"
+    if [[ -z "$filter" ]]; then
+        echo "$data"
+        return
+    fi
+    local lf
+    lf=$(echo "$filter" | tr '[:upper:]' '[:lower:]')
+    local out=""
+    local n=0
+    while IFS='|' read -r num p child title age fullname status_sym status_color preview; do
+        [[ -z "$num" ]] && continue
+        local hay
+        hay=$(echo "${p} ${child} ${title}" | tr '[:upper:]' '[:lower:]')
+        if [[ "$hay" == *"$lf"* ]]; then
+            n=$((n + 1))
+            out+="${n}|${p}|${child}|${title}|${age}|${fullname}|${status_sym}|${status_color}|${preview}"$'\n'
+        fi
+    done <<< "$data"
+    printf '%s' "$out"
+}
+
+_selector_field_at() {
+    local data="$1" idx="$2" field="$3"
+    awk -F'|' -v idx="$idx" -v f="$field" '$1 == idx {print $f; exit}' <<< "$data"
+}
+
+_selector_session_at() {
+    _selector_field_at "$1" "$2" 6
+}
+
+# Build a horizontal rule that fills the terminal width using a single
+# repeated unicode char. Capped to avoid silliness on huge terminals.
+_selector_rule() {
+    local cols="${1:-80}"
+    [[ $cols -gt 120 ]] && cols=120
+    [[ $cols -lt 20 ]] && cols=20
+    local rule=""
+    local i=0
+    while [[ $i -lt $cols ]]; do
+        rule+="─"
+        i=$((i + 1))
+    done
+    printf '%s' "$rule"
+}
+
+# A rule with an embedded label, e.g. "── preview ─────────...".
+_selector_labeled_rule() {
+    local cols="${1:-80}"
+    local label="${2:-}"
+    [[ $cols -gt 120 ]] && cols=120
+    [[ $cols -lt 20 ]] && cols=20
+    local prefix="── ${label} "
+    local prefix_len=${#prefix}
+    local fill_len=$(( cols - prefix_len ))
+    [[ $fill_len -lt 4 ]] && fill_len=4
+    local fill=""
+    local i=0
+    while [[ $i -lt $fill_len ]]; do
+        fill+="─"
+        i=$((i + 1))
+    done
+    printf '%s%s' "$prefix" "$fill"
+}
+
+_selector_render() {
+    local data="$1"
+    local visible_count="$2"
+    local selected="$3"
+    local max_preview_lines="$4"
+    local term_cols="${5:-80}"
+
+    printf '\e[H'
+
+    local rule
+    rule=$(_selector_rule "$term_cols")
+
+    local count_label="$visible_count session"
+    [[ $visible_count -ne 1 ]] && count_label+="s"
+
+    local output=""
+    # Header — title + session count, no inline legend (legend lives in `?`)
+    output+="${C_BOLD}${C_CYAN}cmux${C_RESET}  ${C_DIM}${count_label}${C_RESET}\e[K\n"
+
+    # Filter line only when actually filtering — saves a row of vertical space
+    # for preview when not in filter mode.
+    if [[ -n "$SEL_FILTER" || "$SEL_MODE" == "filter" ]]; then
+        output+="${C_YELLOW}/${C_RESET}${SEL_FILTER}"
+        [[ "$SEL_MODE" == "filter" ]] && output+="${C_BOLD}_${C_RESET}"
+        output+="\e[K\n"
+    fi
+
+    local selected_preview=""
+
+    if [[ $visible_count -eq 0 ]]; then
+        output+="${C_DIM}  no match${C_RESET}\e[K\n"
+    else
+        local parents
+        parents=$(echo "$data" | cut -d'|' -f2 | sort -u | grep -v '^$' || true)
+        local parent
+        for parent in $parents; do
+            local parent_buffer=""
+            local has_visible=0
+            while IFS='|' read -r num p child title age fullname status_sym status_color preview; do
+                [[ -z "$num" ]] && continue
+                [[ "$p" != "$parent" ]] && continue
+                has_visible=1
+
+                local display_name="" display_secondary=""
+                if [[ -n "$title" ]]; then
+                    display_name="$title"
+                    display_secondary="($child)"
+                else
+                    display_name="$child"
+                fi
+
+                # Selected: green left-bar + bold name. Unselected: matching
+                # space-pad so columns stay aligned across the list.
+                if [[ "$num" -eq "$selected" ]]; then
+                    parent_buffer+="${status_color}${status_sym}${C_RESET} ${C_GREEN}▌${C_RESET}$(printf '%2s' "$num")  ${C_BOLD}${display_name}${C_RESET}"
+                    [[ -n "$display_secondary" ]] && parent_buffer+=" ${C_DIM}${display_secondary}${C_RESET}"
+                    parent_buffer+="  ${C_DIM}${age}${C_RESET}\e[K\n"
+                    selected_preview="$preview"
+                else
+                    parent_buffer+="${status_color}${status_sym}${C_RESET}  $(printf '%2s' "$num")  ${C_CYAN}${display_name}${C_RESET}"
+                    [[ -n "$display_secondary" ]] && parent_buffer+=" ${C_DIM}${display_secondary}${C_RESET}"
+                    parent_buffer+="  ${C_DIM}${age}${C_RESET}\e[K\n"
+                fi
+            done <<< "$data"
+            if [[ $has_visible -eq 1 ]]; then
+                # Subtler group header — dim, no bold, no color, slight indent
+                output+="${C_DIM}  ${parent}${C_RESET}\e[K\n"
+                output+="$parent_buffer"
+            fi
+        done
+    fi
+
+    # Preview block: labeled top rule, left-gutter line marker, the most
+    # recent user prompt rendered bold to draw the eye.
+    local preview_label
+    preview_label=$(_selector_labeled_rule "$term_cols" "preview")
+    output+="${C_DIM}${preview_label}${C_RESET}\e[K\n"
+
+    local preview_line_count=0
+    if [[ -n "$selected_preview" ]]; then
+        local -a plines=()
+        while IFS= read -r pline; do
+            plines+=("$pline")
+        done <<< "${selected_preview//␤/$'\n'}"
+
+        local total_plines=${#plines[@]}
+        local last_user_idx=-1
+        local i
+        for ((i = 0; i < total_plines; i++)); do
+            if [[ "${plines[$i]}" =~ ^[\>] ]]; then
+                last_user_idx=$i
+            fi
+        done
+
+        for ((i = 0; i < total_plines; i++)); do
+            ((preview_line_count++))
+            [[ $preview_line_count -gt $max_preview_lines ]] && break
+            local pline="${plines[$i]}"
+            # Gutter is always dim; content uses its own color so the line
+            # actually reads on terminals that render dim faintly (Terminus).
+            if [[ "$pline" =~ ^[\>] ]]; then
+                if [[ $i -eq $last_user_idx ]]; then
+                    output+="${C_DIM}▎${C_RESET} ${C_BOLD}${C_CYAN}${pline}${C_RESET}\e[K\n"
+                else
+                    output+="${C_DIM}▎${C_RESET} ${C_CYAN}${pline}${C_RESET}\e[K\n"
+                fi
+            elif [[ "$pline" =~ ^[\$\%] ]]; then
+                output+="${C_DIM}▎${C_RESET} ${C_YELLOW}${pline}${C_RESET}\e[K\n"
+            else
+                output+="${C_DIM}▎${C_RESET} ${pline}\e[K\n"
+            fi
+        done
+    else
+        ((preview_line_count++))
+        output+="${C_DIM}▎ (no recent activity)${C_RESET}\e[K\n"
+    fi
+    while [[ $preview_line_count -lt $max_preview_lines ]]; do
+        output+="\e[K\n"
+        ((preview_line_count++))
+    done
+    output+="${C_DIM}${rule}${C_RESET}\e[K\n"
+
+    case "$SEL_MODE" in
+        rename)
+            output+="${C_YELLOW}rename${C_RESET}  ${SEL_TEXT}${C_BOLD}_${C_RESET}   ${C_DIM}enter save · esc cancel${C_RESET}\e[K\n"
+            ;;
+        title)
+            output+="${C_YELLOW}title${C_RESET}   ${SEL_TEXT}${C_BOLD}_${C_RESET}   ${C_DIM}enter save · esc cancel${C_RESET}\e[K\n"
+            ;;
+        confirm)
+            local target_label
+            target_label=$(get_session_title "$SEL_TARGET")
+            [[ -z "$target_label" ]] && target_label=$(get_session_child "$SEL_TARGET")
+            output+="${C_RED}delete${C_RESET}  ${C_BOLD}${target_label}${C_RESET}   ${C_DIM}y to confirm · any key cancel${C_RESET}\e[K\n"
+            ;;
+        filter)
+            output+="${C_DIM}type to filter · enter apply · esc clear${C_RESET}\e[K\n"
+            ;;
+        *)
+            output+="${C_DIM}↑↓${C_RESET} nav  ${C_DIM}enter${C_RESET} open  ${C_DIM}/${C_RESET} filter  ${C_DIM}n${C_RESET} new  ${C_DIM}r${C_RESET} rename  ${C_DIM}t${C_RESET} title  ${C_DIM}d${C_RESET} del  ${C_DIM}?${C_RESET} help  ${C_DIM}q${C_RESET} quit\e[K\n"
+            ;;
+    esac
+
+    if [[ -n "$SEL_DIGITS" ]]; then
+        output+="${C_CYAN}→ ${SEL_DIGITS}${C_RESET}\e[K\n"
+    elif [[ -n "$SEL_MESSAGE" ]]; then
+        output+="${SEL_MESSAGE}\e[K\n"
+    else
+        output+="\e[K\n"
+    fi
+
+    output+="\e[J"  # clear from cursor to end of alt screen
+    printf '%b' "$output"
+}
+
+_selector_commit_text() {
+    local mode="$1"
+    [[ -z "$SEL_TARGET" ]] && return 1
+
+    case "$mode" in
+        rename)
+            if [[ -z "$SEL_TEXT" ]]; then
+                SEL_MESSAGE="${C_RED}Empty name.${C_RESET}"
+                return 1
+            fi
+            if [[ "$SEL_TEXT" == *"$CMUX_SEP"* ]]; then
+                SEL_MESSAGE="${C_RED}Invalid (no '${CMUX_SEP}').${C_RESET}"
+                return 1
+            fi
+            local parent new_full
+            parent=$(get_session_parent "$SEL_TARGET")
+            new_full="${CMUX_PREFIX}${CMUX_SEP}${parent}${CMUX_SEP}${SEL_TEXT}"
+            if tmux rename-session -t "$SEL_TARGET" "$new_full" 2>/dev/null; then
+                tmux set-environment -t "$new_full" CMUX_SESSION "$new_full" 2>/dev/null || true
+                SEL_MESSAGE="${C_GREEN}Renamed.${C_RESET}"
+            else
+                SEL_MESSAGE="${C_RED}Rename failed (name in use?).${C_RESET}"
+            fi
+            ;;
+        title)
+            if tmux set-environment -t "$SEL_TARGET" CMUX_TITLE "$SEL_TEXT" 2>/dev/null; then
+                SEL_MESSAGE="${C_GREEN}Title set.${C_RESET}"
+            else
+                SEL_MESSAGE="${C_RED}Failed to set title.${C_RESET}"
+            fi
+            ;;
+    esac
+}
+
+_selector_run_new() {
+    # Stay inside the alt screen — clear it and switch to line-input mode
+    # for the prompts. Previously we exited the alt screen, which briefly
+    # exposed the user's pre-cmux shell scrollback under the prompts.
+    printf '\e[H\e[2J\e[?25h'
+    stty echo 2>/dev/null || true
+
+    if ! prompt_for_path; then
+        # Cancelled — restore selector mode (raw input, hidden cursor)
+        printf '\e[?25l'
+        stty -echo 2>/dev/null || true
+        return 1
+    fi
+
+    # Create the session but don't attach yet — the user explicitly asked
+    # for an Enter-to-attach beat instead of auto-jumping into the session.
+    local agent_args=()
+    [[ -n "$_CMUX_PICKED_AGENT" ]] && agent_args=(--agent "$_CMUX_PICKED_AGENT")
+    cmd_new --no-attach "$_CMUX_PICKED_DIR" "${agent_args[@]}"
+
+    local target="$_CMUX_LAST_CREATED"
+    printf "\n  ${C_DIM}press enter to attach, q to leave it running${C_RESET}\n  "
+    local confirm
+    read -r confirm
+
+    selector_restore_tty
+    trap - EXIT INT TERM HUP
+
+    if [[ "$confirm" == "q" || "$confirm" == "Q" ]]; then
+        echo "Session left running. Use 'cmux' to attach later."
+        return 0
+    fi
+    if [[ -n "$target" ]]; then
+        if is_inside_tmux; then
+            tmux switch-client -t "$target"
+        else
+            tmux attach-session -t "$target"
+        fi
+    fi
+    return 0
+}
+
+_selector_show_help() {
+    printf '\e[2J\e[H'
+    local out=""
+    out+="${C_BOLD}CMUX Selector Keys${C_RESET}\n\n"
+    out+="  ${C_CYAN}↑↓ j k${C_RESET}        navigate\n"
+    out+="  ${C_CYAN}home end${C_RESET}      first / last\n"
+    out+="  ${C_CYAN}pgup pgdn${C_RESET}     ±5\n"
+    out+="  ${C_CYAN}1-9 digits${C_RESET}    jump to N (multi-digit ok)\n"
+    out+="  ${C_CYAN}enter${C_RESET}         open selected\n"
+    out+="  ${C_CYAN}/${C_RESET}             filter (esc clears)\n"
+    out+="  ${C_CYAN}n${C_RESET}             new session\n"
+    out+="  ${C_CYAN}r${C_RESET}             rename selected\n"
+    out+="  ${C_CYAN}t${C_RESET}             set title for selected\n"
+    out+="  ${C_CYAN}d${C_RESET}             delete (with confirm)\n"
+    out+="  ${C_CYAN}q esc${C_RESET}         quit\n"
+    out+="  ${C_CYAN}?${C_RESET}             this help\n\n"
+    out+="  ${C_DIM}press any key to return${C_RESET}"
+    printf '%b' "$out"
+    read_key >/dev/null
+}
+
+show_selector() {
+    local mode="${1:-attach}"
+
+    ensure_popup_binding
+    selector_setup_tty
+    trap 'selector_restore_tty' EXIT INT TERM HUP
+
+    SEL_MODE="browse"
+    SEL_FILTER=""
+    SEL_TEXT=""
+    SEL_TARGET=""
+    SEL_DIGITS=""
+    SEL_MESSAGE=""
+
+    while true; do
+        local sessions
+        sessions=$(get_sessions)
+
+        # Handle empty state
+        if [[ -z "$sessions" ]]; then
+            printf '\e[H\e[2J'
+            printf '%b' "${C_BOLD}${C_CYAN}cmux${C_RESET}  ${C_DIM}no sessions${C_RESET}\n\n"
+            printf '%b' "  ${C_DIM}n${C_RESET} new   ${C_DIM}q${C_RESET} quit\n"
+            local key
+            key=$(read_key)
+            case "$key" in
+                n|N)
+                    if _selector_run_new; then return 0; fi
+                    continue
+                    ;;
+                q|Q|escape)
+                    selector_restore_tty
+                    trap - EXIT INT TERM HUP
+                    return 0
+                    ;;
+                *) continue ;;
+            esac
+        fi
+
+        # Build all-session data once per refresh cycle
+        local term_cols term_lines
+        term_cols=$(tput cols 2>/dev/null || echo 80)
+        term_lines=$(tput lines 2>/dev/null || echo 24)
+        local preview_width=$((term_cols - 4))
+        [[ $preview_width -gt 100 ]] && preview_width=100
+        [[ $preview_width -lt 40 ]] && preview_width=40
+
+        local all_session_count=0
+        local all_session_data=""
+        while IFS='|' read -r name created; do
+            [[ -z "$name" ]] && continue
+            local parent child title age status_info status_sym status_color preview
+            parent=$(get_session_parent "$name")
+            child=$(get_session_child "$name")
+            title=$(get_session_title "$name")
+            age=$(format_age "$created")
+            status_info=$(get_session_status "$name")
+            status_sym="${status_info%%|*}"
+            status_color="${status_info#*|}"
+            preview=$(get_session_preview "$name" "$preview_width" 30)
+            preview="${preview//$'\n'/ }"
+            all_session_count=$((all_session_count + 1))
+            all_session_data+="${all_session_count}|${parent}|${child}|${title}|${age}|${name}|${status_sym}|${status_color}|${preview}"$'\n'
+        done <<< "$sessions"
+
+        local selected=1
+        local refresh=0
+
+        # Inner render loop — break to refresh data, return to exit selector.
+        while true; do
+            # Apply filter to get visible data + visible_count
+            local visible_data visible_count
+            visible_data=$(_selector_filter_data "$all_session_data" "$SEL_FILTER")
+            visible_count=$(echo "$visible_data" | grep -c '^[0-9]' || true)
+            [[ -z "$visible_count" ]] && visible_count=0
+
+            # Clamp selection to visible range
+            if [[ $visible_count -eq 0 ]]; then
+                selected=0
+            else
+                [[ $selected -lt 1 ]] && selected=1
+                [[ $selected -gt $visible_count ]] && selected=$visible_count
+            fi
+
+            # Preview takes whatever vertical space is left after header (1),
+            # rules (2), footer + status (2), and the session list (each row
+            # plus ~1 group-header line per parent). Floor at 4 (otherwise
+            # pointless) and ceiling at 40 (sanity).
+            local max_preview_lines=$(( term_lines - visible_count - 7 ))
+            [[ $max_preview_lines -lt 4 ]] && max_preview_lines=4
+            [[ $max_preview_lines -gt 40 ]] && max_preview_lines=40
+
+            _selector_render "$visible_data" "$visible_count" "$selected" "$max_preview_lines" "$term_cols"
+
+            local key
+            key=$(read_key)
+
+            # Clear transient message on any keypress
+            SEL_MESSAGE=""
+
+            # ── Modal modes ────────────────────────────────────────────────
+            case "$SEL_MODE" in
+                filter)
+                    case "$key" in
+                        enter|escape) SEL_MODE="browse"; selected=1 ;;
+                        backspace)    SEL_FILTER="${SEL_FILTER%?}"; selected=1 ;;
+                        up|down|left|right|home|end|pgup|pgdown|del|unknown) ;;
+                        *)
+                            if [[ ${#key} -eq 1 ]]; then
+                                SEL_FILTER+="$key"
+                                selected=1
+                            fi
+                            ;;
+                    esac
+                    continue
+                    ;;
+                rename|title)
+                    case "$key" in
+                        enter)
+                            _selector_commit_text "$SEL_MODE"
+                            SEL_MODE="browse"; SEL_TEXT=""; SEL_TARGET=""
+                            refresh=1; break
+                            ;;
+                        escape)
+                            SEL_MODE="browse"; SEL_TEXT=""; SEL_TARGET=""
+                            ;;
+                        backspace)
+                            SEL_TEXT="${SEL_TEXT%?}"
+                            ;;
+                        up|down|left|right|home|end|pgup|pgdown|del|unknown) ;;
+                        *)
+                            if [[ ${#key} -eq 1 ]]; then
+                                SEL_TEXT+="$key"
+                            fi
+                            ;;
+                    esac
+                    continue
+                    ;;
+                confirm)
+                    case "$key" in
+                        y|Y)
+                            if tmux kill-session -t "$SEL_TARGET" 2>/dev/null; then
+                                SEL_MESSAGE="${C_GREEN}Deleted.${C_RESET}"
+                            else
+                                SEL_MESSAGE="${C_RED}Failed to delete.${C_RESET}"
+                            fi
+                            SEL_MODE="browse"; SEL_TARGET=""
+                            refresh=1; break
+                            ;;
+                        *)
+                            SEL_MODE="browse"; SEL_TARGET=""
+                            SEL_MESSAGE="${C_DIM}cancelled${C_RESET}"
+                            ;;
+                    esac
+                    continue
+                    ;;
+            esac
+
+            # ── Browse mode ────────────────────────────────────────────────
+            # Multi-digit jump
+            if [[ "$key" =~ ^[0-9]$ ]]; then
+                SEL_DIGITS+="$key"
+                local target=$((10#$SEL_DIGITS))
+                if [[ $target -ge 1 && $target -le $visible_count ]]; then
+                    selected=$target
+                else
+                    SEL_DIGITS="$key"
+                    target=$((10#$key))
+                    if [[ $target -ge 1 && $target -le $visible_count ]]; then
+                        selected=$target
+                    else
+                        SEL_DIGITS=""
+                    fi
+                fi
+                continue
+            fi
+            SEL_DIGITS=""
+
+            case "$key" in
+                up|k)
+                    selected=$((selected - 1))
+                    [[ $selected -lt 1 ]] && selected=$visible_count
+                    ;;
+                down|j)
+                    selected=$((selected + 1))
+                    [[ $selected -gt $visible_count ]] && selected=1
+                    ;;
+                home) selected=1 ;;
+                end)  selected=$visible_count ;;
+                pgup)
+                    selected=$((selected - 5))
+                    [[ $selected -lt 1 ]] && selected=1
+                    ;;
+                pgdown)
+                    selected=$((selected + 5))
+                    [[ $selected -gt $visible_count ]] && selected=$visible_count
+                    ;;
+                enter)
+                    [[ $visible_count -eq 0 ]] && continue
+                    local target_session
+                    target_session=$(_selector_session_at "$visible_data" "$selected")
+                    if [[ -n "$target_session" ]]; then
+                        selector_restore_tty
+                        trap - EXIT INT TERM HUP
+                        if [[ "$mode" == "switch" ]] || is_inside_tmux; then
+                            tmux switch-client -t "$target_session"
+                        else
+                            tmux attach-session -t "$target_session"
+                        fi
+                        return 0
+                    fi
+                    ;;
+                q|Q|escape)
+                    selector_restore_tty
+                    trap - EXIT INT TERM HUP
+                    return 0
+                    ;;
+                n|N)
+                    if _selector_run_new; then return 0; fi
+                    refresh=1; break
+                    ;;
+                r|R)
+                    [[ $visible_count -eq 0 ]] && continue
+                    SEL_TARGET=$(_selector_session_at "$visible_data" "$selected")
+                    if [[ -n "$SEL_TARGET" ]]; then
+                        SEL_MODE="rename"
+                        SEL_TEXT=$(get_session_child "$SEL_TARGET")
+                    fi
+                    ;;
+                t|T)
+                    [[ $visible_count -eq 0 ]] && continue
+                    SEL_TARGET=$(_selector_session_at "$visible_data" "$selected")
+                    if [[ -n "$SEL_TARGET" ]]; then
+                        SEL_MODE="title"
+                        SEL_TEXT=$(get_session_title "$SEL_TARGET")
+                    fi
+                    ;;
+                d|D)
+                    [[ $visible_count -eq 0 ]] && continue
+                    SEL_TARGET=$(_selector_session_at "$visible_data" "$selected")
+                    [[ -n "$SEL_TARGET" ]] && SEL_MODE="confirm"
+                    ;;
+                /)
+                    SEL_MODE="filter"
+                    ;;
+                '?')
+                    _selector_show_help
+                    ;;
+            esac
+        done
+
+        [[ $refresh -eq 1 ]] || break
+    done
+
+    selector_restore_tty
+    trap - EXIT INT TERM HUP
+    return 0
+}
+
+cmd_help() {
+    cat <<EOF
+cmux v${VERSION} - Claude Tmux Session Manager
+
+USAGE:
+    cmux                       Interactive session selector
+    cmux new [opts] [path]     Create new session (default: current dir)
+    cmux list                  List all sessions
+    cmux attach <name>         Attach to session
+    cmux switch                Switch sessions (inside tmux)
+    cmux kill <name>           Kill a session
+    cmux rename <name>         Rename current session
+    cmux title <text>          Set session title
+    cmux info                  Show current session info
+    cmux ssh <host|alias>      Open selector on a remote host (one-step SSH)
+    cmux help                  Show this help
+
+OPTIONS:
+    -m, --mobile               Create session at fixed 78-col width
+    -t, --title <text>         Set session title on creation
+    -a, --agent <name|cmd>     Agent to launch: claude (default), codex, or
+                               any custom command (overridable via
+                               \$CMUX_AGENT env var)
+        --no-attach            Create the session but don't attach to it
+
+SELECTOR KEYS:
+    ↑↓/j k       navigate          enter   open selected
+    1-9 + digits jump to N         /       filter
+    n            new session       r       rename selected
+    t            set title         d       delete (with confirm)
+    home/end     first/last        ?       help
+    pgup/pgdn    ±5                q/esc   quit
+
+POPUP SWITCHER (inside any cmux session):
+    prefix + g   open the selector as a floating popup
+                 (default prefix is Ctrl-b, so press Ctrl-b then g)
+
+STATUS INDICATORS:
+    ●  Running   - Claude is actively generating output
+    ◐  Waiting   - Claude is waiting for your input
+    ○  Idle      - Session has been idle for a while
+    ✕  Error     - Error detected in session
+
+SSH ALIASES:
+    Define aliases in ${CMUX_HOSTS_FILE}
+    Format (one per line):     alias=user@host
+    Example:                   dev=dev@devship
+    Use:                       cmux ssh dev
+
+ALIASES:
+    s = selector, sw = switch, ls = list, a = attach, k = kill, t = title, i = info
+
+EXAMPLES:
+    cmux new ~/projects/my-app       Create session for my-app (claude)
+    cmux new -a codex ~/my-app       Create session running codex instead
+    cmux new --mobile ~/my-app       Create mobile-friendly session (78 cols)
+    cmux ssh dev@devship             SSH and open the selector in one step
+    cmux ssh dev                     Same, using an alias from the hosts file
+    CMUX_AGENT=codex cmux new        Default to codex for this shell
+
+EOF
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
+main() {
+    if ! command -v tmux &>/dev/null; then
+        die "tmux is not installed"
+    fi
+
+    local cmd="${1:-}"
+    shift || true
+
+    case "$cmd" in
+        "")
+            show_selector attach
+            ;;
+        new)
+            cmd_new "$@"
+            ;;
+        list|ls)
+            cmd_list
+            ;;
+        attach|a)
+            [[ -z "${1:-}" ]] && die "Usage: cmux attach <name>"
+            cmd_attach "$1"
+            ;;
+        switch|sw)
+            cmd_switch
+            ;;
+        selector|s)
+            show_selector attach
+            ;;
+        kill|k)
+            [[ -z "${1:-}" ]] && die "Usage: cmux kill <name>"
+            cmd_kill "$1"
+            ;;
+        rename)
+            [[ -z "${1:-}" ]] && die "Usage: cmux rename <new-name>"
+            cmd_rename "$1"
+            ;;
+        title|t)
+            [[ -z "${1:-}" ]] && die "Usage: cmux title <text>"
+            cmd_title "$1"
+            ;;
+        info|i)
+            cmd_info
+            ;;
+        ssh)
+            cmd_ssh "$@"
+            ;;
+        help|--help|-h)
+            cmd_help
+            ;;
+        version|--version|-v)
+            echo "cmux v${VERSION}"
+            ;;
+        *)
+            die "Unknown command: $cmd. Run 'cmux help' for usage."
+            ;;
+    esac
+}
+
+main "$@"

@@ -9,6 +9,24 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "Installing cmux..."
 
+# Install dependencies and build the TypeScript CLI so the installed command is
+# a normal executable, not a development-only wrapper.
+if ! command -v node >/dev/null 2>&1; then
+    echo "Error: node is required. Install Node.js 22+ first." >&2
+    exit 1
+fi
+
+if ! command -v npm >/dev/null 2>&1; then
+    echo "Error: npm is required. Install npm first." >&2
+    exit 1
+fi
+
+echo "Installing dependencies..."
+npm install
+
+echo "Building cmux..."
+npm run build
+
 # Determine install directory
 INSTALL_DIR="${HOME}/bin"
 if [[ ! -d "$INSTALL_DIR" ]]; then
@@ -36,9 +54,9 @@ echo ""
 echo "Installation complete!"
 echo ""
 echo "Quick start:"
-echo "  cmux new ~/projects/my-app    # Create a new session"
 echo "  cmux                          # Open session selector"
-echo "  cmux switch                   # Switch sessions (inside tmux)"
-echo "  cmux ssh dev@devship          # SSH into a host and open selector"
+echo "  cmux new ~/projects/my-app    # Create a plain session"
+echo "  cmux agent start REB-123      # Start Linear-backed agent work"
+echo "  cmux agent list               # List structured agent sessions"
 echo "  cmux help                     # See all commands"
 echo ""

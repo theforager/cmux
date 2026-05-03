@@ -2,11 +2,16 @@ package tui
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 
+	"github.com/theforager/cmux/internal/agent"
 	"github.com/theforager/cmux/internal/format"
 	"github.com/theforager/cmux/internal/state"
 	"github.com/theforager/cmux/internal/tmux"
+	"github.com/theforager/cmux/internal/types"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -28,6 +33,8 @@ type model struct {
 	filtered []row
 	selected int
 	filter   string
+	input    string
+	pending  types.AgentStatus
 	mode     string
 	digits   string
 	message  string
@@ -35,6 +42,8 @@ type model struct {
 	width    int
 	height   int
 }
+
+var issuePattern = regexp.MustCompile(`^[A-Z][A-Z0-9]+-[0-9]+$`)
 
 var (
 	cyan  = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
@@ -110,19 +119,88 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.mode = "browse"
 			return m, nil
 		}
-		if m.mode == "filter" {
-			switch key {
-			case "esc", "enter":
-				m.mode = "browse"
-			case "backspace", "ctrl+h":
-				if len(m.filter) > 0 {
-					m.filter = m.filter[:len(m.filter)-1]
+		if m.mode != "browse" && m.mode != "help" {
+			if m.mode == "statusPick" {
+				switch key {
+				case "esc":
+					m.mode = "browse"
+				case "1":
+					m.pending = types.StatusRunning
+					m.mode = "statusSummary"
+					m.input = ""
+				case "2":
+					m.pending = types.StatusWaiting
+					m.mode = "statusSummary"
+					m.input = ""
+				case "3":
+					m.pending = types.StatusBlocked
+					m.mode = "statusSummary"
+					m.input = ""
+				case "4":
+					m.pending = types.StatusTestsFailed
+					m.mode = "statusSummary"
+					m.input = ""
+				case "5":
+					m.pending = types.StatusReadyForReview
+					m.mode = "statusSummary"
+					m.input = ""
+				case "6":
+					m.pending = types.StatusPROpened
+					m.mode = "statusSummary"
+					m.input = ""
+				case "7":
+					m.pending = types.StatusDone
+					m.mode = "statusSummary"
+					m.input = ""
+				case "8":
+					m.pending = types.StatusStale
+					m.mode = "statusSummary"
+					m.input = ""
+				case "9":
+					m.pending = types.StatusCrashed
+					m.mode = "statusSummary"
+					m.input = ""
 				}
-				m.applyFilter()
+				return m, nil
+			}
+			switch key {
+			case "esc":
+				m.mode = "browse"
+				m.input = ""
+			case "enter":
+				if m.mode == "filter" {
+					m.mode = "browse"
+					return m, nil
+				}
+				if err := m.commitAction(); err != nil {
+					m.message = err.Error()
+				} else {
+					m.message = ""
+					m.mode = "browse"
+					m.input = ""
+					rows, err := loadRows()
+					if err == nil {
+						m.rows = rows
+						m.applyFilter()
+					}
+				}
+			case "backspace", "ctrl+h":
+				if m.mode == "filter" {
+					if len(m.filter) > 0 {
+						m.filter = m.filter[:len(m.filter)-1]
+					}
+					m.applyFilter()
+				} else if len(m.input) > 0 {
+					m.input = m.input[:len(m.input)-1]
+				}
 			default:
 				if len(key) == 1 {
-					m.filter += key
-					m.applyFilter()
+					if m.mode == "filter" {
+						m.filter += key
+						m.applyFilter()
+					} else {
+						m.input += key
+					}
 				}
 			}
 			return m, nil
@@ -134,6 +212,33 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.mode = "help"
 		case "/":
 			m.mode = "filter"
+		case "n":
+			m.mode = "scratch"
+			wd, _ := os.Getwd()
+			m.input = wd
+		case "a":
+			m.mode = "start"
+			m.input = ""
+		case "r":
+			if r, ok := m.current(); ok && r.active {
+				m.mode = "rename"
+				m.input = tmux.Child(r.session)
+			}
+		case "t":
+			if r, ok := m.current(); ok && r.active {
+				m.mode = "title"
+				m.input = r.title
+			}
+		case "d":
+			if _, ok := m.current(); ok {
+				m.mode = "delete"
+				m.input = ""
+			}
+		case "s":
+			if r, ok := m.current(); ok && isAgentRow(r) {
+				m.mode = "statusPick"
+				m.input = ""
+			}
 		case "up", "k":
 			m.move(-1)
 		case "down", "j":
@@ -231,10 +336,10 @@ func (m model) View() string {
 		}
 	}
 	b.WriteString("\n")
-	if m.mode == "filter" {
-		b.WriteString(cyan.Render("filter  "+m.filter+"_  ") + dim.Render("enter apply · esc cancel"))
+	if prompt := m.prompt(); prompt != "" {
+		b.WriteString(prompt)
 	} else {
-		b.WriteString(dim.Render("↑↓/jk nav  1-9 jump  home/end  pgup/pgdn  enter open  / filter  R refresh  ? help  q quit"))
+		b.WriteString(dim.Render("↑↓/jk nav  1-9 jump  home/end  pgup/pgdn  enter open  / filter  n scratch  a issue/task  r rename  t title  d delete  s status  R refresh  ? help  q quit"))
 	}
 	if m.digits != "" {
 		b.WriteString("  " + cyan.Render("→ "+m.digits))
@@ -243,6 +348,118 @@ func (m model) View() string {
 		b.WriteString("  " + red.Render(m.message))
 	}
 	return b.String()
+}
+
+func (m model) current() (row, bool) {
+	if len(m.filtered) == 0 || m.selected < 0 || m.selected >= len(m.filtered) {
+		return row{}, false
+	}
+	return m.filtered[m.selected], true
+}
+
+func (m *model) commitAction() error {
+	r, hasRow := m.current()
+	value := strings.TrimSpace(m.input)
+	switch m.mode {
+	case "scratch":
+		if value == "" {
+			value = "."
+		}
+		abs, _ := filepath.Abs(value)
+		title := filepath.Base(abs)
+		_, err := agent.Start(agent.StartOptions{Cwd: abs, Scratch: true, Title: title})
+		return err
+	case "start":
+		if value == "" {
+			return fmt.Errorf("enter a Linear issue key or task title")
+		}
+		if issuePattern.MatchString(value) {
+			_, err := agent.Start(agent.StartOptions{Cwd: ".", IssueKey: value})
+			return err
+		}
+		_, err := agent.Start(agent.StartOptions{Cwd: ".", Title: value, Worktree: true})
+		return err
+	case "rename":
+		if !hasRow || !r.active || value == "" {
+			return fmt.Errorf("no active session selected")
+		}
+		next, err := tmux.Rename(r.session, value)
+		if err == nil && isAgentRow(r) {
+			_, _ = state.Update(r.id, func(s types.AgentSession) types.AgentSession {
+				s.TmuxSession = next
+				return s
+			})
+		}
+		return err
+	case "title":
+		if !hasRow || !r.active {
+			return fmt.Errorf("no active session selected")
+		}
+		if err := tmux.SetTitle(r.session, value); err != nil {
+			return err
+		}
+		if isAgentRow(r) && value != "" {
+			_, _ = state.Update(r.id, func(s types.AgentSession) types.AgentSession {
+				s.Title = value
+				return s
+			})
+		}
+		return nil
+	case "delete":
+		if !hasRow {
+			return fmt.Errorf("no session selected")
+		}
+		if strings.ToLower(value) != "y" {
+			return nil
+		}
+		if isAgentRow(r) {
+			return agent.Kill(r.id)
+		}
+		return tmux.Kill(r.session)
+	case "statusSummary":
+		if !hasRow || !isAgentRow(r) {
+			return fmt.Errorf("select a structured agent session")
+		}
+		_, err := agent.SetStatus(r.id, m.pending, value)
+		return err
+	default:
+		return nil
+	}
+}
+
+func (m model) prompt() string {
+	switch m.mode {
+	case "filter":
+		return cyan.Render("filter  "+m.filter+"_  ") + dim.Render("enter apply · esc cancel")
+	case "scratch":
+		return cyan.Render("scratch path  "+m.input+"_  ") + dim.Render("enter create · esc cancel")
+	case "start":
+		return cyan.Render("issue/task  "+m.input+"_  ") + dim.Render("REB-123 starts Linear work · other text creates task worktree")
+	case "rename":
+		return cyan.Render("rename  "+m.input+"_  ") + dim.Render("enter save · esc cancel")
+	case "title":
+		return cyan.Render("title  "+m.input+"_  ") + dim.Render("enter save · esc cancel")
+	case "delete":
+		return red.Render("delete? type y then enter  ") + dim.Render("esc cancel")
+	case "statusPick":
+		return strings.Join([]string{
+			cyan.Render("set status"),
+			"  1 running",
+			"  2 waiting_for_input",
+			"  3 blocked",
+			"  4 tests_failed",
+			"  5 ready_for_review",
+			"  6 pr_opened",
+			"  7 done",
+			"  8 stale",
+			"  9 crashed",
+			dim.Render("press 1-9 · esc cancel"),
+		}, "\n")
+	case "statusSummary":
+		return cyan.Render("summary for "+string(m.pending)+"  "+m.input+"_  ") + dim.Render("enter save · esc cancel")
+	default:
+		return ""
+	}
 }
 
 func (m *model) move(delta int) {
@@ -298,11 +515,28 @@ func helpView() string {
 		cyan.Render("1-9 digits") + "    jump to row number",
 		cyan.Render("enter") + "         open selected session",
 		cyan.Render("/") + "             filter",
+		cyan.Render("n") + "             create scratch session",
+		cyan.Render("a") + "             start Linear issue or task-backed agent",
+		cyan.Render("r") + "             rename selected tmux session",
+		cyan.Render("t") + "             set selected title",
+		cyan.Render("d") + "             delete selected session",
+		cyan.Render("s") + "             set structured agent status",
 		cyan.Render("R") + "             refresh",
 		cyan.Render("q esc") + "         quit",
 		"",
 		dim.Render("press any key to return"),
 	}, "\n")
+}
+
+func isAgentRow(r row) bool {
+	return r.group == string(types.TypeIssueBacked) || r.group == string(types.TypeTaskBacked) || r.group == string(types.TypeScratch)
+}
+
+func valueOr(value, fallback string) string {
+	if value == "" {
+		return fallback
+	}
+	return value
 }
 
 func glyph(status string) string {

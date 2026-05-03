@@ -185,6 +185,10 @@ func Rename(current, child string) (string, error) {
 	return next, nil
 }
 
+func SetTitle(session, title string) error {
+	return SetEnv(session, "CMUX_TITLE", title)
+}
+
 func Capture(session string, lines int) string {
 	out, err := process.Run("tmux", "capture-pane", "-t", session, "-p", "-S", fmt.Sprintf("-%d", lines*4))
 	if err != nil {

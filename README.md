@@ -13,9 +13,6 @@ agent orchestration:
 - Linear status/comment sync
 - Bubble Tea based session dashboard
 
-The original Bash implementation is preserved at `legacy/cmux.bash` and can be
-run with `cmux legacy ...`.
-
 ## Installation
 
 ```bash
@@ -29,8 +26,8 @@ The installer builds the Go CLI and symlinks `cmux` into `~/bin`.
 For development:
 
 ```bash
-go build -o dist/cmux-go ./cmd/cmux
-./cmux help
+go run ./cmd/cmux help
+go build -o ./cmux-dev ./cmd/cmux
 ```
 
 ## Basic Usage
@@ -55,6 +52,12 @@ pgup / pgdn    move by 5
 1-9 digits     jump to row number
 enter          open selected session
 /              filter
+n              create scratch session
+a              start Linear issue-backed or task-backed agent
+r              rename selected tmux session
+t              set selected title
+d              delete selected session
+s              set structured agent status
 R              refresh
 ?              help
 q / esc        quit
@@ -122,6 +125,5 @@ cmux info
 cmux debug
 cmux doctor
 cmux agent ...
-cmux legacy ...
 cmux help
 ```

@@ -3,8 +3,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"os/exec"
-	"path/filepath"
 
 	"github.com/theforager/cmux/internal/agent"
 	"github.com/theforager/cmux/internal/format"
@@ -35,32 +33,8 @@ func rootCmd() *cobra.Command {
 		},
 	}
 	cmd.Version = version
-	cmd.AddCommand(newCmd(), listCmd(), attachCmd(), switchCmd(), killCmd(), titleCmd(), infoCmd(), debugCmd(), agentCmd(), doctorCmd(), legacyCmd())
+	cmd.AddCommand(newCmd(), listCmd(), attachCmd(), switchCmd(), killCmd(), titleCmd(), infoCmd(), debugCmd(), agentCmd(), doctorCmd())
 	return cmd
-}
-
-func legacyCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:                "legacy [args...]",
-		Short:              "Run the preserved Bash implementation",
-		DisableFlagParsing: true,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			exe, err := os.Executable()
-			if err != nil {
-				return err
-			}
-			repo := filepath.Dir(filepath.Dir(exe))
-			if filepath.Base(filepath.Dir(exe)) != "dist" {
-				repo, _ = os.Getwd()
-			}
-			script := filepath.Join(repo, "legacy", "cmux.bash")
-			c := exec.Command(script, args...)
-			c.Stdin = os.Stdin
-			c.Stdout = os.Stdout
-			c.Stderr = os.Stderr
-			return c.Run()
-		},
-	}
 }
 
 func newCmd() *cobra.Command {

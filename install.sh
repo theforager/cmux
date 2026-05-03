@@ -9,16 +9,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "Installing cmux..."
 
-# Build the Go CLI so the installed command is a normal executable, not a
-# development-only wrapper.
 if ! command -v go >/dev/null 2>&1; then
     echo "Error: go is required. Install Go 1.24+ first." >&2
     exit 1
 fi
-
-echo "Building cmux..."
-mkdir -p "${SCRIPT_DIR}/dist"
-go build -o "${SCRIPT_DIR}/dist/cmux-go" ./cmd/cmux
 
 # Determine install directory
 INSTALL_DIR="${HOME}/bin"
@@ -27,13 +21,19 @@ if [[ ! -d "$INSTALL_DIR" ]]; then
     echo "Created $INSTALL_DIR"
 fi
 
-# Create symlink
-if [[ -L "${INSTALL_DIR}/cmux" ]]; then
+if [[ -e "${INSTALL_DIR}/cmux" || -L "${INSTALL_DIR}/cmux" ]]; then
     rm "${INSTALL_DIR}/cmux"
 fi
 
-ln -s "${SCRIPT_DIR}/cmux" "${INSTALL_DIR}/cmux"
-echo "Linked cmux to ${INSTALL_DIR}/cmux"
+echo "Building cmux..."
+go build -o "${INSTALL_DIR}/cmux" ./cmd/cmux
+
+if [[ ! -x "${INSTALL_DIR}/cmux" ]]; then
+    echo "Error: failed to install ${INSTALL_DIR}/cmux" >&2
+    exit 1
+fi
+
+echo "Installed cmux to ${INSTALL_DIR}/cmux"
 
 # Check if ~/bin is in PATH
 if [[ ":$PATH:" != *":${HOME}/bin:"* ]]; then

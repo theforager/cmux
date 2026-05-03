@@ -201,6 +201,18 @@ func SetStatus(id string, status types.AgentStatus, summary string) (types.Agent
 	return s, nil
 }
 
+func Kill(id string) error {
+	s, err := state.Read(id)
+	if err != nil {
+		return err
+	}
+	if err := tmux.Kill(s.TmuxSession); err != nil {
+		return err
+	}
+	_, err = SetStatus(id, types.StatusDone, "Session killed from cmux")
+	return err
+}
+
 func syncLinear(s *types.AgentSession) error {
 	if s.Linear.IssueID == "" {
 		return nil

@@ -8,8 +8,10 @@ import (
 
 	"github.com/theforager/cmux/internal/format"
 	"github.com/theforager/cmux/internal/gitx"
+	"github.com/theforager/cmux/internal/home"
 	"github.com/theforager/cmux/internal/linear"
 	"github.com/theforager/cmux/internal/process"
+	"github.com/theforager/cmux/internal/runbook"
 	"github.com/theforager/cmux/internal/state"
 	"github.com/theforager/cmux/internal/tmux"
 	"github.com/theforager/cmux/internal/types"
@@ -91,7 +93,7 @@ func startIssue(o StartOptions) (types.AgentSession, error) {
 	if o.PrepareOnly {
 		s.Status = types.StatusIdle
 	}
-	if err := ensureRunbook(worktree, s, issue); err != nil {
+	if err := ensureRunbook(s, issue); err != nil {
 		return s, err
 	}
 	if err := state.Write(s); err != nil {
@@ -131,7 +133,7 @@ func startTask(o StartOptions) (types.AgentSession, error) {
 	if o.PrepareOnly {
 		s.Status = types.StatusIdle
 	}
-	if err := ensureRunbook(worktree, s, types.LinearIssue{}); err != nil {
+	if err := ensureRunbook(s, types.LinearIssue{}); err != nil {
 		return s, err
 	}
 	if err := state.Write(s); err != nil {
@@ -217,9 +219,25 @@ func syncLinear(s *types.AgentSession) error {
 	if s.Linear.IssueID == "" {
 		return nil
 	}
-	body := fmt.Sprintf("cmux session\n\nStatus: %s\nBranch: %s\nWorkspace: %s\ntmux: %s", s.Status, valueOr(s.Branch, "current"), valueOr(s.WorktreePath, s.RepoPath), s.TmuxSession)
+	notes := runbook.Read(s.ID)
+	body := fmt.Sprintf("cmux session\n\nStatus: %s\nBranch: %s\nWorkspace: %s\nRunbook: %s\ntmux: %s", s.Status, valueOr(s.Branch, "current"), valueOr(s.WorktreePath, s.RepoPath), home.RunbookPath(s.ID), s.TmuxSession)
 	if s.LastSummary != "" {
 		body += "\nLast summary: " + s.LastSummary
+	}
+	if notes.CurrentState != "" {
+		body += "\n\nCurrent state:\n" + notes.CurrentState
+	}
+	if notes.NextAction != "" {
+		body += "\n\nNext action:\n" + notes.NextAction
+	}
+	if notes.Blockers != "" {
+		body += "\n\nBlockers:\n" + notes.Blockers
+	}
+	if notes.TestsRun != "" {
+		body += "\n\nTests run:\n" + notes.TestsRun
+	}
+	if notes.ReviewSummary != "" {
+		body += "\n\nReview summary:\n" + notes.ReviewSummary
 	}
 	commentID, err := linear.UpsertComment(s.Linear.IssueID, s.Linear.CommentID, body)
 	if err == nil && commentID != "" {
@@ -228,12 +246,12 @@ func syncLinear(s *types.AgentSession) error {
 	return err
 }
 
-func ensureRunbook(workspace string, s types.AgentSession, issue types.LinearIssue) error {
-	dir := filepath.Join(workspace, ".agent")
+func ensureRunbook(s types.AgentSession, issue types.LinearIssue) error {
+	dir := home.SessionDir(s.ID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	path := filepath.Join(dir, "RUNBOOK.md")
+	path := home.RunbookPath(s.ID)
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		goal := s.Title
 		if issue.Identifier != "" {
@@ -244,8 +262,7 @@ func ensureRunbook(workspace string, s types.AgentSession, issue types.LinearIss
 			return err
 		}
 	}
-	meta := fmt.Sprintf("{\n  \"sessionId\": %q,\n  \"tmuxSession\": %q\n}\n", s.ID, s.TmuxSession)
-	return os.WriteFile(filepath.Join(dir, "cmux.json"), []byte(meta), 0o644)
+	return nil
 }
 
 func initialPrompt(s types.AgentSession, issue types.LinearIssue) string {
@@ -258,8 +275,9 @@ func initialPrompt(s types.AgentSession, issue types.LinearIssue) string {
 	if s.Branch != "" {
 		text += "Branch: " + s.Branch + "\n"
 	}
-	text += "Workspace: " + valueOr(s.WorktreePath, s.RepoPath) + "\n\n"
-	text += "Requirements:\n- Work only in this workspace unless the user explicitly says otherwise.\n- Keep .agent/RUNBOOK.md updated.\n- When blocked, run: cmux agent status " + s.ID + " blocked \"<reason>\"\n- When ready for review, run: cmux agent status " + s.ID + " ready_for_review \"<summary>\"\n"
+	text += "Workspace: " + valueOr(s.WorktreePath, s.RepoPath) + "\n"
+	text += "Runbook: " + home.RunbookPath(s.ID) + "\n\n"
+	text += "Requirements:\n- Work only in this workspace unless the user explicitly says otherwise.\n- Keep the cmux runbook updated at " + home.RunbookPath(s.ID) + ".\n- When blocked, run: cmux agent status " + s.ID + " blocked \"<reason>\"\n- When ready for review, run: cmux agent status " + s.ID + " ready_for_review \"<summary>\"\n"
 	if issue.Description != "" {
 		text += "\nIssue description:\n" + issue.Description
 	}

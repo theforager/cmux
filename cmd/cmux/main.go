@@ -6,6 +6,7 @@ import (
 
 	"github.com/theforager/cmux/internal/agent"
 	"github.com/theforager/cmux/internal/format"
+	"github.com/theforager/cmux/internal/home"
 	"github.com/theforager/cmux/internal/state"
 	"github.com/theforager/cmux/internal/tmux"
 	"github.com/theforager/cmux/internal/tui"
@@ -211,7 +212,10 @@ func doctorCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			fmt.Println("cmux:", version)
 			fmt.Println("tmux:", boolWord(tmux.Exists()))
-			fmt.Println("state:", state.Dir())
+			fmt.Println("home:", home.Dir())
+			fmt.Println("config:", home.ConfigPath())
+			fmt.Println("sessions:", home.SessionsDir())
+			fmt.Println("worktrees:", home.WorktreesDir())
 			if os.Getenv("LINEAR_API_KEY") == "" {
 				fmt.Println("LINEAR_API_KEY: not set")
 			} else {
@@ -224,7 +228,7 @@ func doctorCmd() *cobra.Command {
 
 func agentCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "agent", Short: "Structured agent orchestration"}
-	cmd.AddCommand(agentStartCmd(), agentScratchCmd(), agentListCmd(), agentOpenCmd(), agentStatusCmd("status"), agentStatusCmd("block"), agentStatusCmd("review"), agentStatusCmd("done"))
+	cmd.AddCommand(agentStartCmd(), agentScratchCmd(), agentListCmd(), agentOpenCmd(), agentPathCmd(), agentStatusCmd("status"), agentStatusCmd("block"), agentStatusCmd("review"), agentStatusCmd("done"))
 	return cmd
 }
 
@@ -313,6 +317,22 @@ func agentOpenCmd() *cobra.Command {
 				return err
 			}
 			return tmux.AttachOrSwitch(found.Name)
+		},
+	}
+}
+
+func agentPathCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "path <id>",
+		Short: "Print a structured agent worktree path",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			s, err := state.Read(args[0])
+			if err != nil {
+				return err
+			}
+			fmt.Println(valueOr(s.WorktreePath, s.RepoPath))
+			return nil
 		},
 	}
 }

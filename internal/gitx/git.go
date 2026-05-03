@@ -2,10 +2,10 @@ package gitx
 
 import (
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/theforager/cmux/internal/format"
+	"github.com/theforager/cmux/internal/home"
 	"github.com/theforager/cmux/internal/process"
 )
 
@@ -23,11 +23,10 @@ func EnsureWorktree(cwd, identifier, title, branchName string) (repo, branch, wo
 	if branch == "" {
 		branch = "agent/" + identifier + "-" + format.Slug(title)
 	}
-	root := filepath.Join(filepath.Dir(repo), "worktrees")
-	if err := os.MkdirAll(root, 0o755); err != nil {
+	worktree = home.WorktreePath(repo, identifier, title)
+	if err := os.MkdirAll(filepathDir(worktree), 0o755); err != nil {
 		return "", "", "", err
 	}
-	worktree = filepath.Join(root, identifier+"-"+format.Slug(title))
 	if _, err := os.Stat(worktree); err == nil {
 		return repo, branch, worktree, nil
 	}
@@ -37,6 +36,15 @@ func EnsureWorktree(cwd, identifier, title, branchName string) (repo, branch, wo
 		_, err = process.RunDir(repo, "git", "worktree", "add", "-b", branch, worktree)
 	}
 	return repo, branch, worktree, err
+}
+
+func filepathDir(path string) string {
+	for i := len(path) - 1; i >= 0; i-- {
+		if path[i] == '/' {
+			return path[:i]
+		}
+	}
+	return "."
 }
 
 func branchExists(repo, branch string) bool {

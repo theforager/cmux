@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 
@@ -91,17 +92,27 @@ func graphql(query string, vars map[string]any, out any) error {
 		return err
 	}
 	defer res.Body.Close()
+	bodyBytes, err := io.ReadAll(res.Body)
+	if err != nil {
+		return err
+	}
 	var envelope struct {
 		Data   json.RawMessage `json:"data"`
 		Errors []struct {
 			Message string `json:"message"`
 		} `json:"errors"`
 	}
-	if err := json.NewDecoder(res.Body).Decode(&envelope); err != nil {
+	if err := json.Unmarshal(bodyBytes, &envelope); err != nil {
+		if res.StatusCode < 200 || res.StatusCode >= 300 {
+			return fmt.Errorf("Linear HTTP %d: %s", res.StatusCode, string(bodyBytes))
+		}
 		return err
 	}
 	if len(envelope.Errors) > 0 {
 		return fmt.Errorf("Linear: %s", envelope.Errors[0].Message)
+	}
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return fmt.Errorf("Linear HTTP %d: %s", res.StatusCode, string(bodyBytes))
 	}
 	return json.Unmarshal(envelope.Data, out)
 }

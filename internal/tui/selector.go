@@ -9,6 +9,8 @@ import (
 
 	"github.com/theforager/cmux/internal/agent"
 	"github.com/theforager/cmux/internal/format"
+	"github.com/theforager/cmux/internal/home"
+	"github.com/theforager/cmux/internal/runbook"
 	"github.com/theforager/cmux/internal/state"
 	"github.com/theforager/cmux/internal/tmux"
 	"github.com/theforager/cmux/internal/types"
@@ -25,25 +27,42 @@ type row struct {
 	updated string
 	session string
 	preview string
+	detail  string
 	active  bool
 }
 
 type model struct {
-	rows     []row
-	filtered []row
-	selected int
-	filter   string
-	input    string
-	pending  types.AgentStatus
-	mode     string
-	digits   string
-	message  string
-	chosen   string
-	width    int
-	height   int
+	rows          []row
+	filtered      []row
+	selected      int
+	agentSelected int
+	filter        string
+	input         string
+	create        string
+	target        string
+	pending       types.AgentStatus
+	mode          string
+	digits        string
+	message       string
+	chosen        string
+	width         int
+	height        int
 }
 
 var issuePattern = regexp.MustCompile(`^[A-Z][A-Z0-9]+-[0-9]+$`)
+
+type agentChoice struct {
+	label       string
+	command     string
+	description string
+	custom      bool
+}
+
+var agentChoices = []agentChoice{
+	{label: "Claude", command: "claude", description: "Launch the Claude CLI agent"},
+	{label: "Codex", command: "codex", description: "Launch the Codex CLI agent"},
+	{label: "Other", description: "Type a custom agent command", custom: true},
+}
 
 var (
 	cyan  = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
@@ -82,14 +101,16 @@ func loadRows() ([]row, error) {
 	agentSessions, _ := state.List()
 	byTmux := map[string]row{}
 	for _, s := range agentSessions {
-		byTmux[s.TmuxSession] = row{id: s.ID, title: s.Title, status: string(s.Status), group: string(s.Type), updated: format.Age(s.LastUpdatedAt), session: s.TmuxSession, preview: s.LastSummary, active: false}
+		byTmux[s.TmuxSession] = agentRow(s, false)
 	}
 	var rows []row
 	seen := map[string]bool{}
 	for _, s := range tmuxSessions {
 		if r, ok := byTmux[s.Name]; ok {
 			r.active = true
-			r.preview = tmux.Capture(s.Name, 10)
+			if r.preview == "" {
+				r.preview = tmux.Capture(s.Name, 10)
+			}
 			rows = append(rows, r)
 			seen[s.Name] = true
 			continue
@@ -101,9 +122,26 @@ func loadRows() ([]row, error) {
 		if seen[s.TmuxSession] {
 			continue
 		}
-		rows = append(rows, row{id: s.ID, title: s.Title + " (not running)", status: string(s.Status), group: string(s.Type), updated: format.Age(s.LastUpdatedAt), session: s.TmuxSession, preview: s.LastSummary, active: false})
+		r := agentRow(s, false)
+		r.title += " (not running)"
+		rows = append(rows, r)
 	}
 	return rows, nil
+}
+
+func agentRow(s types.AgentSession, active bool) row {
+	notes := runbook.Read(s.ID)
+	preview := notes.Preview()
+	if preview == "" {
+		preview = s.LastSummary
+	}
+	detail := strings.Join(nonEmpty([]string{
+		"repo: " + s.RepoPath,
+		"workspace: " + valueOr(s.WorktreePath, s.RepoPath),
+		"runbook: " + home.RunbookPath(s.ID),
+		"linear: " + s.Linear.URL,
+	}), "\n")
+	return row{id: s.ID, title: s.Title, status: string(s.Status), group: string(s.Type), updated: format.Age(s.LastUpdatedAt), session: s.TmuxSession, preview: preview, detail: detail, active: active}
 }
 
 func (m model) Init() tea.Cmd { return nil }
@@ -163,6 +201,41 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
+			if m.mode == "agentPick" {
+				switch key {
+				case "esc":
+					m.mode = "browse"
+					m.input = ""
+					m.create = ""
+					m.target = ""
+					m.message = ""
+				case "up", "k":
+					m.moveAgent(-1)
+				case "down", "j", "tab":
+					m.moveAgent(1)
+				case "enter":
+					if err := m.chooseAgent(); err != nil {
+						m.message = err.Error()
+					}
+				case "1":
+					if err := m.createWithAgent("claude"); err != nil {
+						m.message = err.Error()
+					} else {
+						m.afterCreate()
+					}
+				case "2":
+					if err := m.createWithAgent("codex"); err != nil {
+						m.message = err.Error()
+					} else {
+						m.afterCreate()
+					}
+				case "3":
+					m.mode = "agentCustom"
+					m.input = ""
+					m.message = ""
+				}
+				return m, nil
+			}
 			switch key {
 			case "esc":
 				m.mode = "browse"
@@ -172,16 +245,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.mode = "browse"
 					return m, nil
 				}
+				before := m.mode
 				if err := m.commitAction(); err != nil {
 					m.message = err.Error()
 				} else {
 					m.message = ""
-					m.mode = "browse"
-					m.input = ""
-					rows, err := loadRows()
-					if err == nil {
-						m.rows = rows
-						m.applyFilter()
+					if m.mode == before {
+						m.mode = "browse"
+						m.input = ""
+						rows, err := loadRows()
+						if err == nil {
+							m.rows = rows
+							m.applyFilter()
+						}
 					}
 				}
 			case "backspace", "ctrl+h":
@@ -327,7 +403,13 @@ func (m model) View() string {
 	}
 	b.WriteString("\n" + dim.Render("── preview ─────────────────────────────────────────") + "\n")
 	if len(m.filtered) > 0 {
-		preview := m.filtered[m.selected].preview
+		selected := m.filtered[m.selected]
+		if selected.detail != "" {
+			for _, line := range tail(strings.Split(selected.detail, "\n"), 4) {
+				b.WriteString(dim.Render("· "+line) + "\n")
+			}
+		}
+		preview := selected.preview
 		if preview == "" {
 			preview = "(no recent activity)"
 		}
@@ -336,7 +418,8 @@ func (m model) View() string {
 		}
 	}
 	b.WriteString("\n")
-	if prompt := m.prompt(); prompt != "" {
+	prompt := m.prompt()
+	if prompt != "" {
 		b.WriteString(prompt)
 	} else {
 		b.WriteString(dim.Render("↑↓/jk nav  1-9 jump  home/end  pgup/pgdn  enter open  / filter  n scratch  a issue/task  r rename  t title  d delete  s status  R refresh  ? help  q quit"))
@@ -345,7 +428,12 @@ func (m model) View() string {
 		b.WriteString("  " + cyan.Render("→ "+m.digits))
 	}
 	if m.message != "" {
-		b.WriteString("  " + red.Render(m.message))
+		if prompt != "" {
+			b.WriteString("\n")
+		} else {
+			b.WriteString("  ")
+		}
+		b.WriteString(red.Render("Error: " + m.message))
 	}
 	return b.String()
 }
@@ -365,20 +453,30 @@ func (m *model) commitAction() error {
 		if value == "" {
 			value = "."
 		}
-		abs, _ := filepath.Abs(value)
-		title := filepath.Base(abs)
-		_, err := agent.Start(agent.StartOptions{Cwd: abs, Scratch: true, Title: title})
-		return err
+		m.target = value
+		m.create = "scratch"
+		m.mode = "agentPick"
+		m.agentSelected = 0
+		m.input = ""
+		return nil
 	case "start":
 		if value == "" {
 			return fmt.Errorf("enter a Linear issue key or task title")
 		}
-		if issuePattern.MatchString(value) {
-			_, err := agent.Start(agent.StartOptions{Cwd: ".", IssueKey: value})
-			return err
+		if issuePattern.MatchString(value) && os.Getenv("LINEAR_API_KEY") == "" {
+			return fmt.Errorf("LINEAR_API_KEY is not set in this cmux process")
 		}
-		_, err := agent.Start(agent.StartOptions{Cwd: ".", Title: value, Worktree: true})
-		return err
+		m.target = value
+		m.create = "start"
+		m.mode = "agentPick"
+		m.agentSelected = 0
+		m.input = ""
+		return nil
+	case "agentCustom":
+		if value == "" {
+			return fmt.Errorf("enter an agent command")
+		}
+		return m.createWithAgent(value)
 	case "rename":
 		if !hasRow || !r.active || value == "" {
 			return fmt.Errorf("no active session selected")
@@ -427,6 +525,85 @@ func (m *model) commitAction() error {
 	}
 }
 
+func (m *model) createWithAgent(agentCommand string) error {
+	switch m.create {
+	case "scratch":
+		target := m.target
+		if target == "" {
+			target = "."
+		}
+		abs, _ := filepath.Abs(target)
+		title := filepath.Base(abs)
+		_, err := agent.Start(agent.StartOptions{Cwd: abs, Scratch: true, Title: title, Agent: agentCommand})
+		return err
+	case "start":
+		target := strings.TrimSpace(m.target)
+		if target == "" {
+			return fmt.Errorf("enter a Linear issue key or task title")
+		}
+		if issuePattern.MatchString(target) {
+			_, err := agent.Start(agent.StartOptions{Cwd: ".", IssueKey: target, Agent: agentCommand})
+			return err
+		}
+		_, err := agent.Start(agent.StartOptions{Cwd: ".", Title: target, Worktree: true, Agent: agentCommand})
+		return err
+	default:
+		return fmt.Errorf("no pending session creation")
+	}
+}
+
+func (m *model) chooseAgent() error {
+	if len(agentChoices) == 0 {
+		return fmt.Errorf("no agent choices configured")
+	}
+	if m.agentSelected < 0 {
+		m.agentSelected = 0
+	}
+	if m.agentSelected >= len(agentChoices) {
+		m.agentSelected = len(agentChoices) - 1
+	}
+	choice := agentChoices[m.agentSelected]
+	if choice.custom {
+		m.mode = "agentCustom"
+		m.input = ""
+		m.message = ""
+		return nil
+	}
+	if err := m.createWithAgent(choice.command); err != nil {
+		return err
+	}
+	m.afterCreate()
+	return nil
+}
+
+func (m *model) afterCreate() {
+	m.mode = "browse"
+	m.input = ""
+	m.create = ""
+	m.target = ""
+	m.agentSelected = 0
+	m.message = ""
+	rows, err := loadRows()
+	if err == nil {
+		m.rows = rows
+		m.applyFilter()
+	}
+}
+
+func (m model) agentPicker() string {
+	var b strings.Builder
+	b.WriteString(cyan.Render("agent") + dim.Render("  ↑↓/jk select · enter create · 1-3 shortcut · esc cancel") + "\n")
+	for i, choice := range agentChoices {
+		line := fmt.Sprintf("%-8s %s", choice.label, dim.Render(choice.description))
+		if i == m.agentSelected {
+			b.WriteString(green.Render("▌ "+line) + "\n")
+		} else {
+			b.WriteString("  " + line + "\n")
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
 func (m model) prompt() string {
 	switch m.mode {
 	case "filter":
@@ -435,6 +612,10 @@ func (m model) prompt() string {
 		return cyan.Render("scratch path  "+m.input+"_  ") + dim.Render("enter create · esc cancel")
 	case "start":
 		return cyan.Render("issue/task  "+m.input+"_  ") + dim.Render("REB-123 starts Linear work · other text creates task worktree")
+	case "agentPick":
+		return m.agentPicker()
+	case "agentCustom":
+		return cyan.Render("agent command  "+m.input+"_  ") + dim.Render("enter create · esc cancel")
 	case "rename":
 		return cyan.Render("rename  "+m.input+"_  ") + dim.Render("enter save · esc cancel")
 	case "title":
@@ -473,6 +654,20 @@ func (m *model) move(delta int) {
 	}
 	if m.selected >= len(m.filtered) {
 		m.selected = len(m.filtered) - 1
+	}
+}
+
+func (m *model) moveAgent(delta int) {
+	if len(agentChoices) == 0 {
+		m.agentSelected = 0
+		return
+	}
+	m.agentSelected += delta
+	if m.agentSelected < 0 {
+		m.agentSelected = len(agentChoices) - 1
+	}
+	if m.agentSelected >= len(agentChoices) {
+		m.agentSelected = 0
 	}
 }
 
@@ -537,6 +732,21 @@ func valueOr(value, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func nonEmpty(values []string) []string {
+	out := []string{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if strings.HasSuffix(value, ":") {
+			continue
+		}
+		out = append(out, value)
+	}
+	return out
 }
 
 func glyph(status string) string {

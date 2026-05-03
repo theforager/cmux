@@ -9,30 +9,24 @@ import (
 	"time"
 
 	"github.com/theforager/cmux/internal/format"
+	"github.com/theforager/cmux/internal/home"
 	"github.com/theforager/cmux/internal/types"
 )
 
 func Dir() string {
-	if v := os.Getenv("CMUX_STATE_DIR"); v != "" {
-		return v
-	}
-	if v := os.Getenv("XDG_STATE_HOME"); v != "" {
-		return filepath.Join(v, "cmux")
-	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".local", "state", "cmux")
+	return home.Dir()
 }
 
-func agentsDir() string {
-	return filepath.Join(Dir(), "agents")
+func sessionsDir() string {
+	return home.SessionsDir()
 }
 
 func ensure() error {
-	return os.MkdirAll(agentsDir(), 0o755)
+	return os.MkdirAll(sessionsDir(), 0o755)
 }
 
 func path(id string) string {
-	return filepath.Join(agentsDir(), id+".json")
+	return home.SessionPath(id)
 }
 
 func Read(id string) (types.AgentSession, error) {
@@ -46,7 +40,7 @@ func Read(id string) (types.AgentSession, error) {
 }
 
 func Write(s types.AgentSession) error {
-	if err := ensure(); err != nil {
+	if err := os.MkdirAll(home.SessionDir(s.ID), 0o755); err != nil {
 		return err
 	}
 	b, err := json.MarshalIndent(s, "", "  ")
@@ -61,16 +55,16 @@ func List() ([]types.AgentSession, error) {
 	if err := ensure(); err != nil {
 		return nil, err
 	}
-	entries, err := os.ReadDir(agentsDir())
+	entries, err := os.ReadDir(sessionsDir())
 	if err != nil {
 		return nil, err
 	}
 	var out []types.AgentSession
 	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+		if !entry.IsDir() {
 			continue
 		}
-		b, err := os.ReadFile(filepath.Join(agentsDir(), entry.Name()))
+		b, err := os.ReadFile(filepath.Join(sessionsDir(), entry.Name(), "session.json"))
 		if err != nil {
 			continue
 		}

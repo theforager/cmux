@@ -9,7 +9,7 @@ agent orchestration:
 - task-backed and scratch sessions
 - git worktree isolation
 - durable local session registry
-- `.agent/RUNBOOK.md` per real workspace
+- cmux-owned runbooks per real workspace
 - Linear status/comment sync
 - Bubble Tea based session dashboard
 
@@ -66,6 +66,14 @@ q / esc        quit
 Inside any cmux tmux session, press `prefix + g` to open the popup switcher.
 By default tmux prefix is `Ctrl-b`, so press `Ctrl-b` then `g`.
 
+When creating sessions from the dashboard, cmux asks which agent to run:
+
+```text
+1 claude
+2 codex
+3 other
+```
+
 ## Agent Orchestration
 
 ```bash
@@ -75,6 +83,7 @@ cmux agent start REB-123 --prepare
 cmux agent scratch --title "Explore SDK publishing bug"
 cmux agent list
 cmux agent open REB-123
+cmux agent path REB-123
 cmux agent status REB-123 blocked "Need API shape decision"
 cmux agent review REB-123 "Ready for review"
 cmux agent done REB-123
@@ -86,23 +95,29 @@ Session types:
 - `task-backed`: manually named goal, optional worktree.
 - `scratch`: quick current-directory session.
 
-For issue-backed and task-backed workspaces, cmux writes:
+cmux keeps session metadata and runbooks under its own home directory:
 
 ```text
-.agent/RUNBOOK.md
-.agent/cmux.json
+~/.cmux/sessions/<session-id>/session.json
+~/.cmux/sessions/<session-id>/RUNBOOK.md
 ```
 
 The initial agent prompt tells the agent to keep the runbook updated and to set
 cmux statuses when blocked, failed, or ready for review.
 
-## State And Config
+## Home Directory
 
-Local session state is stored outside the repo:
+cmux stores its own data in one home directory:
 
 ```text
-~/.local/state/cmux/agents/*.json
+~/.cmux/
+  config.json
+  sessions/
+  worktrees/
+  hooks/
 ```
+
+Override it with `CMUX_HOME=/path/to/cmux-home`.
 
 Set your Linear token with:
 

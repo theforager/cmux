@@ -3,9 +3,11 @@ package state
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/theforager/cmux/internal/format"
@@ -49,6 +51,19 @@ func Write(s types.AgentSession) error {
 	}
 	b = append(b, '\n')
 	return os.WriteFile(path(s.ID), b, 0o644)
+}
+
+func Delete(id string) error {
+	if strings.TrimSpace(id) == "" {
+		return errors.New("session id is required")
+	}
+	base := sessionsDir()
+	target := home.SessionDir(id)
+	rel, err := filepath.Rel(base, target)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
+		return fmt.Errorf("invalid session id: %s", id)
+	}
+	return os.RemoveAll(target)
 }
 
 func List() ([]types.AgentSession, error) {

@@ -104,12 +104,32 @@ func Create(o CreateOptions) error {
 	if o.Title != "" {
 		_ = SetEnv(o.Name, "CMUX_TITLE", o.Title)
 	}
-	_ = EnsurePopupBinding()
+	_ = EnsureKeyOptions()
 	if o.Command != "" {
 		_, err := process.Run("tmux", "send-keys", "-t", o.Name, "exec "+o.Command, "Enter")
 		return err
 	}
 	return nil
+}
+
+func EnsureKeyOptions() error {
+	if err := EnsurePopupBinding(); err != nil {
+		return err
+	}
+	// Forward modified keys such as Option/Meta+Enter through tmux to TUIs.
+	_, _ = process.Run("tmux", "set-option", "-g", "extended-keys", "on")
+	ensureTerminalFeature("xterm*:extkeys")
+	ensureTerminalFeature("tmux*:extkeys")
+	ensureTerminalFeature("screen*:extkeys")
+	return nil
+}
+
+func ensureTerminalFeature(entry string) {
+	out, err := process.Run("tmux", "show-options", "-gqv", "terminal-features")
+	if err == nil && strings.Contains(out, entry) {
+		return
+	}
+	_, _ = process.Run("tmux", "set-option", "-as", "terminal-features", ","+entry)
 }
 
 func EnsurePopupBinding() error {
@@ -118,7 +138,7 @@ func EnsurePopupBinding() error {
 }
 
 func AttachOrSwitch(name string) error {
-	_ = EnsurePopupBinding()
+	_ = EnsureKeyOptions()
 	if Inside() {
 		_, err := process.Run("tmux", "switch-client", "-t", name)
 		return err
@@ -151,6 +171,24 @@ func Find(target string) (Session, error) {
 func Kill(name string) error {
 	_, err := process.Run("tmux", "kill-session", "-t", name)
 	return err
+}
+
+func KillIfExists(name string) error {
+	if strings.TrimSpace(name) == "" {
+		return nil
+	}
+	if err := Kill(name); err != nil && !IsMissingSessionError(err) {
+		return err
+	}
+	return nil
+}
+
+func IsMissingSessionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "can't find session") || strings.Contains(msg, "no server running")
 }
 
 func Current() (string, error) {

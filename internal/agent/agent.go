@@ -208,11 +208,22 @@ func Kill(id string) error {
 	if err != nil {
 		return err
 	}
-	if err := tmux.Kill(s.TmuxSession); err != nil {
+	if err := tmux.KillIfExists(s.TmuxSession); err != nil {
 		return err
 	}
 	_, err = SetStatus(id, types.StatusDone, "Session killed from cmux")
 	return err
+}
+
+func Delete(id string) error {
+	s, err := state.Read(id)
+	if err != nil {
+		return err
+	}
+	if err := tmux.KillIfExists(s.TmuxSession); err != nil {
+		return err
+	}
+	return state.Delete(id)
 }
 
 func syncLinear(s *types.AgentSession) error {

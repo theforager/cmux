@@ -471,7 +471,7 @@ func (m model) View() string {
 	if m.filter != "" || m.mode == "filter" {
 		b.WriteString("  " + cyan.Render("/"+m.filter))
 		if m.mode == "filter" {
-			b.WriteString(cyan.Render("_"))
+			b.WriteString(cyan.Render("▌"))
 		}
 	}
 	b.WriteString("\n\n")
@@ -602,7 +602,7 @@ func (m *model) commitAction() error {
 			return nil
 		}
 		if isAgentRow(r) {
-			return agent.Kill(r.id)
+			return agent.Delete(r.id)
 		}
 		return tmux.Kill(r.session)
 	case "statusSummary":
@@ -729,19 +729,19 @@ func (m model) detailView() string {
 func (m model) prompt() string {
 	switch m.mode {
 	case "filter":
-		return cyan.Render("filter  "+m.filter+"_  ") + dim.Render("enter apply · esc cancel")
+		return renderPromptInput("filter", m.filter) + dim.Render("enter apply · esc cancel")
 	case "scratch":
-		return cyan.Render("scratch path  "+m.input+"_  ") + dim.Render("enter create · esc cancel")
+		return renderPromptInput("scratch path", m.input) + dim.Render("enter create · esc cancel")
 	case "start":
-		return cyan.Render("issue/task  "+m.input+"_  ") + dim.Render("REB-123 starts Linear work · other text creates task worktree")
+		return renderPromptInput("issue/task", m.input) + dim.Render("REB-123 starts Linear work · other text creates task worktree")
 	case "agentPick":
 		return m.agentPicker()
 	case "agentCustom":
-		return cyan.Render("agent command  "+m.input+"_  ") + dim.Render("enter create · esc cancel")
+		return renderPromptInput("agent command", m.input) + dim.Render("enter create · esc cancel")
 	case "rename":
-		return cyan.Render("rename  "+m.input+"_  ") + dim.Render("enter save · esc cancel")
+		return renderPromptInput("rename", m.input) + dim.Render("enter save · esc cancel")
 	case "title":
-		return cyan.Render("title  "+m.input+"_  ") + dim.Render("enter save · esc cancel")
+		return renderPromptInput("title", m.input) + dim.Render("enter save · esc cancel")
 	case "delete":
 		return red.Render("delete? type y then enter  ") + dim.Render("esc cancel")
 	case "statusPick":
@@ -759,10 +759,14 @@ func (m model) prompt() string {
 			dim.Render("press 1-9 · esc cancel"),
 		}, "\n")
 	case "statusSummary":
-		return cyan.Render("summary for "+string(m.pending)+"  "+m.input+"_  ") + dim.Render("enter save · esc cancel")
+		return renderPromptInput("summary for "+string(m.pending), m.input) + dim.Render("enter save · esc cancel")
 	default:
 		return ""
 	}
+}
+
+func renderPromptInput(label, value string) string {
+	return cyan.Render(label+"  "+value) + cyan.Render("▌  ")
 }
 
 func (m *model) move(delta int) {

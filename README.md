@@ -21,7 +21,7 @@ cd cmux
 ./install.sh
 ```
 
-The installer builds the Go CLI and symlinks `cmux` into `~/bin`.
+The installer builds the Go CLI into `~/bin/cmux`.
 
 For development:
 
@@ -51,6 +51,9 @@ home / end     first / last
 pgup / pgdn    move by 5
 1-9 digits     jump to row number
 enter          open selected session
+i              show session details
+w              open shell in selected workspace
+p              show selected workspace path
 /              filter
 n              create scratch session
 a              start Linear issue-backed or task-backed agent
@@ -69,9 +72,9 @@ By default tmux prefix is `Ctrl-b`, so press `Ctrl-b` then `g`.
 When creating sessions from the dashboard, cmux asks which agent to run:
 
 ```text
-1 claude
-2 codex
-3 other
+↑↓ / j k       choose agent
+enter          create
+1 / 2 / 3      shortcut to Claude / Codex / Other
 ```
 
 ## Agent Orchestration

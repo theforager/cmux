@@ -20,15 +20,27 @@ import (
 )
 
 type row struct {
-	id      string
-	title   string
-	status  string
-	group   string
-	updated string
-	session string
-	preview string
-	detail  string
-	active  bool
+	id            string
+	title         string
+	status        string
+	group         string
+	updated       string
+	session       string
+	repo          string
+	workspace     string
+	branch        string
+	agent         string
+	runbook       string
+	linear        string
+	lastSummary   string
+	currentState  string
+	nextAction    string
+	blockers      string
+	testsRun      string
+	reviewSummary string
+	preview       string
+	detail        string
+	active        bool
 }
 
 type model struct {
@@ -115,7 +127,7 @@ func loadRows() ([]row, error) {
 			seen[s.Name] = true
 			continue
 		}
-		rows = append(rows, row{id: tmux.Child(s.Name), title: displayName(s), status: tmux.InferStatus(s.Name), group: tmux.Parent(s.Name), updated: format.AgeUnix(s.Created), session: s.Name, preview: tmux.Capture(s.Name, 10), active: true})
+		rows = append(rows, rawTmuxRow(s))
 		seen[s.Name] = true
 	}
 	for _, s := range agentSessions {
@@ -127,6 +139,21 @@ func loadRows() ([]row, error) {
 		rows = append(rows, r)
 	}
 	return rows, nil
+}
+
+func rawTmuxRow(s tmux.Session) row {
+	return row{
+		id:        tmux.Child(s.Name),
+		title:     displayName(s),
+		status:    tmux.InferStatus(s.Name),
+		group:     tmux.Parent(s.Name),
+		updated:   format.AgeUnix(s.Created),
+		session:   s.Name,
+		workspace: s.Dir,
+		agent:     valueOr(s.Agent, "shell"),
+		preview:   tmux.Capture(s.Name, 10),
+		active:    true,
+	}
 }
 
 func agentRow(s types.AgentSession, active bool) row {
@@ -141,7 +168,29 @@ func agentRow(s types.AgentSession, active bool) row {
 		"runbook: " + home.RunbookPath(s.ID),
 		"linear: " + s.Linear.URL,
 	}), "\n")
-	return row{id: s.ID, title: s.Title, status: string(s.Status), group: string(s.Type), updated: format.Age(s.LastUpdatedAt), session: s.TmuxSession, preview: preview, detail: detail, active: active}
+	return row{
+		id:            s.ID,
+		title:         s.Title,
+		status:        string(s.Status),
+		group:         string(s.Type),
+		updated:       format.Age(s.LastUpdatedAt),
+		session:       s.TmuxSession,
+		repo:          s.RepoPath,
+		workspace:     valueOr(s.WorktreePath, s.RepoPath),
+		branch:        s.Branch,
+		agent:         valueOr(s.AgentCommand, s.Provider),
+		runbook:       home.RunbookPath(s.ID),
+		linear:        s.Linear.URL,
+		lastSummary:   s.LastSummary,
+		currentState:  notes.CurrentState,
+		nextAction:    notes.NextAction,
+		blockers:      notes.Blockers,
+		testsRun:      notes.TestsRun,
+		reviewSummary: notes.ReviewSummary,
+		preview:       preview,
+		detail:        detail,
+		active:        active,
+	}
 }
 
 func (m model) Init() tea.Cmd { return nil }
@@ -158,6 +207,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if m.mode != "browse" && m.mode != "help" {
+			if m.mode == "detail" {
+				switch key {
+				case "esc", "backspace", "ctrl+h", "i", "q":
+					m.mode = "browse"
+					m.message = ""
+				case "enter":
+					if r, ok := m.current(); ok && r.active {
+						m.chosen = r.session
+						return m, tea.Quit
+					}
+					m.message = "Session is not running"
+				case "p":
+					m.showWorkspacePath()
+				case "w":
+					name, err := m.openWorkspaceSession()
+					if err != nil {
+						m.message = err.Error()
+					} else {
+						m.chosen = name
+						return m, tea.Quit
+					}
+				}
+				return m, nil
+			}
 			if m.mode == "statusPick" {
 				switch key {
 				case "esc":
@@ -295,6 +368,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "a":
 			m.mode = "start"
 			m.input = ""
+		case "i":
+			if _, ok := m.current(); ok {
+				m.mode = "detail"
+				m.message = ""
+			}
+		case "p":
+			m.showWorkspacePath()
+		case "w":
+			name, err := m.openWorkspaceSession()
+			if err != nil {
+				m.message = err.Error()
+			} else {
+				m.chosen = name
+				return m, tea.Quit
+			}
 		case "r":
 			if r, ok := m.current(); ok && r.active {
 				m.mode = "rename"
@@ -374,6 +462,9 @@ func (m model) View() string {
 	if m.mode == "help" {
 		return helpView()
 	}
+	if m.mode == "detail" {
+		return m.detailView()
+	}
 	var b strings.Builder
 	count := fmt.Sprintf("%d sessions", len(m.filtered))
 	b.WriteString(bold.Render(cyan.Render("cmux")) + dim.Render("  "+count))
@@ -422,7 +513,7 @@ func (m model) View() string {
 	if prompt != "" {
 		b.WriteString(prompt)
 	} else {
-		b.WriteString(dim.Render("↑↓/jk nav  1-9 jump  home/end  pgup/pgdn  enter open  / filter  n scratch  a issue/task  r rename  t title  d delete  s status  R refresh  ? help  q quit"))
+		b.WriteString(dim.Render("↑↓/jk nav  1-9 jump  enter open  i detail  w workspace  p path  / filter  n scratch  a issue/task  s status  ? help  q quit"))
 	}
 	if m.digits != "" {
 		b.WriteString("  " + cyan.Render("→ "+m.digits))
@@ -433,7 +524,7 @@ func (m model) View() string {
 		} else {
 			b.WriteString("  ")
 		}
-		b.WriteString(red.Render("Error: " + m.message))
+		b.WriteString(renderMessage(m.message))
 	}
 	return b.String()
 }
@@ -604,6 +695,37 @@ func (m model) agentPicker() string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
+func (m model) detailView() string {
+	r, ok := m.current()
+	if !ok {
+		return dim.Render("no session selected")
+	}
+	var b strings.Builder
+	b.WriteString(bold.Render(cyan.Render(r.id)) + "  " + r.title + "\n")
+	b.WriteString(dim.Render(r.group+" · "+r.status+" · updated "+r.updated) + "\n\n")
+	for _, item := range detailItems(r) {
+		label := fmt.Sprintf("%-10s", item[0]+":")
+		b.WriteString(cyan.Render(label) + item[1] + "\n")
+	}
+	b.WriteString("\n" + dim.Render("── runbook ─────────────────────────────────────────") + "\n")
+	writeDetailSection(&b, "Current", r.currentState)
+	writeDetailSection(&b, "Next", r.nextAction)
+	writeDetailSection(&b, "Blockers", r.blockers)
+	writeDetailSection(&b, "Tests", r.testsRun)
+	writeDetailSection(&b, "Review", r.reviewSummary)
+	if r.preview != "" {
+		b.WriteString("\n" + dim.Render("── recent terminal ─────────────────────────────────") + "\n")
+		for _, line := range tail(strings.Split(r.preview, "\n"), previewHeight(m.height)) {
+			b.WriteString("▎ " + line + "\n")
+		}
+	}
+	b.WriteString("\n" + dim.Render("enter open session  w open workspace shell  p show path  esc back"))
+	if m.message != "" {
+		b.WriteString("\n" + renderMessage(m.message))
+	}
+	return b.String()
+}
+
 func (m model) prompt() string {
 	switch m.mode {
 	case "filter":
@@ -671,6 +793,51 @@ func (m *model) moveAgent(delta int) {
 	}
 }
 
+func (m *model) showWorkspacePath() {
+	r, ok := m.current()
+	if !ok {
+		m.message = "No session selected"
+		return
+	}
+	path := valueOr(r.workspace, r.repo)
+	if path == "" {
+		m.message = "No workspace path recorded"
+		return
+	}
+	m.message = "Workspace: " + path
+}
+
+func (m *model) openWorkspaceSession() (string, error) {
+	r, ok := m.current()
+	if !ok {
+		return "", fmt.Errorf("no session selected")
+	}
+	workspace := valueOr(r.workspace, r.repo)
+	if workspace == "" {
+		return "", fmt.Errorf("no workspace path recorded")
+	}
+	abs, err := filepath.Abs(workspace)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("workspace is not a directory: %s", abs)
+	}
+	name, err := tmux.GenerateSessionName(abs, "")
+	if err != nil {
+		return "", err
+	}
+	title := "workspace: " + valueOr(r.id, filepath.Base(abs))
+	if err := tmux.Create(tmux.CreateOptions{Name: name, Dir: abs, Title: title}); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
 func (m *model) applyFilter() {
 	if m.filter == "" {
 		m.filtered = m.rows
@@ -709,6 +876,9 @@ func helpView() string {
 		cyan.Render("pgup pgdn") + "     move by 5",
 		cyan.Render("1-9 digits") + "    jump to row number",
 		cyan.Render("enter") + "         open selected session",
+		cyan.Render("i") + "             show selected session details",
+		cyan.Render("w") + "             open shell in selected workspace",
+		cyan.Render("p") + "             show selected workspace path",
 		cyan.Render("/") + "             filter",
 		cyan.Render("n") + "             create scratch session",
 		cyan.Render("a") + "             start Linear issue or task-backed agent",
@@ -747,6 +917,54 @@ func nonEmpty(values []string) []string {
 		out = append(out, value)
 	}
 	return out
+}
+
+func detailItems(r row) [][2]string {
+	values := [][2]string{
+		{"tmux", r.session},
+		{"agent", r.agent},
+		{"branch", valueOr(r.branch, "current")},
+		{"workspace", r.workspace},
+		{"repo", r.repo},
+		{"runbook", r.runbook},
+		{"linear", r.linear},
+		{"summary", r.lastSummary},
+	}
+	out := [][2]string{}
+	for _, item := range values {
+		if strings.TrimSpace(item[1]) != "" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func writeDetailSection(b *strings.Builder, label, value string) {
+	value = cleanDetail(value)
+	if value == "" {
+		return
+	}
+	b.WriteString(cyan.Render(label+":") + "\n")
+	for _, line := range strings.Split(value, "\n") {
+		b.WriteString("  " + line + "\n")
+	}
+}
+
+func cleanDetail(value string) string {
+	value = strings.TrimSpace(value)
+	switch value {
+	case "- None.", "- None yet.", "- Not run yet.", "- Not ready for review yet.":
+		return ""
+	default:
+		return value
+	}
+}
+
+func renderMessage(message string) string {
+	if strings.HasPrefix(message, "Workspace:") {
+		return cyan.Render(message)
+	}
+	return red.Render("Error: " + message)
 }
 
 func glyph(status string) string {

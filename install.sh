@@ -9,23 +9,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "Installing cmux..."
 
-# Install dependencies and build the TypeScript CLI so the installed command is
-# a normal executable, not a development-only wrapper.
-if ! command -v node >/dev/null 2>&1; then
-    echo "Error: node is required. Install Node.js 22+ first." >&2
+# Build the Go CLI so the installed command is a normal executable, not a
+# development-only wrapper.
+if ! command -v go >/dev/null 2>&1; then
+    echo "Error: go is required. Install Go 1.24+ first." >&2
     exit 1
 fi
-
-if ! command -v npm >/dev/null 2>&1; then
-    echo "Error: npm is required. Install npm first." >&2
-    exit 1
-fi
-
-echo "Installing dependencies..."
-npm install
 
 echo "Building cmux..."
-npm run build
+mkdir -p "${SCRIPT_DIR}/dist"
+go build -o "${SCRIPT_DIR}/dist/cmux-go" ./cmd/cmux
 
 # Determine install directory
 INSTALL_DIR="${HOME}/bin"

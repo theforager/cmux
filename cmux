@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 
-if [[ -f "$SCRIPT_DIR/dist/cli.js" ]]; then
-  exec node "$SCRIPT_DIR/dist/cli.js" "$@"
-fi
-
-if [[ -x "$SCRIPT_DIR/node_modules/.bin/tsx" ]]; then
-  exec "$SCRIPT_DIR/node_modules/.bin/tsx" "$SCRIPT_DIR/src/cli.tsx" "$@"
+if [[ -x "$SCRIPT_DIR/dist/cmux-go" ]]; then
+  exec "$SCRIPT_DIR/dist/cmux-go" "$@"
 fi
 
 if [[ "${1:-}" == "legacy" ]]; then
@@ -17,11 +19,11 @@ if [[ "${1:-}" == "legacy" ]]; then
 fi
 
 cat >&2 <<EOF
-cmux TypeScript dependencies are not installed yet.
+cmux Go binary is not built yet.
 
 Run:
-  npm install
-  npm run build
+  mkdir -p dist
+  go build -o dist/cmux-go ./cmd/cmux
 
 Legacy cmux is still available:
   cmux legacy [command]

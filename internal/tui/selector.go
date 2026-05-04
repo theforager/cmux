@@ -5,11 +5,14 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/theforager/cmux/internal/agent"
+	"github.com/theforager/cmux/internal/config"
 	"github.com/theforager/cmux/internal/format"
 	"github.com/theforager/cmux/internal/home"
+	"github.com/theforager/cmux/internal/queue"
 	"github.com/theforager/cmux/internal/runbook"
 	"github.com/theforager/cmux/internal/state"
 	"github.com/theforager/cmux/internal/tmux"
@@ -41,24 +44,32 @@ type row struct {
 	preview       string
 	detail        string
 	active        bool
+	kind          string
+	structured    bool
+	queueIssue    string
 }
 
 type model struct {
-	rows          []row
-	filtered      []row
-	selected      int
-	agentSelected int
-	filter        string
-	input         string
-	create        string
-	target        string
-	pending       types.AgentStatus
-	mode          string
-	digits        string
-	message       string
-	chosen        string
-	width         int
-	height        int
+	rows           []row
+	filtered       []row
+	selected       int
+	agentSelected  int
+	repoSelected   int
+	actionSelected int
+	newSelected    int
+	filter         string
+	input          string
+	create         string
+	createRepo     string
+	target         string
+	pending        types.AgentStatus
+	mode           string
+	message        string
+	chosen         string
+	fullQueue      bool
+	selectedQueue  map[string]bool
+	width          int
+	height         int
 }
 
 var issuePattern = regexp.MustCompile(`^[A-Z][A-Z0-9]+-[0-9]+$`)
@@ -76,6 +87,13 @@ var agentChoices = []agentChoice{
 	{label: "Other", description: "Type a custom agent command", custom: true},
 }
 
+type menuChoice struct {
+	id          string
+	label       string
+	description string
+	danger      bool
+}
+
 var (
 	cyan  = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
 	dim   = lipgloss.NewStyle().Faint(true)
@@ -85,11 +103,11 @@ var (
 )
 
 func Run(popup bool) (string, error) {
-	rows, err := loadRows()
+	rows, err := loadRows(false)
 	if err != nil {
 		return "", err
 	}
-	m := model{rows: rows, filtered: rows, mode: "browse", width: 80, height: 24}
+	m := model{rows: rows, filtered: rows, mode: "browse", width: 80, height: 24, selectedQueue: map[string]bool{}}
 	opts := []tea.ProgramOption{}
 	if !popup {
 		opts = []tea.ProgramOption{tea.WithAltScreen()}
@@ -105,7 +123,25 @@ func Run(popup bool) (string, error) {
 	return "", nil
 }
 
-func loadRows() ([]row, error) {
+func RunQueue() (string, error) {
+	rows, err := loadRows(true)
+	if err != nil {
+		return "", err
+	}
+	m := model{rows: rows, filtered: rows, mode: "browse", width: 80, height: 24, fullQueue: true, selectedQueue: map[string]bool{}}
+	p := tea.NewProgram(m, tea.WithAltScreen())
+	final, err := p.Run()
+	if err != nil {
+		return "", err
+	}
+	if m, ok := final.(model); ok {
+		return m.chosen, nil
+	}
+	return "", nil
+}
+
+func loadRows(fullQueue bool) ([]row, error) {
+	_, _ = agent.Scan()
 	tmuxSessions, err := tmux.List()
 	if err != nil {
 		return nil, err
@@ -138,21 +174,128 @@ func loadRows() ([]row, error) {
 		r.title += " (not running)"
 		rows = append(rows, r)
 	}
+	rows = append(rows, queueRows(fullQueue)...)
+	sortRows(rows)
 	return rows, nil
 }
 
+func queueRows(fullQueue bool) []row {
+	if !queue.Configured() {
+		return []row{{
+			id:      "linear-setup",
+			title:   "Linear queue not configured: set LINEAR_API_KEY and run cmux queue setup",
+			status:  "setup",
+			group:   "Queue",
+			updated: "",
+			kind:    "notice",
+			detail:  "Linear queue needs LINEAR_API_KEY before cmux can fetch issues.",
+		}}
+	}
+	limit := 8
+	if fullQueue {
+		limit = 50
+	}
+	rows, preset, err := queue.Rows("", limit)
+	if err != nil {
+		return []row{{
+			id:     "linear-error",
+			title:  err.Error(),
+			status: "error",
+			group:  "Queue",
+			kind:   "notice",
+			detail: "Queue preset could not be loaded or Linear returned an error.",
+		}}
+	}
+	if len(rows) == 0 {
+		return []row{{id: "linear-empty", title: "No matching Linear issues in " + preset.Name, status: "empty", group: "Queue", kind: "notice"}}
+	}
+	displayLimit := limit
+	out := make([]row, 0, len(rows))
+	for _, qr := range rows {
+		if !fullQueue && qr.Started {
+			continue
+		}
+		if !fullQueue && displayLimit > 0 && len(out) >= displayLimit {
+			break
+		}
+		r := row{
+			id:         qr.Issue.Identifier,
+			title:      qr.Issue.Title,
+			status:     string(qr.Status),
+			group:      "Queue",
+			updated:    valueOr(qr.Issue.State, ""),
+			repo:       preset.RepoPath,
+			workspace:  preset.RepoPath,
+			linear:     qr.Issue.URL,
+			branch:     qr.Issue.BranchName,
+			kind:       "queue",
+			queueIssue: qr.Issue.Identifier,
+			detail: strings.Join(nonEmpty([]string{
+				"preset: " + preset.Name,
+				"repo: " + preset.RepoPath,
+				"linear: " + qr.Issue.URL,
+				"team: " + valueOr(qr.Issue.TeamName, qr.Issue.TeamKey),
+				"state: " + qr.Issue.State,
+				"assignee: " + qr.Issue.AssigneeName,
+			}), "\n"),
+			preview: qr.Issue.Description,
+		}
+		if qr.Session != nil {
+			sr := agentRow(*qr.Session, qr.Session.Runtime.TmuxAlive && !qr.Session.Runtime.PaneDead)
+			sr.group = "Queue"
+			sr.kind = "queue"
+			sr.queueIssue = qr.Issue.Identifier
+			sr.updated = format.Age(qr.Session.LastUpdatedAt)
+			r = sr
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+func sortRows(rows []row) {
+	sort.SliceStable(rows, func(i, j int) bool {
+		gi, gj := groupRank(rows[i].group), groupRank(rows[j].group)
+		if gi != gj {
+			return gi < gj
+		}
+		return rows[i].updated > rows[j].updated
+	})
+}
+
+func groupRank(group string) int {
+	switch group {
+	case "Needs attention":
+		return 0
+	case "Running":
+		return 1
+	case "Ready for review":
+		return 2
+	case "Queue":
+		return 3
+	case "Stale":
+		return 4
+	case "Done/Other":
+		return 5
+	default:
+		return 6
+	}
+}
+
 func rawTmuxRow(s tmux.Session) row {
+	status := tmux.InferStatus(s.Name)
 	return row{
 		id:        tmux.Child(s.Name),
 		title:     displayName(s),
-		status:    tmux.InferStatus(s.Name),
-		group:     tmux.Parent(s.Name),
+		status:    status,
+		group:     dashboardGroup(types.AgentStatus(status)),
 		updated:   format.AgeUnix(s.Created),
 		session:   s.Name,
 		workspace: s.Dir,
 		agent:     valueOr(s.Agent, "shell"),
 		preview:   tmux.Capture(s.Name, 10),
 		active:    true,
+		kind:      "session",
 	}
 }
 
@@ -172,7 +315,7 @@ func agentRow(s types.AgentSession, active bool) row {
 		id:            s.ID,
 		title:         s.Title,
 		status:        string(s.Status),
-		group:         string(s.Type),
+		group:         dashboardGroup(s.Status),
 		updated:       format.Age(s.LastUpdatedAt),
 		session:       s.TmuxSession,
 		repo:          s.RepoPath,
@@ -190,6 +333,8 @@ func agentRow(s types.AgentSession, active bool) row {
 		preview:       preview,
 		detail:        detail,
 		active:        active,
+		kind:          "session",
+		structured:    true,
 	}
 }
 
@@ -218,14 +363,40 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						return m, tea.Quit
 					}
 					m.message = "Session is not running"
-				case "p":
-					m.showWorkspacePath()
-				case "w":
-					name, err := m.openWorkspaceSession()
-					if err != nil {
+				case ".":
+					m.mode = "actionMenu"
+					m.actionSelected = 0
+				}
+				return m, nil
+			}
+			if m.mode == "actionMenu" {
+				switch key {
+				case "esc", "backspace", "ctrl+h", ".":
+					m.mode = "browse"
+				case "up", "k":
+					m.moveAction(-1)
+				case "down", "j", "tab":
+					m.moveAction(1)
+				case "enter":
+					if err := m.chooseAction(); err != nil {
 						m.message = err.Error()
-					} else {
-						m.chosen = name
+					} else if m.chosen != "" {
+						return m, tea.Quit
+					}
+				}
+				return m, nil
+			}
+			if m.mode == "newMenu" {
+				switch key {
+				case "esc", "backspace", "ctrl+h", "a":
+					m.mode = "browse"
+				case "up", "k":
+					m.moveNew(-1)
+				case "down", "j", "tab":
+					m.moveNew(1)
+				case "enter":
+					m.chooseNew()
+					if m.chosen != "" {
 						return m, tea.Quit
 					}
 				}
@@ -280,6 +451,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.mode = "browse"
 					m.input = ""
 					m.create = ""
+					m.createRepo = ""
 					m.target = ""
 					m.message = ""
 				case "up", "k":
@@ -289,16 +461,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				case "enter":
 					if err := m.chooseAgent(); err != nil {
 						m.message = err.Error()
+					} else if m.chosen != "" {
+						return m, tea.Quit
 					}
 				case "1":
 					if err := m.createWithAgent("claude"); err != nil {
 						m.message = err.Error()
+					} else if m.chosen != "" {
+						return m, tea.Quit
 					} else {
 						m.afterCreate()
 					}
 				case "2":
 					if err := m.createWithAgent("codex"); err != nil {
 						m.message = err.Error()
+					} else if m.chosen != "" {
+						return m, tea.Quit
 					} else {
 						m.afterCreate()
 					}
@@ -306,6 +484,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.mode = "agentCustom"
 					m.input = ""
 					m.message = ""
+				}
+				return m, nil
+			}
+			if m.mode == "repoPick" {
+				switch key {
+				case "esc":
+					m.mode = "browse"
+					m.input = ""
+					m.create = ""
+					m.createRepo = ""
+					m.target = ""
+					m.message = ""
+				case "up", "k":
+					m.moveRepo(-1)
+				case "down", "j", "tab":
+					m.moveRepo(1)
+				case "enter":
+					if err := m.chooseRepo(); err != nil {
+						m.message = err.Error()
+					}
 				}
 				return m, nil
 			}
@@ -321,12 +519,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				before := m.mode
 				if err := m.commitAction(); err != nil {
 					m.message = err.Error()
+				} else if m.chosen != "" {
+					return m, tea.Quit
 				} else {
 					m.message = ""
 					if m.mode == before {
 						m.mode = "browse"
 						m.input = ""
-						rows, err := loadRows()
+						rows, err := loadRows(m.fullQueue)
 						if err == nil {
 							m.rows = rows
 							m.applyFilter()
@@ -361,47 +561,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.mode = "help"
 		case "/":
 			m.mode = "filter"
-		case "n":
-			m.mode = "scratch"
-			wd, _ := os.Getwd()
-			m.input = wd
 		case "a":
-			m.mode = "start"
-			m.input = ""
+			m.mode = "newMenu"
+			m.newSelected = 0
 		case "i":
 			if _, ok := m.current(); ok {
 				m.mode = "detail"
 				m.message = ""
 			}
-		case "p":
-			m.showWorkspacePath()
-		case "w":
-			name, err := m.openWorkspaceSession()
-			if err != nil {
-				m.message = err.Error()
-			} else {
-				m.chosen = name
-				return m, tea.Quit
-			}
-		case "r":
-			if r, ok := m.current(); ok && r.active {
-				m.mode = "rename"
-				m.input = tmux.Child(r.session)
-			}
-		case "t":
-			if r, ok := m.current(); ok && r.active {
-				m.mode = "title"
-				m.input = r.title
-			}
-		case "d":
+		case ".":
 			if _, ok := m.current(); ok {
-				m.mode = "delete"
-				m.input = ""
-			}
-		case "s":
-			if r, ok := m.current(); ok && isAgentRow(r) {
-				m.mode = "statusPick"
-				m.input = ""
+				m.mode = "actionMenu"
+				m.actionSelected = 0
 			}
 		case "up", "k":
 			m.move(-1)
@@ -418,40 +589,33 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.selected = len(m.filtered) - 1
 			}
 		case "R":
-			rows, err := loadRows()
+			rows, err := loadRows(m.fullQueue)
 			if err == nil {
 				m.rows = rows
 				m.applyFilter()
 			} else {
 				m.message = err.Error()
 			}
-		case "enter":
-			if len(m.filtered) == 0 {
-				return m, nil
-			}
-			r := m.filtered[m.selected]
-			if !r.active {
-				m.message = "Session is not running: " + r.id
-				return m, nil
-			}
-			m.chosen = r.session
-			return m, tea.Quit
-		default:
-			if len(key) == 1 && key >= "1" && key <= "9" {
-				m.digits += key
-				target := atoi(m.digits)
-				if target >= 1 && target <= len(m.filtered) {
-					m.selected = target - 1
-				} else {
-					single := atoi(key)
-					m.digits = ""
-					if single >= 1 && single <= len(m.filtered) {
-						m.selected = single - 1
-						m.digits = key
-					}
-				}
+		case "tab":
+			m.fullQueue = !m.fullQueue
+			m.filter = ""
+			rows, err := loadRows(m.fullQueue)
+			if err == nil {
+				m.rows = rows
+				m.applyFilter()
+				m.message = ""
 			} else {
-				m.digits = ""
+				m.message = err.Error()
+			}
+		case " ":
+			if m.fullQueue {
+				m.toggleQueueSelection()
+			}
+		case "enter":
+			if err := m.primaryAction(); err != nil {
+				m.message = err.Error()
+			} else if m.chosen != "" {
+				return m, tea.Quit
 			}
 		}
 	}
@@ -467,6 +631,9 @@ func (m model) View() string {
 	}
 	var b strings.Builder
 	count := fmt.Sprintf("%d sessions", len(m.filtered))
+	if m.fullQueue {
+		count = fmt.Sprintf("%d rows", len(m.filtered))
+	}
 	b.WriteString(bold.Render(cyan.Render("cmux")) + dim.Render("  "+count))
 	if m.filter != "" || m.mode == "filter" {
 		b.WriteString("  " + cyan.Render("/"+m.filter))
@@ -484,7 +651,11 @@ func (m model) View() string {
 				lastGroup = r.group
 				b.WriteString(dim.Render("  "+r.group) + "\n")
 			}
-			line := fmt.Sprintf("%s %-3d %-16s %-17s %s  %s", glyph(r.status), i+1, format.Trunc(r.id, 16), format.Trunc(r.status, 17), r.title, dim.Render(r.updated))
+			mark := " "
+			if r.kind == "queue" && !r.active && m.selectedQueue[r.queueIssue] {
+				mark = "✓"
+			}
+			line := fmt.Sprintf("%s%s %-16s %-17s %s  %s", glyph(r.status), mark, format.Trunc(r.id, 16), format.Trunc(r.status, 17), r.title, dim.Render(r.updated))
 			if i == m.selected {
 				b.WriteString(green.Render("▌ "+line) + "\n")
 			} else {
@@ -513,10 +684,11 @@ func (m model) View() string {
 	if prompt != "" {
 		b.WriteString(prompt)
 	} else {
-		b.WriteString(dim.Render("↑↓/jk nav  1-9 jump  enter open  i detail  w workspace  p path  / filter  n scratch  a issue/task  s status  ? help  q quit"))
-	}
-	if m.digits != "" {
-		b.WriteString("  " + cyan.Render("→ "+m.digits))
+		if m.fullQueue {
+			b.WriteString(dim.Render("↑↓/jk nav  enter start/open  space select  a new work  . actions  tab dashboard  / filter  R refresh  ? help  q quit"))
+		} else {
+			b.WriteString(dim.Render("↑↓/jk nav  enter open/start  a new work  . actions  tab queue  / filter  R refresh  ? help  q quit"))
+		}
 	}
 	if m.message != "" {
 		if prompt != "" {
@@ -563,6 +735,26 @@ func (m *model) commitAction() error {
 		m.agentSelected = 0
 		m.input = ""
 		return nil
+	case "repoPath":
+		if value == "" {
+			return fmt.Errorf("enter a repository path")
+		}
+		abs, err := filepath.Abs(value)
+		if err != nil {
+			return err
+		}
+		info, err := os.Stat(abs)
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("repository path is not a directory: %s", abs)
+		}
+		m.createRepo = abs
+		m.mode = "agentPick"
+		m.agentSelected = 0
+		m.input = ""
+		return nil
 	case "agentCustom":
 		if value == "" {
 			return fmt.Errorf("enter an agent command")
@@ -605,6 +797,23 @@ func (m *model) commitAction() error {
 			return agent.Delete(r.id)
 		}
 		return tmux.Kill(r.session)
+	case "cleanup":
+		if !hasRow || !isAgentRow(r) {
+			return fmt.Errorf("select a structured agent session")
+		}
+		force := value == r.id
+		if !force && strings.ToLower(value) != "y" {
+			return nil
+		}
+		return agent.CleanupWorktree(r.id, force)
+	case "reset":
+		if !hasRow || !isAgentRow(r) {
+			return fmt.Errorf("select a structured agent session")
+		}
+		if value != r.id {
+			return fmt.Errorf("type %s to reset workspace", r.id)
+		}
+		return agent.ResetWorkspace(r.id)
 	case "statusSummary":
 		if !hasRow || !isAgentRow(r) {
 			return fmt.Errorf("select a structured agent session")
@@ -638,6 +847,29 @@ func (m *model) createWithAgent(agentCommand string) error {
 		}
 		_, err := agent.Start(agent.StartOptions{Cwd: ".", Title: target, Worktree: true, Agent: agentCommand})
 		return err
+	case "queue":
+		targets := splitTargets(m.target)
+		if len(targets) == 0 {
+			return fmt.Errorf("select a Linear issue")
+		}
+		if len(targets) > queue.BatchLimit {
+			return fmt.Errorf("batch start is capped at %d issues", queue.BatchLimit)
+		}
+		cwd := valueOr(m.createRepo, ".")
+		var first types.AgentSession
+		for _, target := range targets {
+			s, err := agent.Start(agent.StartOptions{Cwd: cwd, IssueKey: target, Agent: agentCommand})
+			if err != nil {
+				return err
+			}
+			if first.ID == "" {
+				first = s
+			}
+		}
+		if len(targets) == 1 && first.TmuxSession != "" {
+			m.chosen = first.TmuxSession
+		}
+		return nil
 	default:
 		return fmt.Errorf("no pending session creation")
 	}
@@ -663,6 +895,9 @@ func (m *model) chooseAgent() error {
 	if err := m.createWithAgent(choice.command); err != nil {
 		return err
 	}
+	if m.chosen != "" {
+		return nil
+	}
 	m.afterCreate()
 	return nil
 }
@@ -671,10 +906,12 @@ func (m *model) afterCreate() {
 	m.mode = "browse"
 	m.input = ""
 	m.create = ""
+	m.createRepo = ""
 	m.target = ""
 	m.agentSelected = 0
 	m.message = ""
-	rows, err := loadRows()
+	m.selectedQueue = map[string]bool{}
+	rows, err := loadRows(m.fullQueue)
 	if err == nil {
 		m.rows = rows
 		m.applyFilter()
@@ -687,6 +924,61 @@ func (m model) agentPicker() string {
 	for i, choice := range agentChoices {
 		line := fmt.Sprintf("%-8s %s", choice.label, dim.Render(choice.description))
 		if i == m.agentSelected {
+			b.WriteString(green.Render("▌ "+line) + "\n")
+		} else {
+			b.WriteString("  " + line + "\n")
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func (m model) actionMenu() string {
+	r, ok := m.current()
+	if !ok {
+		return dim.Render("no row selected")
+	}
+	choices := actionsFor(r, m.fullQueue)
+	var b strings.Builder
+	b.WriteString(cyan.Render("actions") + dim.Render("  "+r.id+" · ↑↓/jk select · enter run · esc cancel") + "\n")
+	for i, choice := range choices {
+		line := fmt.Sprintf("%-22s %s", choice.label, dim.Render(choice.description))
+		if i == m.actionSelected {
+			b.WriteString(green.Render("▌ "+line) + "\n")
+		} else if choice.danger {
+			b.WriteString("  " + red.Render(line) + "\n")
+		} else {
+			b.WriteString("  " + line + "\n")
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func (m model) newMenu() string {
+	choices := newChoices()
+	var b strings.Builder
+	b.WriteString(cyan.Render("new work") + dim.Render("  ↑↓/jk select · enter continue · esc cancel") + "\n")
+	for i, choice := range choices {
+		line := fmt.Sprintf("%-18s %s", choice.label, dim.Render(choice.description))
+		if i == m.newSelected {
+			b.WriteString(green.Render("▌ "+line) + "\n")
+		} else {
+			b.WriteString("  " + line + "\n")
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func (m model) repoPicker() string {
+	choices := repoChoices(m.createRepo)
+	var b strings.Builder
+	b.WriteString(cyan.Render("repository") + dim.Render("  ↑↓/jk select · enter continue · esc cancel") + "\n")
+	for i, choice := range choices {
+		desc := choice.description
+		if choice.path != "" {
+			desc = strings.TrimSpace(strings.Join(nonEmpty([]string{desc, choice.path}), " · "))
+		}
+		line := fmt.Sprintf("%-18s %s", choice.label, dim.Render(desc))
+		if i == m.repoSelected {
 			b.WriteString(green.Render("▌ "+line) + "\n")
 		} else {
 			b.WriteString("  " + line + "\n")
@@ -719,7 +1011,7 @@ func (m model) detailView() string {
 			b.WriteString("▎ " + line + "\n")
 		}
 	}
-	b.WriteString("\n" + dim.Render("enter open session  w open workspace shell  p show path  esc back"))
+	b.WriteString("\n" + dim.Render("enter open  . actions  esc back"))
 	if m.message != "" {
 		b.WriteString("\n" + renderMessage(m.message))
 	}
@@ -730,12 +1022,20 @@ func (m model) prompt() string {
 	switch m.mode {
 	case "filter":
 		return renderPromptInput("filter", m.filter) + dim.Render("enter apply · esc cancel")
+	case "actionMenu":
+		return m.actionMenu()
+	case "newMenu":
+		return m.newMenu()
 	case "scratch":
 		return renderPromptInput("scratch path", m.input) + dim.Render("enter create · esc cancel")
 	case "start":
 		return renderPromptInput("issue/task", m.input) + dim.Render("REB-123 starts Linear work · other text creates task worktree")
 	case "agentPick":
 		return m.agentPicker()
+	case "repoPick":
+		return m.repoPicker()
+	case "repoPath":
+		return renderPromptInput("repo path", m.input) + dim.Render("queue worktrees will be created from this repo")
 	case "agentCustom":
 		return renderPromptInput("agent command", m.input) + dim.Render("enter create · esc cancel")
 	case "rename":
@@ -743,7 +1043,14 @@ func (m model) prompt() string {
 	case "title":
 		return renderPromptInput("title", m.input) + dim.Render("enter save · esc cancel")
 	case "delete":
-		return red.Render("delete? type y then enter  ") + dim.Render("esc cancel")
+		return red.Render("delete cmux session only? type y then enter  ") + dim.Render("worktree and branch are kept · esc cancel")
+	case "cleanup":
+		return red.Render("cleanup worktree? type y if clean, or type session id to force  ") + dim.Render("dirty worktrees are refused unless forced · esc cancel")
+	case "reset":
+		if r, ok := m.current(); ok {
+			return red.Render("reset workspace? type "+r.id+" then enter  ") + dim.Render("runs git reset --hard and git clean -fd · esc cancel")
+		}
+		return red.Render("reset workspace? type session id then enter  ") + dim.Render("esc cancel")
 	case "statusPick":
 		return strings.Join([]string{
 			cyan.Render("set status"),
@@ -797,6 +1104,332 @@ func (m *model) moveAgent(delta int) {
 	}
 }
 
+func (m *model) moveRepo(delta int) {
+	choices := repoChoices(m.createRepo)
+	if len(choices) == 0 {
+		m.repoSelected = 0
+		return
+	}
+	m.repoSelected += delta
+	if m.repoSelected < 0 {
+		m.repoSelected = len(choices) - 1
+	}
+	if m.repoSelected >= len(choices) {
+		m.repoSelected = 0
+	}
+}
+
+func (m *model) moveAction(delta int) {
+	r, ok := m.current()
+	if !ok {
+		m.actionSelected = 0
+		return
+	}
+	choices := actionsFor(r, m.fullQueue)
+	if len(choices) == 0 {
+		m.actionSelected = 0
+		return
+	}
+	m.actionSelected += delta
+	if m.actionSelected < 0 {
+		m.actionSelected = len(choices) - 1
+	}
+	if m.actionSelected >= len(choices) {
+		m.actionSelected = 0
+	}
+}
+
+func (m *model) moveNew(delta int) {
+	choices := newChoices()
+	m.newSelected += delta
+	if m.newSelected < 0 {
+		m.newSelected = len(choices) - 1
+	}
+	if m.newSelected >= len(choices) {
+		m.newSelected = 0
+	}
+}
+
+func (m *model) chooseNew() {
+	choices := newChoices()
+	if m.newSelected < 0 || m.newSelected >= len(choices) {
+		m.newSelected = 0
+	}
+	switch choices[m.newSelected].id {
+	case "scratch":
+		m.mode = "scratch"
+		wd, _ := os.Getwd()
+		m.input = wd
+	case "issueTask":
+		m.mode = "start"
+		m.input = ""
+	case "workspace":
+		name, err := m.openWorkspaceSession()
+		if err != nil {
+			m.message = err.Error()
+			m.mode = "browse"
+			return
+		}
+		m.chosen = name
+	}
+}
+
+func (m *model) chooseAction() error {
+	r, ok := m.current()
+	if !ok {
+		return fmt.Errorf("no row selected")
+	}
+	choices := actionsFor(r, m.fullQueue)
+	if len(choices) == 0 {
+		return fmt.Errorf("no actions available")
+	}
+	if m.actionSelected < 0 || m.actionSelected >= len(choices) {
+		m.actionSelected = 0
+	}
+	switch choices[m.actionSelected].id {
+	case "open":
+		if !r.active {
+			return fmt.Errorf("session is not running")
+		}
+		m.chosen = r.session
+	case "startQueue":
+		return m.startQueueFlow(false)
+	case "startSelected":
+		return m.startQueueFlow(true)
+	case "detail":
+		m.mode = "detail"
+	case "path":
+		m.showWorkspacePath()
+		m.mode = "browse"
+	case "workspace":
+		name, err := m.openWorkspaceSession()
+		if err != nil {
+			return err
+		}
+		m.chosen = name
+	case "restart":
+		if err := m.restartCurrent(); err != nil {
+			return err
+		}
+		if r, ok := m.current(); ok && r.session != "" {
+			m.chosen = r.session
+		}
+	case "status":
+		if !isAgentRow(r) {
+			return fmt.Errorf("select a structured agent session")
+		}
+		m.mode = "statusPick"
+		m.input = ""
+	case "rename":
+		if !r.active {
+			return fmt.Errorf("session is not running")
+		}
+		m.mode = "rename"
+		m.input = tmux.Child(r.session)
+	case "title":
+		if !r.active {
+			return fmt.Errorf("session is not running")
+		}
+		m.mode = "title"
+		m.input = r.title
+	case "delete":
+		m.mode = "delete"
+		m.input = ""
+	case "cleanup":
+		m.mode = "cleanup"
+		m.input = ""
+	case "reset":
+		m.mode = "reset"
+		m.input = ""
+	}
+	return nil
+}
+
+func (m *model) primaryAction() error {
+	r, ok := m.current()
+	if !ok {
+		return nil
+	}
+	if r.kind == "queue" && !r.active && !r.structured {
+		return m.startQueueFlow(false)
+	}
+	if !r.active {
+		m.mode = "actionMenu"
+		m.actionSelected = 0
+		return nil
+	}
+	m.chosen = r.session
+	return nil
+}
+
+func (m *model) startQueueFlow(useSelected bool) error {
+	r, ok := m.current()
+	if !ok {
+		return fmt.Errorf("no row selected")
+	}
+	selected := []string{}
+	if useSelected {
+		selected = m.selectedQueueIssues()
+	}
+	if len(selected) == 0 && r.queueIssue != "" {
+		selected = []string{r.queueIssue}
+	}
+	if len(selected) == 0 {
+		return fmt.Errorf("no queue issue selected")
+	}
+	m.create = "queue"
+	m.createRepo = r.repo
+	m.target = strings.Join(selected, ",")
+	m.mode = "repoPick"
+	m.repoSelected = 0
+	m.message = ""
+	return nil
+}
+
+func (m *model) chooseRepo() error {
+	choices := repoChoices(m.createRepo)
+	if len(choices) == 0 {
+		m.mode = "repoPath"
+		m.input = defaultRepoPath()
+		return nil
+	}
+	if m.repoSelected < 0 {
+		m.repoSelected = 0
+	}
+	if m.repoSelected >= len(choices) {
+		m.repoSelected = len(choices) - 1
+	}
+	choice := choices[m.repoSelected]
+	if choice.custom {
+		m.mode = "repoPath"
+		m.input = defaultRepoPath()
+		return nil
+	}
+	m.createRepo = choice.path
+	m.mode = "agentPick"
+	m.agentSelected = 0
+	m.input = ""
+	return nil
+}
+
+type repoChoice struct {
+	label       string
+	path        string
+	description string
+	custom      bool
+}
+
+func repoChoices(preferred string) []repoChoice {
+	choices := []repoChoice{}
+	add := func(label, path, description string) {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			return
+		}
+		for _, choice := range choices {
+			if choice.path == path {
+				return
+			}
+		}
+		choices = append(choices, repoChoice{label: label, path: path, description: description})
+	}
+	if preferred != "" {
+		add(filepath.Base(preferred), preferred, "preset default")
+	}
+	if cfg, err := config.LoadOrDefault(); err == nil {
+		for _, repo := range cfg.Repos {
+			add(valueOr(repo.Name, filepath.Base(repo.Path)), repo.Path, "configured")
+		}
+		add(filepath.Base(cfg.DefaultRepoPath), cfg.DefaultRepoPath, "default")
+	}
+	current := defaultRepoPath()
+	add(filepath.Base(current), current, "current directory")
+	choices = append(choices, repoChoice{label: "Custom path", custom: true})
+	return choices
+}
+
+func actionsFor(r row, fullQueue bool) []menuChoice {
+	if r.kind == "queue" && !r.structured {
+		actions := []menuChoice{{id: "startQueue", label: "Start agent", description: "choose repo and agent"}}
+		if fullQueue {
+			actions = append(actions, menuChoice{id: "startSelected", label: "Start selected", description: "batch up to 3 selected issues"})
+		}
+		return append(actions,
+			menuChoice{id: "detail", label: "Details", description: "show issue details"},
+			menuChoice{id: "path", label: "Show URL/path", description: "show Linear URL or workspace path"},
+		)
+	}
+	if r.structured {
+		actions := []menuChoice{}
+		if r.active {
+			actions = append(actions, menuChoice{id: "open", label: "Open agent", description: "attach to tmux session"})
+		} else {
+			actions = append(actions, menuChoice{id: "restart", label: "Restart agent", description: "create tmux session in workspace"})
+		}
+		return append(actions,
+			menuChoice{id: "workspace", label: "Workspace shell", description: "open shell in recorded workspace"},
+			menuChoice{id: "detail", label: "Details", description: "show runbook and output"},
+			menuChoice{id: "status", label: "Set status", description: "update cmux status"},
+			menuChoice{id: "rename", label: "Rename tmux", description: "rename tmux session"},
+			menuChoice{id: "title", label: "Set title", description: "change display title"},
+			menuChoice{id: "delete", label: "Delete cmux session", description: "keep worktree and branch", danger: true},
+			menuChoice{id: "cleanup", label: "Cleanup worktree", description: "remove clean worktree", danger: true},
+			menuChoice{id: "reset", label: "Reset workspace", description: "git reset --hard and clean", danger: true},
+		)
+	}
+	actions := []menuChoice{}
+	if r.active {
+		actions = append(actions, menuChoice{id: "open", label: "Open session", description: "attach to tmux session"})
+	}
+	if r.workspace != "" {
+		actions = append(actions, menuChoice{id: "workspace", label: "Workspace shell", description: "open shell in path"})
+	}
+	return append(actions,
+		menuChoice{id: "rename", label: "Rename tmux", description: "rename tmux session"},
+		menuChoice{id: "title", label: "Set title", description: "change display title"},
+		menuChoice{id: "delete", label: "Kill session", description: "kill tmux session", danger: true},
+	)
+}
+
+func newChoices() []menuChoice {
+	return []menuChoice{
+		{id: "scratch", label: "Scratch session", description: "start an agent in a local path"},
+		{id: "issueTask", label: "Issue or task", description: "Linear issue key or task title"},
+		{id: "workspace", label: "Workspace shell", description: "open shell in selected/current workspace"},
+	}
+}
+
+func (m *model) toggleQueueSelection() {
+	r, ok := m.current()
+	if !ok || r.kind != "queue" || r.active || r.structured || r.queueIssue == "" {
+		return
+	}
+	if m.selectedQueue == nil {
+		m.selectedQueue = map[string]bool{}
+	}
+	if m.selectedQueue[r.queueIssue] {
+		delete(m.selectedQueue, r.queueIssue)
+		m.message = ""
+		return
+	}
+	if len(m.selectedQueue) >= queue.BatchLimit {
+		m.message = fmt.Sprintf("Batch start is capped at %d issues", queue.BatchLimit)
+		return
+	}
+	m.selectedQueue[r.queueIssue] = true
+	m.message = ""
+}
+
+func (m model) selectedQueueIssues() []string {
+	var ids []string
+	for _, r := range m.rows {
+		if r.kind == "queue" && r.queueIssue != "" && m.selectedQueue[r.queueIssue] {
+			ids = append(ids, r.queueIssue)
+		}
+	}
+	return ids
+}
+
 func (m *model) showWorkspacePath() {
 	r, ok := m.current()
 	if !ok {
@@ -842,6 +1475,29 @@ func (m *model) openWorkspaceSession() (string, error) {
 	return name, nil
 }
 
+func (m *model) restartCurrent() error {
+	r, ok := m.current()
+	if !ok || !isAgentRow(r) {
+		return fmt.Errorf("select a structured agent session")
+	}
+	s, err := agent.Restart(r.id)
+	if err != nil {
+		return err
+	}
+	rows, err := loadRows(m.fullQueue)
+	if err == nil {
+		m.rows = rows
+		m.applyFilter()
+		for i, row := range m.filtered {
+			if row.id == s.ID {
+				m.selected = i
+				break
+			}
+		}
+	}
+	return nil
+}
+
 func (m *model) applyFilter() {
 	if m.filter == "" {
 		m.filtered = m.rows
@@ -878,19 +1534,14 @@ func helpView() string {
 		cyan.Render("↑↓ j k") + "        navigate",
 		cyan.Render("home end") + "      first / last",
 		cyan.Render("pgup pgdn") + "     move by 5",
-		cyan.Render("1-9 digits") + "    jump to row number",
-		cyan.Render("enter") + "         open selected session",
+		cyan.Render("enter") + "         open session or start queued issue",
+		cyan.Render(".") + "             actions for selected row",
+		cyan.Render("a") + "             new work menu",
+		cyan.Render("tab") + "           dashboard / full queue",
 		cyan.Render("i") + "             show selected session details",
-		cyan.Render("w") + "             open shell in selected workspace",
-		cyan.Render("p") + "             show selected workspace path",
 		cyan.Render("/") + "             filter",
-		cyan.Render("n") + "             create scratch session",
-		cyan.Render("a") + "             start Linear issue or task-backed agent",
-		cyan.Render("r") + "             rename selected tmux session",
-		cyan.Render("t") + "             set selected title",
-		cyan.Render("d") + "             delete selected session",
-		cyan.Render("s") + "             set structured agent status",
-		cyan.Render("R") + "             refresh",
+		cyan.Render("space") + "         select queued issue in full queue",
+		cyan.Render("R") + "             scan sessions and refresh",
 		cyan.Render("q esc") + "         quit",
 		"",
 		dim.Render("press any key to return"),
@@ -898,7 +1549,22 @@ func helpView() string {
 }
 
 func isAgentRow(r row) bool {
-	return r.group == string(types.TypeIssueBacked) || r.group == string(types.TypeTaskBacked) || r.group == string(types.TypeScratch)
+	return r.structured
+}
+
+func dashboardGroup(status types.AgentStatus) string {
+	switch status {
+	case types.StatusBlocked, types.StatusTestsFailed, types.StatusWaiting, types.StatusCrashed:
+		return "Needs attention"
+	case types.StatusRunning, types.StatusIdle:
+		return "Running"
+	case types.StatusReadyForReview, types.StatusPROpened:
+		return "Ready for review"
+	case types.StatusStale:
+		return "Stale"
+	default:
+		return "Done/Other"
+	}
 }
 
 func valueOr(value, fallback string) string {
@@ -1007,13 +1673,25 @@ func tail(lines []string, n int) []string {
 	return lines[len(lines)-n:]
 }
 
-func atoi(s string) int {
-	n := 0
-	for _, r := range s {
-		if r < '0' || r > '9' {
-			return n
+func splitTargets(value string) []string {
+	var out []string
+	for _, part := range strings.Split(value, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
 		}
-		n = n*10 + int(r-'0')
 	}
-	return n
+	return out
+}
+
+func defaultRepoPath() string {
+	wd, err := os.Getwd()
+	if err != nil {
+		return "."
+	}
+	abs, err := filepath.Abs(wd)
+	if err != nil {
+		return wd
+	}
+	return abs
 }

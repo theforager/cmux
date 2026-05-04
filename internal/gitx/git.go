@@ -15,6 +15,54 @@ func Root(cwd string) (string, error) {
 	return strings.TrimSpace(out), err
 }
 
+func StatusSummary(cwd string) (bool, string) {
+	out, err := process.RunDir(cwd, "git", "status", "--short")
+	if err != nil {
+		return false, ""
+	}
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return false, "clean"
+	}
+	lines := strings.Split(out, "\n")
+	summary := strings.Join(lines, "\n")
+	if len(lines) > 8 {
+		summary = strings.Join(lines[:8], "\n") + "\n..."
+	}
+	return true, summary
+}
+
+func WorktreeListed(repo, worktree string) bool {
+	out, err := process.RunDir(repo, "git", "worktree", "list", "--porcelain")
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.TrimSpace(strings.TrimPrefix(line, "worktree ")) == worktree && strings.HasPrefix(line, "worktree ") {
+			return true
+		}
+	}
+	return false
+}
+
+func RemoveWorktree(repo, worktree string, force bool) error {
+	args := []string{"worktree", "remove"}
+	if force {
+		args = append(args, "--force")
+	}
+	args = append(args, worktree)
+	_, err := process.RunDir(repo, "git", args...)
+	return err
+}
+
+func ResetHardClean(worktree string) error {
+	if _, err := process.RunDir(worktree, "git", "reset", "--hard"); err != nil {
+		return err
+	}
+	_, err := process.RunDir(worktree, "git", "clean", "-fd")
+	return err
+}
+
 func EnsureWorktree(cwd, identifier, title, branchName string) (repo, branch, worktree string, err error) {
 	repo, err = Root(cwd)
 	if err != nil {

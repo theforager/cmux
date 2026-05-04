@@ -24,6 +24,14 @@ type Session struct {
 	Agent   string
 }
 
+type PaneInfo struct {
+	Alive            bool
+	PaneDead         bool
+	ExitStatus       string
+	LastActivityUnix int64
+	CurrentCommand   string
+}
+
 type CreateOptions struct {
 	Name    string
 	Dir     string
@@ -118,6 +126,8 @@ func EnsureKeyOptions() error {
 	}
 	// Forward modified keys such as Option/Meta+Enter through tmux to TUIs.
 	_, _ = process.Run("tmux", "set-option", "-g", "extended-keys", "on")
+	_, _ = process.Run("tmux", "set-option", "-g", "xterm-keys", "on")
+	_, _ = process.Run("tmux", "bind-key", "-n", "M-Enter", "send-keys", "Escape", "Enter")
 	ensureTerminalFeature("xterm*:extkeys")
 	ensureTerminalFeature("tmux*:extkeys")
 	ensureTerminalFeature("screen*:extkeys")
@@ -247,17 +257,40 @@ func Capture(session string, lines int) string {
 	return strings.Join(cleaned, "\n")
 }
 
+func Inspect(session string) (PaneInfo, error) {
+	out, err := process.Run("tmux", "display-message", "-t", session, "-p", "#{pane_last_activity}|#{pane_dead}|#{pane_dead_status}|#{pane_current_command}")
+	if err != nil {
+		if IsMissingSessionError(err) || strings.Contains(strings.ToLower(err.Error()), "no server running") {
+			return PaneInfo{Alive: false}, nil
+		}
+		return PaneInfo{Alive: false}, err
+	}
+	parts := strings.Split(strings.TrimSpace(out), "|")
+	info := PaneInfo{Alive: true}
+	if len(parts) > 0 {
+		info.LastActivityUnix = parseInt64(parts[0])
+	}
+	if len(parts) > 1 {
+		info.PaneDead = parts[1] == "1"
+	}
+	if len(parts) > 2 {
+		info.ExitStatus = strings.TrimSpace(parts[2])
+	}
+	if len(parts) > 3 {
+		info.CurrentCommand = strings.TrimSpace(parts[3])
+	}
+	return info, nil
+}
+
 func InferStatus(session string) string {
-	out, err := process.Run("tmux", "display-message", "-t", session, "-p", "#{pane_last_activity}|#{pane_dead}")
+	info, err := Inspect(session)
 	if err != nil {
 		return "crashed"
 	}
-	parts := strings.Split(strings.TrimSpace(out), "|")
-	if len(parts) > 1 && parts[1] == "1" {
+	if !info.Alive || info.PaneDead {
 		return "crashed"
 	}
-	last := parseInt64(parts[0])
-	idle := time.Now().Unix() - last
+	idle := time.Now().Unix() - info.LastActivityUnix
 	preview := Capture(session, 5)
 	lastLine := ""
 	lines := strings.Split(preview, "\n")

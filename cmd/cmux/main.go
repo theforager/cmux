@@ -1,12 +1,20 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/theforager/cmux/internal/agent"
+	"github.com/theforager/cmux/internal/config"
 	"github.com/theforager/cmux/internal/format"
+	"github.com/theforager/cmux/internal/gitx"
 	"github.com/theforager/cmux/internal/home"
+	"github.com/theforager/cmux/internal/linear"
+	"github.com/theforager/cmux/internal/queue"
 	"github.com/theforager/cmux/internal/state"
 	"github.com/theforager/cmux/internal/tmux"
 	"github.com/theforager/cmux/internal/tui"
@@ -34,7 +42,7 @@ func rootCmd() *cobra.Command {
 		},
 	}
 	cmd.Version = version
-	cmd.AddCommand(newCmd(), listCmd(), attachCmd(), switchCmd(), killCmd(), titleCmd(), infoCmd(), debugCmd(), agentCmd(), doctorCmd())
+	cmd.AddCommand(newCmd(), listCmd(), attachCmd(), switchCmd(), killCmd(), titleCmd(), infoCmd(), debugCmd(), agentCmd(), queueCmd(), doctorCmd())
 	return cmd
 }
 
@@ -228,7 +236,7 @@ func doctorCmd() *cobra.Command {
 
 func agentCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "agent", Short: "Structured agent orchestration"}
-	cmd.AddCommand(agentStartCmd(), agentScratchCmd(), agentListCmd(), agentOpenCmd(), agentPathCmd(), agentStatusCmd("status"), agentStatusCmd("block"), agentStatusCmd("review"), agentStatusCmd("done"))
+	cmd.AddCommand(agentStartCmd(), agentScratchCmd(), agentListCmd(), agentOpenCmd(), agentPathCmd(), agentScanCmd(), agentRestartCmd(), agentCleanupCmd(), agentResetCmd(), agentStatusCmd("status"), agentStatusCmd("block"), agentStatusCmd("review"), agentStatusCmd("done"))
 	return cmd
 }
 
@@ -337,6 +345,202 @@ func agentPathCmd() *cobra.Command {
 	}
 }
 
+func agentScanCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "scan",
+		Short: "Scan tmux/git runtime state for structured agent sessions",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			result, err := agent.Scan()
+			if err != nil {
+				return err
+			}
+			fmt.Printf("scanned=%d updated=%d crashed=%d waiting=%d stale=%d\n", result.Scanned, result.Updated, result.Crashed, result.Waiting, result.Stale)
+			return nil
+		},
+	}
+}
+
+func agentRestartCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "restart <id>",
+		Short: "Restart a missing/dead structured agent tmux session",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			s, err := agent.Restart(args[0])
+			if err != nil {
+				return err
+			}
+			printAgent(s)
+			return nil
+		},
+	}
+}
+
+func agentCleanupCmd() *cobra.Command {
+	var force bool
+	cmd := &cobra.Command{
+		Use:   "cleanup <id>",
+		Short: "Remove a structured agent worktree if it is clean",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := agent.CleanupWorktree(args[0], force); err != nil {
+				return err
+			}
+			fmt.Println("Cleaned up worktree and deleted session:", args[0])
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&force, "force", false, "force cleanup dirty or external worktree")
+	return cmd
+}
+
+func agentResetCmd() *cobra.Command {
+	var confirm string
+	cmd := &cobra.Command{
+		Use:   "reset <id>",
+		Short: "Reset a cmux-owned worktree with git reset --hard and git clean -fd",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if confirm != args[0] {
+				return fmt.Errorf("refusing reset; pass --confirm %s", args[0])
+			}
+			if err := agent.ResetWorkspace(args[0]); err != nil {
+				return err
+			}
+			fmt.Println("Reset workspace:", args[0])
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&confirm, "confirm", "", "session id required to confirm destructive reset")
+	return cmd
+}
+
+func queueCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "queue",
+		Short: "Open the Linear queue browser",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			selected, err := tui.RunQueue()
+			if err != nil {
+				return err
+			}
+			if selected == "" {
+				return nil
+			}
+			return tmux.AttachOrSwitch(selected)
+		},
+	}
+	cmd.AddCommand(queueListCmd(), queueSetupCmd())
+	return cmd
+}
+
+func queueListCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "list [preset]",
+		Short: "Print Linear queue rows joined with cmux sessions",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			preset := ""
+			if len(args) > 0 {
+				preset = args[0]
+			}
+			if !queue.Configured() {
+				fmt.Println("Linear queue not configured: set LINEAR_API_KEY and run cmux queue setup")
+				return nil
+			}
+			rows, used, err := queue.Rows(preset, 250)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("Preset: %s\n", used.Name)
+			if len(rows) == 0 {
+				fmt.Println("No matching Linear issues")
+				return nil
+			}
+			fmt.Printf("%-12s %-18s %-10s %-12s %-10s TITLE\n", "ISSUE", "STATUS", "TEAM", "LINEAR", "SESSION")
+			for _, r := range rows {
+				if r.Started {
+					continue
+				}
+				session := ""
+				if r.Session != nil {
+					session = r.Session.ID
+				}
+				fmt.Printf("%-12s %-18s %-10s %-12s %-10s %s\n", r.Issue.Identifier, r.Status, valueOr(r.Issue.TeamKey, "-"), format.Trunc(valueOr(r.Issue.State, "-"), 12), format.Trunc(valueOr(session, "-"), 10), r.Issue.Title)
+			}
+			return nil
+		},
+	}
+}
+
+func queueSetupCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "setup",
+		Short: "Create a saved Linear queue preset",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !queue.Configured() {
+				return fmt.Errorf("LINEAR_API_KEY is not set")
+			}
+			viewer, err := linear.Viewer()
+			if err != nil {
+				return err
+			}
+			teams, err := linear.ListTeams()
+			if err != nil {
+				return err
+			}
+			states, err := linear.ListWorkflowStates()
+			if err != nil {
+				return err
+			}
+			labels, err := linear.ListLabels()
+			if err != nil {
+				return err
+			}
+			reader := bufio.NewReader(os.Stdin)
+			fmt.Printf("Linear viewer: %s <%s>\n", viewer.Name, viewer.Email)
+			name := prompt(reader, "Preset name", "Agent Ready")
+			repoPath := prompt(reader, "Default repository path for this preset", defaultRepoPath())
+			selectedTeams := chooseTeams(reader, teams)
+			selectedStates := chooseStates(reader, states)
+			selectedLabels := chooseLabels(reader, labels)
+			assignee := prompt(reader, "Assignee mode (any/viewer/unassigned)", "unassigned")
+			limitText := prompt(reader, "Limit", "8")
+			limit, _ := strconv.Atoi(limitText)
+			if limit <= 0 {
+				limit = 8
+			}
+			cfg, err := config.Load()
+			if err != nil {
+				return err
+			}
+			preset := types.QueuePreset{Name: name, RepoPath: repoPath, Teams: selectedTeams, States: selectedStates, Labels: selectedLabels, AssigneeMode: assignee, Limit: limit}
+			replaced := false
+			for i := range cfg.QueuePresets {
+				if cfg.QueuePresets[i].Name == name {
+					cfg.QueuePresets[i] = preset
+					replaced = true
+				}
+			}
+			if !replaced {
+				cfg.QueuePresets = append(cfg.QueuePresets, preset)
+			}
+			if cfg.DefaultQueuePreset == "" {
+				cfg.DefaultQueuePreset = name
+			}
+			if cfg.DefaultRepoPath == "" {
+				cfg.DefaultRepoPath = repoPath
+			}
+			cfg = config.AddRepo(cfg, types.RepoConfig{Name: filepath.Base(repoPath), Path: repoPath})
+			if err := config.Save(cfg); err != nil {
+				return err
+			}
+			fmt.Println("Saved preset:", name)
+			return nil
+		},
+	}
+}
+
 func agentStatusCmd(kind string) *cobra.Command {
 	use := kind + " <id> [summary]"
 	return &cobra.Command{
@@ -427,4 +631,95 @@ func boolWord(v bool) string {
 		return "yes"
 	}
 	return "no"
+}
+
+func prompt(reader *bufio.Reader, label, fallback string) string {
+	fmt.Printf("%s [%s]: ", label, fallback)
+	line, _ := reader.ReadString('\n')
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return fallback
+	}
+	return line
+}
+
+func defaultRepoPath() string {
+	wd, _ := os.Getwd()
+	if root, err := gitx.Root(wd); err == nil && root != "" {
+		return root
+	}
+	return wd
+}
+
+func chooseTeams(reader *bufio.Reader, teams []types.LinearTeam) []string {
+	if len(teams) == 0 {
+		return nil
+	}
+	items := make([]tui.ChecklistItem, 0, len(teams))
+	for _, team := range teams {
+		items = append(items, tui.ChecklistItem{ID: team.ID, Label: team.Name, Description: team.Key})
+	}
+	selected, err := tui.RunChecklist(tui.ChecklistOptions{Title: "Linear Teams", Help: "Leave empty to include all teams.", Items: items})
+	if err != nil {
+		fmt.Println("Team setup skipped:", err)
+		return nil
+	}
+	return selected
+}
+
+func chooseStates(reader *bufio.Reader, states []types.LinearWorkflowState) []string {
+	if len(states) == 0 {
+		return nil
+	}
+	items := make([]tui.ChecklistItem, 0, len(states))
+	for _, state := range states {
+		items = append(items, tui.ChecklistItem{ID: state.ID, Label: state.Name, Description: state.Type})
+	}
+	selected, err := tui.RunChecklist(tui.ChecklistOptions{
+		Title:    "Linear Workflow States",
+		Help:     "Check states in queue order. Empty uses Todo -> Scoping -> Backlog.",
+		Items:    items,
+		Selected: defaultStateIDs(states),
+		Ordered:  true,
+	})
+	if err != nil {
+		fmt.Println("State setup skipped:", err)
+		return nil
+	}
+	return selected
+}
+
+func chooseLabels(reader *bufio.Reader, labels []types.LinearLabel) []string {
+	if len(labels) == 0 {
+		return nil
+	}
+	items := make([]tui.ChecklistItem, 0, len(labels))
+	for _, label := range labels {
+		items = append(items, tui.ChecklistItem{ID: label.ID, Label: label.Name})
+	}
+	selected, err := tui.RunChecklist(tui.ChecklistOptions{Title: "Linear Labels", Help: "Leave empty to include all labels.", Items: items})
+	if err != nil {
+		fmt.Println("Label setup skipped:", err)
+		return nil
+	}
+	return selected
+}
+
+func defaultStateIDs(states []types.LinearWorkflowState) []string {
+	wanted := []string{"todo", "to do", "scoping", "backlog"}
+	out := []string{}
+	seen := map[string]bool{}
+	for _, want := range wanted {
+		for _, state := range states {
+			if seen[state.ID] {
+				continue
+			}
+			if strings.EqualFold(strings.TrimSpace(state.Name), want) {
+				out = append(out, state.ID)
+				seen[state.ID] = true
+				break
+			}
+		}
+	}
+	return out
 }

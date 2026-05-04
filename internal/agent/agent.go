@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/theforager/cmux/internal/format"
@@ -181,7 +182,8 @@ func launch(s types.AgentSession, issue types.LinearIssue) error {
 			_ = tmp.Close()
 			_, _ = process.Run("tmux", "load-buffer", "-b", "cmux-agent-prompt", tmp.Name())
 			_, _ = process.Run("tmux", "paste-buffer", "-t", s.TmuxSession, "-b", "cmux-agent-prompt")
-			_, _ = process.Run("tmux", "send-keys", "-t", s.TmuxSession, "Enter")
+			timeSleep()
+			_, _ = process.Run("tmux", "send-keys", "-t", s.TmuxSession, "C-m")
 			_ = os.Remove(tmp.Name())
 		}
 	}
@@ -226,6 +228,106 @@ func Delete(id string) error {
 	return state.Delete(id)
 }
 
+type WorktreeDirtyError struct {
+	Path    string
+	Summary string
+}
+
+func (e WorktreeDirtyError) Error() string {
+	return "worktree has uncommitted changes: " + e.Path + "\n" + e.Summary
+}
+
+func Restart(id string) (types.AgentSession, error) {
+	s, err := state.Read(id)
+	if err != nil {
+		return s, err
+	}
+	if tmux.Has(s.TmuxSession) {
+		return s, nil
+	}
+	name, err := tmux.GenerateSessionName(valueOr(s.WorktreePath, s.RepoPath), s.ID)
+	if err != nil {
+		return s, err
+	}
+	s.TmuxSession = name
+	s.Status = types.StatusRunning
+	s.LastUpdatedAt = format.Now()
+	if err := state.Write(s); err != nil {
+		return s, err
+	}
+	issue := types.LinearIssue{Identifier: s.Linear.Identifier, Title: s.Title, Description: "Resume from the cmux runbook.", URL: s.Linear.URL, BranchName: s.Branch, State: s.Linear.State}
+	if err := launch(s, issue); err != nil {
+		return s, err
+	}
+	return s, state.Write(s)
+}
+
+func CleanupWorktree(id string, force bool) error {
+	s, err := state.Read(id)
+	if err != nil {
+		return err
+	}
+	if !hasSeparateWorktree(s) {
+		return fmt.Errorf("session has no separate worktree")
+	}
+	if !worktreeOwnedByCmux(s) && !force {
+		return fmt.Errorf("worktree is outside cmux worktrees; refusing cleanup without force: %s", s.WorktreePath)
+	}
+	if other, ok := otherSessionUsingWorktree(s); ok {
+		return fmt.Errorf("worktree is also used by session %s", other)
+	}
+	dirty, summary := gitx.StatusSummary(s.WorktreePath)
+	if dirty && !force {
+		return WorktreeDirtyError{Path: s.WorktreePath, Summary: summary}
+	}
+	if !gitx.WorktreeListed(s.RepoPath, s.WorktreePath) && !force {
+		return fmt.Errorf("git does not list this worktree: %s", s.WorktreePath)
+	}
+	if err := tmux.KillIfExists(s.TmuxSession); err != nil {
+		return err
+	}
+	if err := gitx.RemoveWorktree(s.RepoPath, s.WorktreePath, force); err != nil {
+		return err
+	}
+	return state.Delete(id)
+}
+
+func ResetWorkspace(id string) error {
+	s, err := state.Read(id)
+	if err != nil {
+		return err
+	}
+	if !hasSeparateWorktree(s) {
+		return fmt.Errorf("session has no separate worktree")
+	}
+	if !worktreeOwnedByCmux(s) {
+		return fmt.Errorf("workspace is outside cmux worktrees; refusing reset: %s", s.WorktreePath)
+	}
+	return gitx.ResetHardClean(s.WorktreePath)
+}
+
+func hasSeparateWorktree(s types.AgentSession) bool {
+	return strings.TrimSpace(s.WorktreePath) != "" && s.WorktreePath != s.RepoPath
+}
+
+func worktreeOwnedByCmux(s types.AgentSession) bool {
+	rel, err := filepath.Rel(home.WorktreesDir(), s.WorktreePath)
+	return err == nil && rel != "." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && !filepath.IsAbs(rel)
+}
+
+func otherSessionUsingWorktree(s types.AgentSession) (string, bool) {
+	sessions, err := state.List()
+	if err != nil {
+		return "", false
+	}
+	for _, other := range sessions {
+		if other.ID != s.ID && other.WorktreePath == s.WorktreePath {
+			return other.ID, true
+		}
+	}
+	return "", false
+}
+
 func syncLinear(s *types.AgentSession) error {
 	if s.Linear.IssueID == "" {
 		return nil
@@ -251,10 +353,16 @@ func syncLinear(s *types.AgentSession) error {
 		body += "\n\nReview summary:\n" + notes.ReviewSummary
 	}
 	commentID, err := linear.UpsertComment(s.Linear.IssueID, s.Linear.CommentID, body)
-	if err == nil && commentID != "" {
+	if err != nil {
+		s.Linear.LastSyncError = err.Error()
+		return err
+	}
+	if commentID != "" {
 		s.Linear.CommentID = commentID
 	}
-	return err
+	s.Linear.LastSyncAt = format.Now()
+	s.Linear.LastSyncError = ""
+	return nil
 }
 
 func ensureRunbook(s types.AgentSession, issue types.LinearIssue) error {

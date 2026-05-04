@@ -50,6 +50,187 @@ func Issue(identifier string) (types.LinearIssue, error) {
 	}, nil
 }
 
+type IssueFilterOptions struct {
+	Teams        []string
+	States       []string
+	Labels       []string
+	AssigneeMode string
+	ViewerID     string
+	Priority     []int
+	OpenOnly     bool
+}
+
+func Viewer() (types.LinearViewer, error) {
+	query := `query Viewer { viewer { id name email } }`
+	var out struct {
+		Viewer types.LinearViewer `json:"viewer"`
+	}
+	if err := graphql(query, nil, &out); err != nil {
+		return types.LinearViewer{}, err
+	}
+	return out.Viewer, nil
+}
+
+func ListTeams() ([]types.LinearTeam, error) {
+	query := `query Teams { teams(first: 100) { nodes { id key name } } }`
+	var out struct {
+		Teams struct {
+			Nodes []types.LinearTeam `json:"nodes"`
+		} `json:"teams"`
+	}
+	if err := graphql(query, nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Teams.Nodes, nil
+}
+
+func ListWorkflowStates() ([]types.LinearWorkflowState, error) {
+	query := `query WorkflowStates {
+  workflowStates(first: 250) { nodes { id name type team { id } } }
+}`
+	var raw struct {
+		WorkflowStates struct {
+			Nodes []struct {
+				ID   string `json:"id"`
+				Name string `json:"name"`
+				Type string `json:"type"`
+				Team struct {
+					ID string `json:"id"`
+				} `json:"team"`
+			} `json:"nodes"`
+		} `json:"workflowStates"`
+	}
+	if err := graphql(query, nil, &raw); err != nil {
+		return nil, err
+	}
+	var out []types.LinearWorkflowState
+	for _, node := range raw.WorkflowStates.Nodes {
+		out = append(out, types.LinearWorkflowState{ID: node.ID, Name: node.Name, Type: node.Type, TeamID: node.Team.ID})
+	}
+	return out, nil
+}
+
+func ListLabels() ([]types.LinearLabel, error) {
+	query := `query Labels { issueLabels(first: 250) { nodes { id name } } }`
+	var out struct {
+		IssueLabels struct {
+			Nodes []types.LinearLabel `json:"nodes"`
+		} `json:"issueLabels"`
+	}
+	if err := graphql(query, nil, &out); err != nil {
+		return nil, err
+	}
+	return out.IssueLabels.Nodes, nil
+}
+
+func ListIssues(preset types.QueuePreset) ([]types.LinearIssue, error) {
+	viewerID := ""
+	if preset.AssigneeMode == "viewer" {
+		viewer, err := Viewer()
+		if err != nil {
+			return nil, err
+		}
+		viewerID = viewer.ID
+	}
+	limit := preset.Limit
+	if limit <= 0 {
+		limit = 8
+	}
+	if limit > 250 {
+		limit = 250
+	}
+	filter := BuildIssueFilter(IssueFilterOptions{Teams: preset.Teams, States: preset.States, Labels: preset.Labels, AssigneeMode: preset.AssigneeMode, ViewerID: viewerID, Priority: preset.Priority, OpenOnly: len(preset.States) == 0})
+	query := `query Issues($filter: IssueFilter, $first: Int!) {
+  issues(filter: $filter, first: $first, sort: [{ manual: { order: Ascending } }]) {
+    nodes {
+      id identifier title description url branchName priority sortOrder
+      state { id name }
+      team { id key name }
+      assignee { id name }
+    }
+  }
+}`
+	var raw struct {
+		Issues struct {
+			Nodes []struct {
+				ID          string  `json:"id"`
+				Identifier  string  `json:"identifier"`
+				Title       string  `json:"title"`
+				Description string  `json:"description"`
+				URL         string  `json:"url"`
+				BranchName  string  `json:"branchName"`
+				Priority    int     `json:"priority"`
+				SortOrder   float64 `json:"sortOrder"`
+				State       struct {
+					ID   string `json:"id"`
+					Name string `json:"name"`
+				} `json:"state"`
+				Team struct {
+					ID   string `json:"id"`
+					Key  string `json:"key"`
+					Name string `json:"name"`
+				} `json:"team"`
+				Assignee struct {
+					ID   string `json:"id"`
+					Name string `json:"name"`
+				} `json:"assignee"`
+			} `json:"nodes"`
+		} `json:"issues"`
+	}
+	if err := graphql(query, map[string]any{"filter": filter, "first": limit}, &raw); err != nil {
+		return nil, err
+	}
+	var issues []types.LinearIssue
+	for _, node := range raw.Issues.Nodes {
+		issues = append(issues, types.LinearIssue{
+			ID:           node.ID,
+			Identifier:   node.Identifier,
+			Title:        node.Title,
+			Description:  node.Description,
+			URL:          node.URL,
+			BranchName:   node.BranchName,
+			State:        node.State.Name,
+			StateID:      node.State.ID,
+			TeamID:       node.Team.ID,
+			TeamKey:      node.Team.Key,
+			TeamName:     node.Team.Name,
+			Priority:     node.Priority,
+			SortOrder:    node.SortOrder,
+			AssigneeID:   node.Assignee.ID,
+			AssigneeName: node.Assignee.Name,
+		})
+	}
+	return issues, nil
+}
+
+func BuildIssueFilter(o IssueFilterOptions) map[string]any {
+	filter := map[string]any{}
+	if len(o.Teams) > 0 {
+		filter["team"] = map[string]any{"id": map[string]any{"in": o.Teams}}
+	}
+	if len(o.States) > 0 {
+		filter["state"] = map[string]any{"id": map[string]any{"in": o.States}}
+	}
+	if len(o.Labels) > 0 {
+		filter["labels"] = map[string]any{"id": map[string]any{"in": o.Labels}}
+	}
+	switch o.AssigneeMode {
+	case "viewer":
+		if o.ViewerID != "" {
+			filter["assignee"] = map[string]any{"id": map[string]any{"eq": o.ViewerID}}
+		}
+	case "unassigned":
+		filter["assignee"] = map[string]any{"null": true}
+	}
+	if len(o.Priority) > 0 {
+		filter["priority"] = map[string]any{"in": o.Priority}
+	}
+	if o.OpenOnly {
+		filter["state"] = map[string]any{"type": map[string]any{"nin": []string{"completed", "canceled"}}}
+	}
+	return filter
+}
+
 func UpsertComment(issueID, commentID, body string) (string, error) {
 	if issueID == "" {
 		return commentID, nil

@@ -11,6 +11,7 @@ agent orchestration:
 - durable local session registry
 - cmux-owned runbooks per real workspace
 - Linear status/comment sync
+- Linear queue presets and queue browser
 - Bubble Tea based session dashboard
 
 ## Installation
@@ -49,19 +50,14 @@ The selector is still optimized for fast session switching:
 ↑↓ / j k       navigate
 home / end     first / last
 pgup / pgdn    move by 5
-1-9 digits     jump to row number
-enter          open selected session
+enter          open session or start queued issue
+.              actions for selected row
+a              new work menu
+tab            dashboard / full queue
 i              show session details
-w              open shell in selected workspace
-p              show selected workspace path
 /              filter
-n              create scratch session
-a              start Linear issue-backed or task-backed agent
-r              rename selected tmux session
-t              set selected title
-d              delete selected session
-s              set structured agent status
-R              refresh
+space          select queued issue in full queue
+R              scan sessions and refresh queue
 ?              help
 q / esc        quit
 ```
@@ -87,6 +83,7 @@ cmux agent scratch --title "Explore SDK publishing bug"
 cmux agent list
 cmux agent open REB-123
 cmux agent path REB-123
+cmux agent scan
 cmux agent status REB-123 blocked "Need API shape decision"
 cmux agent review REB-123 "Ready for review"
 cmux agent done REB-123
@@ -107,6 +104,36 @@ cmux keeps session metadata and runbooks under its own home directory:
 
 The initial agent prompt tells the agent to keep the runbook updated and to set
 cmux statuses when blocked, failed, or ready for review.
+
+## Linear Queue
+
+The main `cmux` dashboard shows a bounded queue section when `LINEAR_API_KEY`
+is available. Press `Q` for the full queue browser, select an unstarted issue,
+or press space to multi-select up to 3 issues before starting them with one
+agent choice.
+
+```bash
+cmux queue
+cmux queue list
+cmux queue setup
+```
+
+Queue presets are stored in `~/.cmux/config.json` with team, state, label,
+assignee, priority, and limit filters. `cmux queue setup` uses checklists for
+teams, workflow states, and labels. For workflow states, check states in the
+order they should appear in the queue; that ordered state list controls both
+which statuses are included and how queue rows are sorted. Leaving the state
+selection empty uses the built-in default order: `Todo`, `Scoping`, then
+`Backlog`.
+
+Setup can save a default repository path for the preset and adds it to a
+user-owned repo catalog in `~/.cmux/config.json`. Starting work from the queue
+shows a repo picker with configured repos, the preset default, the current repo,
+and a custom path option, because one Linear queue can contain issues for
+multiple repositories.
+
+If Linear is not configured, the dashboard continues to work normally and shows
+a compact setup notice.
 
 ## Home Directory
 
@@ -143,5 +170,6 @@ cmux info
 cmux debug
 cmux doctor
 cmux agent ...
+cmux queue ...
 cmux help
 ```

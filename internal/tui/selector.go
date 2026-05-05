@@ -23,30 +23,32 @@ import (
 )
 
 type row struct {
-	id            string
-	title         string
-	status        string
-	group         string
-	updated       string
-	session       string
-	repo          string
-	workspace     string
-	branch        string
-	agent         string
-	runbook       string
-	linear        string
-	lastSummary   string
-	currentState  string
-	nextAction    string
-	blockers      string
-	testsRun      string
-	reviewSummary string
-	preview       string
-	detail        string
-	active        bool
-	kind          string
-	structured    bool
-	queueIssue    string
+	id              string
+	title           string
+	status          string
+	group           string
+	updated         string
+	session         string
+	repo            string
+	workspace       string
+	branch          string
+	agent           string
+	runbook         string
+	linear          string
+	lastSummary     string
+	currentState    string
+	nextAction      string
+	blockers        string
+	testsRun        string
+	reviewSummary   string
+	preview         string
+	terminalPreview string
+	detail          string
+	active          bool
+	kind            string
+	structured      bool
+	queueIssue      string
+	workspaceShells []string
 }
 
 type model struct {
@@ -148,16 +150,30 @@ func loadRows(fullQueue bool) ([]row, error) {
 	}
 	agentSessions, _ := state.List()
 	byTmux := map[string]row{}
+	agentIDs := map[string]bool{}
 	for _, s := range agentSessions {
+		agentIDs[s.ID] = true
 		byTmux[s.TmuxSession] = agentRow(s, false)
+	}
+	childByParent := map[string][]string{}
+	for _, s := range tmuxSessions {
+		if s.Kind == "workspace" && s.ParentID != "" {
+			childByParent[s.ParentID] = append(childByParent[s.ParentID], s.Name)
+		}
 	}
 	var rows []row
 	seen := map[string]bool{}
 	for _, s := range tmuxSessions {
+		if s.Kind == "workspace" && s.ParentID != "" && agentIDs[s.ParentID] {
+			seen[s.Name] = true
+			continue
+		}
 		if r, ok := byTmux[s.Name]; ok {
 			r.active = true
+			r.workspaceShells = childByParent[r.id]
+			r.terminalPreview = tmux.Capture(s.Name, 8)
 			if r.preview == "" {
-				r.preview = tmux.Capture(s.Name, 10)
+				r.preview = r.terminalPreview
 			}
 			rows = append(rows, r)
 			seen[s.Name] = true
@@ -171,6 +187,7 @@ func loadRows(fullQueue bool) ([]row, error) {
 			continue
 		}
 		r := agentRow(s, false)
+		r.workspaceShells = childByParent[r.id]
 		r.title += " (not running)"
 		rows = append(rows, r)
 	}
@@ -245,6 +262,7 @@ func queueRows(fullQueue bool) []row {
 			sr.group = "Queue"
 			sr.kind = "queue"
 			sr.queueIssue = qr.Issue.Identifier
+			sr.workspaceShells = r.workspaceShells
 			sr.updated = format.Age(qr.Session.LastUpdatedAt)
 			r = sr
 		}
@@ -284,18 +302,20 @@ func groupRank(group string) int {
 
 func rawTmuxRow(s tmux.Session) row {
 	status := tmux.InferStatus(s.Name)
+	preview := tmux.Capture(s.Name, 10)
 	return row{
-		id:        tmux.Child(s.Name),
-		title:     displayName(s),
-		status:    status,
-		group:     dashboardGroup(types.AgentStatus(status)),
-		updated:   format.AgeUnix(s.Created),
-		session:   s.Name,
-		workspace: s.Dir,
-		agent:     valueOr(s.Agent, "shell"),
-		preview:   tmux.Capture(s.Name, 10),
-		active:    true,
-		kind:      "session",
+		id:              tmux.Child(s.Name),
+		title:           displayName(s),
+		status:          status,
+		group:           dashboardGroup(types.AgentStatus(status)),
+		updated:         format.AgeUnix(s.Created),
+		session:         s.Name,
+		workspace:       s.Dir,
+		agent:           valueOr(s.Agent, "shell"),
+		preview:         preview,
+		terminalPreview: preview,
+		active:          true,
+		kind:            "session",
 	}
 }
 
@@ -312,29 +332,30 @@ func agentRow(s types.AgentSession, active bool) row {
 		"linear: " + s.Linear.URL,
 	}), "\n")
 	return row{
-		id:            s.ID,
-		title:         s.Title,
-		status:        string(s.Status),
-		group:         dashboardGroup(s.Status),
-		updated:       format.Age(s.LastUpdatedAt),
-		session:       s.TmuxSession,
-		repo:          s.RepoPath,
-		workspace:     valueOr(s.WorktreePath, s.RepoPath),
-		branch:        s.Branch,
-		agent:         valueOr(s.AgentCommand, s.Provider),
-		runbook:       home.RunbookPath(s.ID),
-		linear:        s.Linear.URL,
-		lastSummary:   s.LastSummary,
-		currentState:  notes.CurrentState,
-		nextAction:    notes.NextAction,
-		blockers:      notes.Blockers,
-		testsRun:      notes.TestsRun,
-		reviewSummary: notes.ReviewSummary,
-		preview:       preview,
-		detail:        detail,
-		active:        active,
-		kind:          "session",
-		structured:    true,
+		id:              s.ID,
+		title:           s.Title,
+		status:          string(s.Status),
+		group:           dashboardGroup(s.Status),
+		updated:         format.Age(s.LastUpdatedAt),
+		session:         s.TmuxSession,
+		repo:            s.RepoPath,
+		workspace:       valueOr(s.WorktreePath, s.RepoPath),
+		branch:          s.Branch,
+		agent:           valueOr(s.AgentCommand, s.Provider),
+		runbook:         home.RunbookPath(s.ID),
+		linear:          s.Linear.URL,
+		lastSummary:     s.LastSummary,
+		currentState:    notes.CurrentState,
+		nextAction:      notes.NextAction,
+		blockers:        notes.Blockers,
+		testsRun:        notes.TestsRun,
+		reviewSummary:   notes.ReviewSummary,
+		preview:         preview,
+		terminalPreview: s.Runtime.Preview,
+		detail:          detail,
+		active:          active,
+		kind:            "session",
+		structured:      true,
 	}
 }
 
@@ -655,7 +676,11 @@ func (m model) View() string {
 			if r.kind == "queue" && !r.active && m.selectedQueue[r.queueIssue] {
 				mark = "✓"
 			}
-			line := fmt.Sprintf("%s%s %-16s %-17s %s  %s", glyph(r.status), mark, format.Trunc(r.id, 16), format.Trunc(r.status, 17), r.title, dim.Render(r.updated))
+			status := r.status
+			if len(r.workspaceShells) > 0 {
+				status += " ⧉"
+			}
+			line := fmt.Sprintf("%s%s %-16s %-20s %s  %s", glyph(r.status), mark, format.Trunc(r.id, 16), format.Trunc(status, 20), r.title, dim.Render(r.updated))
 			if i == m.selected {
 				b.WriteString(green.Render("▌ "+line) + "\n")
 			} else {
@@ -666,18 +691,7 @@ func (m model) View() string {
 	b.WriteString("\n" + dim.Render("── preview ─────────────────────────────────────────") + "\n")
 	if len(m.filtered) > 0 {
 		selected := m.filtered[m.selected]
-		if selected.detail != "" {
-			for _, line := range tail(strings.Split(selected.detail, "\n"), 4) {
-				b.WriteString(dim.Render("· "+line) + "\n")
-			}
-		}
-		preview := selected.preview
-		if preview == "" {
-			preview = "(no recent activity)"
-		}
-		for _, line := range tail(strings.Split(preview, "\n"), previewHeight(m.height)) {
-			b.WriteString("▎ " + line + "\n")
-		}
+		b.WriteString(m.previewPanel(selected))
 	}
 	b.WriteString("\n")
 	prompt := m.prompt()
@@ -706,6 +720,232 @@ func (m model) current() (row, bool) {
 		return row{}, false
 	}
 	return m.filtered[m.selected], true
+}
+
+type previewLine struct {
+	label string
+	value string
+	style string
+}
+
+func (m model) previewPanel(r row) string {
+	maxLines := previewHeight(m.height)
+	lines := previewContentLines(r, maxLines)
+	if footer, ok := previewFooterLine(r); ok && len(lines) < maxLines && maxLines >= 6 {
+		lines = append(lines, footer)
+	}
+	if len(lines) == 0 {
+		lines = append(lines, previewLine{label: "status", value: "No preview available.", style: "dim"})
+	}
+	if len(lines) > maxLines {
+		lines = lines[:maxLines]
+	}
+	var b strings.Builder
+	for _, line := range lines {
+		b.WriteString(renderPreviewLine(line, m.width) + "\n")
+	}
+	return b.String()
+}
+
+func previewFooterLine(r row) (previewLine, bool) {
+	switch {
+	case r.kind == "queue" && !r.structured:
+		parts := []string{
+			valueOr(r.updated, ""),
+			queueTeam(r),
+			baseOrEmpty(r.repo),
+		}
+		value := compactJoin(parts)
+		return previewLine{label: "meta", value: value, style: "footer"}, value != ""
+	case r.structured:
+		parts := []string{}
+		if r.status == string(types.StatusCrashed) || r.status == string(types.StatusStale) || r.status == string(types.StatusWaiting) {
+			parts = append(parts, r.status)
+		}
+		if r.workspace != "" {
+			parts = append(parts, filepath.Base(r.workspace))
+		}
+		if r.branch != "" {
+			parts = append(parts, r.branch)
+		}
+		if len(r.workspaceShells) > 0 {
+			parts = append(parts, "⧉")
+		}
+		value := compactJoin(parts)
+		return previewLine{label: "meta", value: value, style: "footer"}, value != ""
+	default:
+		parts := []string{}
+		if r.workspace != "" {
+			parts = append(parts, r.workspace)
+		}
+		if r.agent != "" {
+			parts = append(parts, r.agent)
+		}
+		value := compactJoin(parts)
+		return previewLine{label: "meta", value: value, style: "footer"}, value != ""
+	}
+}
+
+func previewContentLines(r row, max int) []previewLine {
+	if max <= 0 {
+		return nil
+	}
+	switch {
+	case r.kind == "queue" && !r.structured:
+		return previewTextLines("desc", r.preview, max, false, "")
+	case r.structured:
+		termBudget := terminalPreviewBudget(max, r)
+		runbookBudget := max - termBudget
+		runbookLines := previewRunbookLines(r, runbookBudget)
+		remaining := max - len(runbookLines)
+		if len(runbookLines) > 0 && remaining > termBudget {
+			remaining = termBudget
+		}
+		termLines := previewTextLines("term", r.terminalPreview, remaining, true, "dim")
+		if len(runbookLines) == 0 && len(termLines) == 0 {
+			return []previewLine{{label: "summary", value: "No runbook or terminal preview yet.", style: "dim"}}
+		}
+		return append(runbookLines, termLines...)
+	default:
+		return previewTextLines("term", r.terminalPreview, max, true, "")
+	}
+}
+
+func terminalPreviewBudget(max int, r row) int {
+	if max <= 4 {
+		return 1
+	}
+	if r.status == string(types.StatusCrashed) || r.status == string(types.StatusWaiting) {
+		return min(5, max/2)
+	}
+	return min(4, max/3)
+}
+
+func previewRunbookLines(r row, max int) []previewLine {
+	lines := []previewLine{}
+	add := func(label, value string) {
+		if len(lines) >= max {
+			return
+		}
+		value = cleanDetail(value)
+		if value == "" {
+			return
+		}
+		for _, line := range strings.Split(value, "\n") {
+			line = compactPreviewText(line)
+			if line == "" {
+				continue
+			}
+			nextLabel := ""
+			if len(lines) == 0 || label != "" {
+				nextLabel = label
+				label = ""
+			}
+			lines = append(lines, previewLine{label: nextLabel, value: line})
+			if len(lines) >= max {
+				return
+			}
+		}
+	}
+	add("current", r.currentState)
+	add("next", r.nextAction)
+	add("blocker", r.blockers)
+	return lines
+}
+
+func previewTextLines(label, text string, max int, tailLines bool, style string) []previewLine {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
+	}
+	raw := strings.Split(text, "\n")
+	if tailLines {
+		raw = tail(raw, max)
+	} else if len(raw) > max {
+		raw = raw[:max]
+	}
+	lines := []previewLine{}
+	for _, line := range raw {
+		line = compactPreviewText(line)
+		if line == "" {
+			continue
+		}
+		nextLabel := ""
+		if len(lines) == 0 {
+			nextLabel = label
+		}
+		lines = append(lines, previewLine{label: nextLabel, value: line, style: style})
+		if len(lines) >= max {
+			break
+		}
+	}
+	return lines
+}
+
+func renderPreviewLine(line previewLine, width int) string {
+	label := fmt.Sprintf("%-8s", line.label)
+	value := compactPreviewText(line.value)
+	if width > 24 {
+		value = format.Trunc(value, width-13)
+	}
+	switch line.style {
+	case "dim":
+		value = dim.Render(value)
+	case "footer":
+		value = dim.Render(renderMetaValue(value))
+	case "red":
+		value = red.Render(value)
+	}
+	if strings.TrimSpace(line.label) == "" {
+		return "         " + value
+	}
+	return renderPreviewLabel(label, line.style) + " " + value
+}
+
+func renderPreviewLabel(label, style string) string {
+	switch style {
+	case "dim", "footer":
+		if strings.TrimSpace(label) == "term" || strings.TrimSpace(label) == "meta" {
+			return cyan.Render(label)
+		}
+		return dim.Render(label)
+	default:
+		return cyan.Render(label)
+	}
+}
+
+func renderMetaValue(value string) string {
+	value = strings.ReplaceAll(value, "term ⧉", "term "+cyan.Render("⧉"))
+	return value
+}
+
+func compactJoin(parts []string) string {
+	return strings.Join(nonEmpty(parts), " · ")
+}
+
+func compactPreviewText(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.ReplaceAll(value, "\t", " ")
+	for strings.Contains(value, "  ") {
+		value = strings.ReplaceAll(value, "  ", " ")
+	}
+	return value
+}
+
+func queueTeam(r row) string {
+	for _, line := range strings.Split(r.detail, "\n") {
+		if strings.HasPrefix(line, "team: ") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "team: "))
+		}
+	}
+	return "-"
+}
+
+func baseOrEmpty(path string) string {
+	if strings.TrimSpace(path) == "" {
+		return ""
+	}
+	return filepath.Base(path)
 }
 
 func (m *model) commitAction() error {
@@ -1005,6 +1245,12 @@ func (m model) detailView() string {
 	writeDetailSection(&b, "Blockers", r.blockers)
 	writeDetailSection(&b, "Tests", r.testsRun)
 	writeDetailSection(&b, "Review", r.reviewSummary)
+	if len(r.workspaceShells) > 0 {
+		b.WriteString("\n" + cyan.Render("Workspace terminals:") + "\n")
+		for _, name := range r.workspaceShells {
+			b.WriteString("  " + name + "\n")
+		}
+	}
 	if r.preview != "" {
 		b.WriteString("\n" + dim.Render("── recent terminal ─────────────────────────────────") + "\n")
 		for _, line := range tail(strings.Split(r.preview, "\n"), previewHeight(m.height)) {
@@ -1164,7 +1410,7 @@ func (m *model) chooseNew() {
 		m.mode = "start"
 		m.input = ""
 	case "workspace":
-		name, err := m.openWorkspaceSession()
+		name, err := m.openWorkspaceSession(true)
 		if err != nil {
 			m.message = err.Error()
 			m.mode = "browse"
@@ -1201,8 +1447,8 @@ func (m *model) chooseAction() error {
 	case "path":
 		m.showWorkspacePath()
 		m.mode = "browse"
-	case "workspace":
-		name, err := m.openWorkspaceSession()
+	case "workspace", "workspaceNew":
+		name, err := m.openWorkspaceSession(choices[m.actionSelected].id == "workspaceNew")
 		if err != nil {
 			return err
 		}
@@ -1366,8 +1612,11 @@ func actionsFor(r row, fullQueue bool) []menuChoice {
 		} else {
 			actions = append(actions, menuChoice{id: "restart", label: "Restart agent", description: "create tmux session in workspace"})
 		}
+		actions = append(actions, workspaceAction(r))
+		if len(r.workspaceShells) > 0 {
+			actions = append(actions, menuChoice{id: "workspaceNew", label: "New workspace terminal", description: "create another attached terminal"})
+		}
 		return append(actions,
-			menuChoice{id: "workspace", label: "Workspace shell", description: "open shell in recorded workspace"},
 			menuChoice{id: "detail", label: "Details", description: "show runbook and output"},
 			menuChoice{id: "status", label: "Set status", description: "update cmux status"},
 			menuChoice{id: "rename", label: "Rename tmux", description: "rename tmux session"},
@@ -1382,13 +1631,20 @@ func actionsFor(r row, fullQueue bool) []menuChoice {
 		actions = append(actions, menuChoice{id: "open", label: "Open session", description: "attach to tmux session"})
 	}
 	if r.workspace != "" {
-		actions = append(actions, menuChoice{id: "workspace", label: "Workspace shell", description: "open shell in path"})
+		actions = append(actions, menuChoice{id: "workspace", label: "Workspace terminal", description: "open shell in path"})
 	}
 	return append(actions,
 		menuChoice{id: "rename", label: "Rename tmux", description: "rename tmux session"},
 		menuChoice{id: "title", label: "Set title", description: "change display title"},
 		menuChoice{id: "delete", label: "Kill session", description: "kill tmux session", danger: true},
 	)
+}
+
+func workspaceAction(r row) menuChoice {
+	if len(r.workspaceShells) > 0 {
+		return menuChoice{id: "workspace", label: "Open workspace terminal", description: "open attached terminal"}
+	}
+	return menuChoice{id: "workspace", label: "New workspace terminal", description: "create attached terminal"}
 }
 
 func newChoices() []menuChoice {
@@ -1444,10 +1700,13 @@ func (m *model) showWorkspacePath() {
 	m.message = "Workspace: " + path
 }
 
-func (m *model) openWorkspaceSession() (string, error) {
+func (m *model) openWorkspaceSession(createNew bool) (string, error) {
 	r, ok := m.current()
 	if !ok {
 		return "", fmt.Errorf("no session selected")
+	}
+	if !createNew && len(r.workspaceShells) > 0 {
+		return r.workspaceShells[0], nil
 	}
 	workspace := valueOr(r.workspace, r.repo)
 	if workspace == "" {
@@ -1469,7 +1728,12 @@ func (m *model) openWorkspaceSession() (string, error) {
 		return "", err
 	}
 	title := "workspace: " + valueOr(r.id, filepath.Base(abs))
-	if err := tmux.Create(tmux.CreateOptions{Name: name, Dir: abs, Title: title}); err != nil {
+	options := tmux.CreateOptions{Name: name, Dir: abs, Title: title}
+	if r.structured {
+		options.Kind = "workspace"
+		options.ParentID = r.id
+	}
+	if err := tmux.Create(options); err != nil {
 		return "", err
 	}
 	return name, nil
@@ -1657,13 +1921,18 @@ func glyph(status string) string {
 }
 
 func previewHeight(h int) int {
-	if h < 20 {
+	switch {
+	case h < 20:
 		return 4
-	}
-	if h > 45 {
+	case h < 30:
+		return 6
+	case h < 40:
+		return 9
+	case h < 55:
+		return 12
+	default:
 		return 16
 	}
-	return 8
 }
 
 func tail(lines []string, n int) []string {

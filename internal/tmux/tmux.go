@@ -17,11 +17,13 @@ const prefix = "cmux"
 const sep = "@"
 
 type Session struct {
-	Name    string
-	Created int64
-	Title   string
-	Dir     string
-	Agent   string
+	Name     string
+	Created  int64
+	Title    string
+	Dir      string
+	Agent    string
+	Kind     string
+	ParentID string
 }
 
 type PaneInfo struct {
@@ -33,12 +35,14 @@ type PaneInfo struct {
 }
 
 type CreateOptions struct {
-	Name    string
-	Dir     string
-	Command string
-	Title   string
-	Agent   string
-	Mobile  bool
+	Name     string
+	Dir      string
+	Command  string
+	Title    string
+	Agent    string
+	Kind     string
+	ParentID string
+	Mobile   bool
 }
 
 func Exists() bool { return process.Exists("tmux") }
@@ -64,6 +68,8 @@ func List() ([]Session, error) {
 		s.Title, _ = ShowEnv(s.Name, "CMUX_TITLE")
 		s.Dir, _ = ShowEnv(s.Name, "CMUX_DIR")
 		s.Agent, _ = ShowEnv(s.Name, "CMUX_AGENT")
+		s.Kind, _ = ShowEnv(s.Name, "CMUX_KIND")
+		s.ParentID, _ = ShowEnv(s.Name, "CMUX_PARENT_ID")
 		sessions = append(sessions, s)
 	}
 	return sessions, nil
@@ -108,6 +114,12 @@ func Create(o CreateOptions) error {
 	_ = SetEnv(o.Name, "CMUX_DIR", o.Dir)
 	if o.Agent != "" {
 		_ = SetEnv(o.Name, "CMUX_AGENT", o.Agent)
+	}
+	if o.Kind != "" {
+		_ = SetEnv(o.Name, "CMUX_KIND", o.Kind)
+	}
+	if o.ParentID != "" {
+		_ = SetEnv(o.Name, "CMUX_PARENT_ID", o.ParentID)
 	}
 	if o.Title != "" {
 		_ = SetEnv(o.Name, "CMUX_TITLE", o.Title)

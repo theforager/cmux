@@ -17,7 +17,9 @@ func Issue(identifier string) (types.LinearIssue, error) {
 	query := `query Issue($id: String!) {
   issue(id: $id) {
     id identifier title description url branchName
-    state { name }
+    state { id name }
+    team { id key name }
+    labels(first: 100) { nodes { id name } }
   }
 }`
 	var out struct {
@@ -29,8 +31,17 @@ func Issue(identifier string) (types.LinearIssue, error) {
 			URL         string `json:"url"`
 			BranchName  string `json:"branchName"`
 			State       struct {
+				ID   string `json:"id"`
 				Name string `json:"name"`
 			} `json:"state"`
+			Team struct {
+				ID   string `json:"id"`
+				Key  string `json:"key"`
+				Name string `json:"name"`
+			} `json:"team"`
+			Labels struct {
+				Nodes []types.LinearLabel `json:"nodes"`
+			} `json:"labels"`
 		} `json:"issue"`
 	}
 	if err := graphql(query, map[string]any{"id": identifier}, &out); err != nil {
@@ -47,6 +58,11 @@ func Issue(identifier string) (types.LinearIssue, error) {
 		URL:         out.Issue.URL,
 		BranchName:  out.Issue.BranchName,
 		State:       out.Issue.State.Name,
+		StateID:     out.Issue.State.ID,
+		TeamID:      out.Issue.Team.ID,
+		TeamKey:     out.Issue.Team.Key,
+		TeamName:    out.Issue.Team.Name,
+		Labels:      out.Issue.Labels.Nodes,
 	}, nil
 }
 
@@ -254,6 +270,62 @@ func UpsertComment(issueID, commentID, body string) (string, error) {
 		return "", err
 	}
 	return out.CommentCreate.Comment.ID, nil
+}
+
+func UpdateIssue(issueID string, stateID string, labelIDs []string) (types.LinearIssue, error) {
+	if issueID == "" {
+		return types.LinearIssue{}, nil
+	}
+	input := map[string]any{}
+	if stateID != "" {
+		input["stateId"] = stateID
+	}
+	if labelIDs != nil {
+		input["labelIds"] = labelIDs
+	}
+	if len(input) == 0 {
+		return types.LinearIssue{}, nil
+	}
+	query := `mutation UpdateIssue($id: String!, $input: IssueUpdateInput!) {
+  issueUpdate(id: $id, input: $input) {
+    success
+    issue {
+      id identifier title url
+      state { id name }
+      labels(first: 100) { nodes { id name } }
+    }
+  }
+}`
+	var out struct {
+		IssueUpdate struct {
+			Issue struct {
+				ID         string `json:"id"`
+				Identifier string `json:"identifier"`
+				Title      string `json:"title"`
+				URL        string `json:"url"`
+				State      struct {
+					ID   string `json:"id"`
+					Name string `json:"name"`
+				} `json:"state"`
+				Labels struct {
+					Nodes []types.LinearLabel `json:"nodes"`
+				} `json:"labels"`
+			} `json:"issue"`
+		} `json:"issueUpdate"`
+	}
+	if err := graphql(query, map[string]any{"id": issueID, "input": input}, &out); err != nil {
+		return types.LinearIssue{}, err
+	}
+	issue := out.IssueUpdate.Issue
+	return types.LinearIssue{
+		ID:         issue.ID,
+		Identifier: issue.Identifier,
+		Title:      issue.Title,
+		URL:        issue.URL,
+		State:      issue.State.Name,
+		StateID:    issue.State.ID,
+		Labels:     issue.Labels.Nodes,
+	}, nil
 }
 
 func graphql(query string, vars map[string]any, out any) error {

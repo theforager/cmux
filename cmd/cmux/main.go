@@ -236,13 +236,13 @@ func doctorCmd() *cobra.Command {
 
 func agentCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "agent", Short: "Structured agent orchestration"}
-	cmd.AddCommand(agentStartCmd(), agentScratchCmd(), agentListCmd(), agentOpenCmd(), agentPathCmd(), agentScanCmd(), agentRestartCmd(), agentCleanupCmd(), agentResetCmd(), agentStatusCmd("status"), agentStatusCmd("block"), agentStatusCmd("review"), agentStatusCmd("done"))
+	cmd.AddCommand(agentStartCmd(), agentScratchCmd(), agentListCmd(), agentOpenCmd(), agentPathCmd(), agentScanCmd(), agentRestartCmd(), agentCleanupCmd(), agentResetCmd(), agentNeedsReviewCmd(), agentScopedCmd(), agentAbandonCmd(), agentStatusCmd("status"), agentStatusCmd("block"), agentStatusCmd("review"), agentStatusCmd("done"))
 	return cmd
 }
 
 func agentStartCmd() *cobra.Command {
 	var title, agentCommand string
-	var worktree, noWorktree, prepare bool
+	var worktree, noWorktree, prepare, scoping bool
 	cmd := &cobra.Command{
 		Use:   "start [ISSUE]",
 		Short: "Start a Linear issue-backed or task-backed agent",
@@ -251,7 +251,7 @@ func agentStartCmd() *cobra.Command {
 			if len(args) > 0 {
 				issue = args[0]
 			}
-			s, err := agent.Start(agent.StartOptions{Cwd: ".", IssueKey: issue, Title: title, Agent: agentCommand, Worktree: worktree, NoWorktree: noWorktree, PrepareOnly: prepare})
+			s, err := agent.Start(agent.StartOptions{Cwd: ".", IssueKey: issue, Title: title, Agent: agentCommand, Scoping: scoping, Worktree: worktree, NoWorktree: noWorktree, PrepareOnly: prepare})
 			if err != nil {
 				return err
 			}
@@ -264,6 +264,7 @@ func agentStartCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&worktree, "worktree", false, "create worktree for task")
 	cmd.Flags().BoolVar(&noWorktree, "no-worktree", false, "do not create worktree for issue")
 	cmd.Flags().BoolVar(&prepare, "prepare", false, "prepare state/worktree without launching")
+	cmd.Flags().BoolVar(&scoping, "scope", false, "start a scoping session for a Linear issue")
 	return cmd
 }
 
@@ -580,6 +581,66 @@ func agentStatusCmd(kind string) *cobra.Command {
 	}
 }
 
+func agentScopedCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "scoped <id> [summary]",
+		Short: "Mark a scoping session scoped and move the Linear issue to its ready state",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			summary := ""
+			if len(args) > 1 {
+				summary = joinArgs(args[1:])
+			}
+			s, err := agent.MarkScoped(args[0], summary)
+			if err != nil {
+				return err
+			}
+			printAgent(s)
+			return nil
+		},
+	}
+}
+
+func agentNeedsReviewCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "needs-review <id> [summary]",
+		Short: "Promote a session to the Linear needs-review queue",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			summary := ""
+			if len(args) > 1 {
+				summary = joinArgs(args[1:])
+			}
+			s, err := agent.MarkNeedsReview(args[0], summary)
+			if err != nil {
+				return err
+			}
+			printAgent(s)
+			return nil
+		},
+	}
+}
+
+func agentAbandonCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "abandon <id> [summary]",
+		Short: "Abandon active work and move the Linear issue back to its original queue state",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			summary := ""
+			if len(args) > 1 {
+				summary = joinArgs(args[1:])
+			}
+			s, err := agent.Abandon(args[0], summary)
+			if err != nil {
+				return err
+			}
+			printAgent(s)
+			return nil
+		},
+	}
+}
+
 func runSelector(popup bool) error {
 	selected, err := tui.Run(popup)
 	if err != nil {
@@ -600,6 +661,9 @@ func displayName(s tmux.Session) string {
 
 func printAgent(s types.AgentSession) {
 	fmt.Printf("%s  %s  %s\n", s.ID, s.Status, s.Title)
+	if s.Phase != "" {
+		fmt.Println("phase:", s.Phase)
+	}
 	fmt.Println("tmux:", s.TmuxSession)
 	fmt.Println("branch:", valueOr(s.Branch, "current"))
 	fmt.Println("workspace:", valueOr(s.WorktreePath, s.RepoPath))

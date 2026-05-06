@@ -8,6 +8,11 @@ const (
 	TypeScratch     AgentSessionType = "scratch"
 )
 
+const (
+	PhaseWork    = "work"
+	PhaseScoping = "scoping"
+)
+
 type AgentStatus string
 
 const (
@@ -24,13 +29,16 @@ const (
 )
 
 type LinearData struct {
-	IssueID       string `json:"issueId,omitempty"`
-	Identifier    string `json:"identifier,omitempty"`
-	URL           string `json:"url,omitempty"`
-	CommentID     string `json:"commentId,omitempty"`
-	State         string `json:"state,omitempty"`
-	LastSyncAt    string `json:"lastSyncAt,omitempty"`
-	LastSyncError string `json:"lastSyncError,omitempty"`
+	IssueID         string `json:"issueId,omitempty"`
+	Identifier      string `json:"identifier,omitempty"`
+	URL             string `json:"url,omitempty"`
+	CommentID       string `json:"commentId,omitempty"`
+	State           string `json:"state,omitempty"`
+	StateID         string `json:"stateId,omitempty"`
+	OriginalState   string `json:"originalState,omitempty"`
+	OriginalStateID string `json:"originalStateId,omitempty"`
+	LastSyncAt      string `json:"lastSyncAt,omitempty"`
+	LastSyncError   string `json:"lastSyncError,omitempty"`
 }
 
 type RuntimeData struct {
@@ -57,6 +65,7 @@ type AgentSession struct {
 	WorktreePath  string           `json:"worktreePath,omitempty"`
 	Branch        string           `json:"branch,omitempty"`
 	Linear        LinearData       `json:"linear,omitempty"`
+	Phase         string           `json:"phase,omitempty"`
 	Runtime       RuntimeData      `json:"runtime,omitempty"`
 	Status        AgentStatus      `json:"status"`
 	LastSummary   string           `json:"lastSummary,omitempty"`
@@ -81,6 +90,7 @@ type LinearIssue struct {
 	SortOrder    float64
 	AssigneeID   string
 	AssigneeName string
+	Labels       []LinearLabel
 }
 
 type LinearViewer struct {
@@ -123,10 +133,25 @@ type RepoConfig struct {
 	Path string `json:"path"`
 }
 
+type LinearTransition struct {
+	State        string   `json:"state,omitempty"`
+	AddLabels    []string `json:"addLabels,omitempty"`
+	RemoveLabels []string `json:"removeLabels,omitempty"`
+}
+
+type LinearWorkflowConfig struct {
+	Transitions map[string]LinearTransition `json:"transitions,omitempty"`
+}
+
+type LinearConfig struct {
+	Workflow LinearWorkflowConfig `json:"workflow,omitempty"`
+}
+
 type Config struct {
 	DefaultAgent       string        `json:"defaultAgent,omitempty"`
 	DefaultRepoPath    string        `json:"defaultRepoPath,omitempty"`
 	Repos              []RepoConfig  `json:"repos,omitempty"`
 	QueuePresets       []QueuePreset `json:"queuePresets,omitempty"`
 	DefaultQueuePreset string        `json:"defaultQueuePreset,omitempty"`
+	Linear             LinearConfig  `json:"linear,omitempty"`
 }

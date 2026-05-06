@@ -35,6 +35,7 @@ type row struct {
 	agent           string
 	runbook         string
 	linear          string
+	phase           string
 	lastSummary     string
 	currentState    string
 	nextAction      string
@@ -344,6 +345,7 @@ func agentRow(s types.AgentSession, active bool) row {
 		agent:           valueOr(s.AgentCommand, s.Provider),
 		runbook:         home.RunbookPath(s.ID),
 		linear:          s.Linear.URL,
+		phase:           s.Phase,
 		lastSummary:     s.LastSummary,
 		currentState:    notes.CurrentState,
 		nextAction:      notes.NextAction,
@@ -762,6 +764,9 @@ func previewFooterLine(r row) (previewLine, bool) {
 		if r.status == string(types.StatusCrashed) || r.status == string(types.StatusStale) || r.status == string(types.StatusWaiting) {
 			parts = append(parts, r.status)
 		}
+		if r.phase != "" && r.phase != types.PhaseWork {
+			parts = append(parts, r.phase)
+		}
 		if r.workspace != "" {
 			parts = append(parts, filepath.Base(r.workspace))
 		}
@@ -1060,6 +1065,24 @@ func (m *model) commitAction() error {
 		}
 		_, err := agent.SetStatus(r.id, m.pending, value)
 		return err
+	case "scopedSummary":
+		if !hasRow || !isAgentRow(r) {
+			return fmt.Errorf("select a structured agent session")
+		}
+		_, err := agent.MarkScoped(r.id, value)
+		return err
+	case "needsReviewSummary":
+		if !hasRow || !isAgentRow(r) {
+			return fmt.Errorf("select a structured agent session")
+		}
+		_, err := agent.MarkNeedsReview(r.id, value)
+		return err
+	case "abandonSummary":
+		if !hasRow || !isAgentRow(r) {
+			return fmt.Errorf("select a structured agent session")
+		}
+		_, err := agent.Abandon(r.id, value)
+		return err
 	default:
 		return nil
 	}
@@ -1099,6 +1122,29 @@ func (m *model) createWithAgent(agentCommand string) error {
 		var first types.AgentSession
 		for _, target := range targets {
 			s, err := agent.Start(agent.StartOptions{Cwd: cwd, IssueKey: target, Agent: agentCommand})
+			if err != nil {
+				return err
+			}
+			if first.ID == "" {
+				first = s
+			}
+		}
+		if len(targets) == 1 && first.TmuxSession != "" {
+			m.chosen = first.TmuxSession
+		}
+		return nil
+	case "queueScope":
+		targets := splitTargets(m.target)
+		if len(targets) == 0 {
+			return fmt.Errorf("select a Linear issue")
+		}
+		if len(targets) > queue.BatchLimit {
+			return fmt.Errorf("batch start is capped at %d issues", queue.BatchLimit)
+		}
+		cwd := valueOr(m.createRepo, ".")
+		var first types.AgentSession
+		for _, target := range targets {
+			s, err := agent.Start(agent.StartOptions{Cwd: cwd, IssueKey: target, Agent: agentCommand, Scoping: true})
 			if err != nil {
 				return err
 			}
@@ -1313,6 +1359,12 @@ func (m model) prompt() string {
 		}, "\n")
 	case "statusSummary":
 		return renderPromptInput("summary for "+string(m.pending), m.input) + dim.Render("enter save · esc cancel")
+	case "scopedSummary":
+		return renderPromptInput("scope summary", m.input) + dim.Render("moves Linear to ready state · esc cancel")
+	case "needsReviewSummary":
+		return renderPromptInput("review summary", m.input) + dim.Render("adds needs-review in Linear · esc cancel")
+	case "abandonSummary":
+		return renderPromptInput("abandon summary", m.input) + dim.Render("moves Linear back to original queue state · esc cancel")
 	default:
 		return ""
 	}
@@ -1439,9 +1491,11 @@ func (m *model) chooseAction() error {
 		}
 		m.chosen = r.session
 	case "startQueue":
-		return m.startQueueFlow(false)
+		return m.startQueueFlow(false, false)
+	case "startScope":
+		return m.startQueueFlow(false, true)
 	case "startSelected":
-		return m.startQueueFlow(true)
+		return m.startQueueFlow(true, false)
 	case "detail":
 		m.mode = "detail"
 	case "path":
@@ -1465,6 +1519,24 @@ func (m *model) chooseAction() error {
 			return fmt.Errorf("select a structured agent session")
 		}
 		m.mode = "statusPick"
+		m.input = ""
+	case "markScoped":
+		if !isAgentRow(r) {
+			return fmt.Errorf("select a structured agent session")
+		}
+		m.mode = "scopedSummary"
+		m.input = ""
+	case "needsReview":
+		if !isAgentRow(r) {
+			return fmt.Errorf("select a structured agent session")
+		}
+		m.mode = "needsReviewSummary"
+		m.input = r.lastSummary
+	case "abandon":
+		if !isAgentRow(r) {
+			return fmt.Errorf("select a structured agent session")
+		}
+		m.mode = "abandonSummary"
 		m.input = ""
 	case "rename":
 		if !r.active {
@@ -1497,7 +1569,7 @@ func (m *model) primaryAction() error {
 		return nil
 	}
 	if r.kind == "queue" && !r.active && !r.structured {
-		return m.startQueueFlow(false)
+		return m.startQueueFlow(false, false)
 	}
 	if !r.active {
 		m.mode = "actionMenu"
@@ -1508,7 +1580,7 @@ func (m *model) primaryAction() error {
 	return nil
 }
 
-func (m *model) startQueueFlow(useSelected bool) error {
+func (m *model) startQueueFlow(useSelected bool, scoping bool) error {
 	r, ok := m.current()
 	if !ok {
 		return fmt.Errorf("no row selected")
@@ -1524,6 +1596,9 @@ func (m *model) startQueueFlow(useSelected bool) error {
 		return fmt.Errorf("no queue issue selected")
 	}
 	m.create = "queue"
+	if scoping {
+		m.create = "queueScope"
+	}
 	m.createRepo = r.repo
 	m.target = strings.Join(selected, ",")
 	m.mode = "repoPick"
@@ -1596,7 +1671,10 @@ func repoChoices(preferred string) []repoChoice {
 
 func actionsFor(r row, fullQueue bool) []menuChoice {
 	if r.kind == "queue" && !r.structured {
-		actions := []menuChoice{{id: "startQueue", label: "Start agent", description: "choose repo and agent"}}
+		actions := []menuChoice{
+			{id: "startQueue", label: "Start work", description: "move to active work and launch agent"},
+			{id: "startScope", label: "Start scoping", description: "move to scoping and launch planning agent"},
+		}
 		if fullQueue {
 			actions = append(actions, menuChoice{id: "startSelected", label: "Start selected", description: "batch up to 3 selected issues"})
 		}
@@ -1615,6 +1693,13 @@ func actionsFor(r row, fullQueue bool) []menuChoice {
 		actions = append(actions, workspaceAction(r))
 		if len(r.workspaceShells) > 0 {
 			actions = append(actions, menuChoice{id: "workspaceNew", label: "New workspace terminal", description: "create another attached terminal"})
+		}
+		if r.phase == types.PhaseScoping {
+			actions = append(actions, menuChoice{id: "markScoped", label: "Mark scoped", description: "move Linear issue to ready queue"})
+		}
+		if r.linear != "" {
+			actions = append(actions, menuChoice{id: "needsReview", label: "Mark needs review", description: "add Linear needs-review label"})
+			actions = append(actions, menuChoice{id: "abandon", label: "Abandon work", description: "move Linear issue back to original queue state", danger: true})
 		}
 		return append(actions,
 			menuChoice{id: "detail", label: "Details", description: "show runbook and output"},
@@ -1857,6 +1942,7 @@ func detailItems(r row) [][2]string {
 	values := [][2]string{
 		{"tmux", r.session},
 		{"agent", r.agent},
+		{"phase", r.phase},
 		{"branch", valueOr(r.branch, "current")},
 		{"workspace", r.workspace},
 		{"repo", r.repo},

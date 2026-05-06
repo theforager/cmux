@@ -10,6 +10,7 @@ import (
 	"github.com/theforager/cmux/internal/format"
 	"github.com/theforager/cmux/internal/gitx"
 	"github.com/theforager/cmux/internal/home"
+	"github.com/theforager/cmux/internal/lifecycle"
 	"github.com/theforager/cmux/internal/linear"
 	"github.com/theforager/cmux/internal/process"
 	"github.com/theforager/cmux/internal/runbook"
@@ -23,6 +24,7 @@ type StartOptions struct {
 	IssueKey    string
 	Title       string
 	Scratch     bool
+	Scoping     bool
 	Worktree    bool
 	NoWorktree  bool
 	PrepareOnly bool
@@ -73,24 +75,32 @@ func startIssue(o StartOptions) (types.AgentSession, error) {
 	if err != nil {
 		return types.AgentSession{}, err
 	}
-	if existing, err := state.Read(issue.Identifier); err == nil {
+	phase := types.PhaseWork
+	sessionID := issue.Identifier
+	transition := lifecycle.EventStartWork
+	if o.Scoping {
+		phase = types.PhaseScoping
+		sessionID = issue.Identifier + "-scope"
+		transition = lifecycle.EventStartScoping
+	}
+	if existing, err := state.Read(sessionID); err == nil {
 		return existing, nil
 	}
 	repo := o.Cwd
 	worktree := o.Cwd
 	branch := ""
 	if !o.NoWorktree {
-		repo, branch, worktree, err = gitx.EnsureWorktree(o.Cwd, issue.Identifier, issue.Title, issue.BranchName)
+		repo, branch, worktree, err = gitx.EnsureWorktree(o.Cwd, sessionID, issue.Title, issue.BranchName)
 		if err != nil {
 			return types.AgentSession{}, err
 		}
 	}
-	name, err := tmux.GenerateSessionName(worktree, issue.Identifier)
+	name, err := tmux.GenerateSessionName(worktree, sessionID)
 	if err != nil {
 		return types.AgentSession{}, err
 	}
 	now := format.Now()
-	s := types.AgentSession{SchemaVersion: 1, ID: issue.Identifier, Type: types.TypeIssueBacked, Title: issue.Title, Provider: Provider(o.Agent), AgentCommand: o.Agent, TmuxSession: name, RepoPath: repo, WorktreePath: worktree, Branch: branch, Linear: types.LinearData{IssueID: issue.ID, Identifier: issue.Identifier, URL: issue.URL, State: issue.State}, Status: types.StatusRunning, CreatedAt: now, LastUpdatedAt: now}
+	s := types.AgentSession{SchemaVersion: 1, ID: sessionID, Type: types.TypeIssueBacked, Title: issue.Title, Provider: Provider(o.Agent), AgentCommand: o.Agent, TmuxSession: name, RepoPath: repo, WorktreePath: worktree, Branch: branch, Linear: types.LinearData{IssueID: issue.ID, Identifier: issue.Identifier, URL: issue.URL, State: issue.State, StateID: issue.StateID, OriginalState: issue.State, OriginalStateID: issue.StateID}, Phase: phase, Status: types.StatusRunning, CreatedAt: now, LastUpdatedAt: now}
 	if o.PrepareOnly {
 		s.Status = types.StatusIdle
 	}
@@ -106,6 +116,11 @@ func startIssue(o StartOptions) (types.AgentSession, error) {
 		}
 	}
 	_ = syncLinear(&s)
+	if !o.PrepareOnly {
+		if err := lifecycle.Apply(&s, transition); err != nil {
+			s.Linear.LastSyncError = err.Error()
+		}
+	}
 	_ = state.Write(s)
 	return s, nil
 }
@@ -201,6 +216,66 @@ func SetStatus(id string, status types.AgentStatus, summary string) (types.Agent
 		return s, err
 	}
 	_ = syncLinear(&s)
+	switch status {
+	case types.StatusDone:
+		if err := lifecycle.Apply(&s, lifecycle.EventDone); err != nil {
+			s.Linear.LastSyncError = err.Error()
+		}
+	}
+	_ = state.Write(s)
+	return s, nil
+}
+
+func MarkNeedsReview(id string, summary string) (types.AgentSession, error) {
+	s, err := state.Update(id, func(s types.AgentSession) types.AgentSession {
+		s.Status = types.StatusReadyForReview
+		s.LastSummary = summary
+		s.NeedsHuman = true
+		return s
+	})
+	if err != nil {
+		return s, err
+	}
+	_ = syncLinear(&s)
+	if err := lifecycle.Apply(&s, lifecycle.EventNeedsReview); err != nil {
+		s.Linear.LastSyncError = err.Error()
+	}
+	_ = state.Write(s)
+	return s, nil
+}
+
+func MarkScoped(id string, summary string) (types.AgentSession, error) {
+	s, err := state.Update(id, func(s types.AgentSession) types.AgentSession {
+		s.Status = types.StatusDone
+		s.LastSummary = summary
+		s.NeedsHuman = false
+		return s
+	})
+	if err != nil {
+		return s, err
+	}
+	_ = syncLinear(&s)
+	if err := lifecycle.Apply(&s, lifecycle.EventMarkScoped); err != nil {
+		s.Linear.LastSyncError = err.Error()
+	}
+	_ = state.Write(s)
+	return s, nil
+}
+
+func Abandon(id string, summary string) (types.AgentSession, error) {
+	s, err := state.Update(id, func(s types.AgentSession) types.AgentSession {
+		s.Status = types.StatusDone
+		s.LastSummary = summary
+		s.NeedsHuman = false
+		return s
+	})
+	if err != nil {
+		return s, err
+	}
+	_ = syncLinear(&s)
+	if err := lifecycle.Apply(&s, lifecycle.EventAbandon); err != nil {
+		s.Linear.LastSyncError = err.Error()
+	}
 	_ = state.Write(s)
 	return s, nil
 }
@@ -396,7 +471,12 @@ func initialPrompt(s types.AgentSession, issue types.LinearIssue) string {
 	}
 	text += "Workspace: " + valueOr(s.WorktreePath, s.RepoPath) + "\n"
 	text += "Runbook: " + home.RunbookPath(s.ID) + "\n\n"
-	text += "Requirements:\n- Work only in this workspace unless the user explicitly says otherwise.\n- Keep the cmux runbook updated at " + home.RunbookPath(s.ID) + ".\n- When blocked, run: cmux agent status " + s.ID + " blocked \"<reason>\"\n- When ready for review, run: cmux agent status " + s.ID + " ready_for_review \"<summary>\"\n"
+	if s.Phase == types.PhaseScoping {
+		text += "Mode: scoping. Do not implement code unless the user explicitly asks. Clarify the problem, repo/package, approach, acceptance criteria, risks, and next coding steps.\n\n"
+		text += "Requirements:\n- Keep the cmux runbook updated at " + home.RunbookPath(s.ID) + ".\n- When blocked, run: cmux agent status " + s.ID + " blocked \"<reason>\"\n- When the issue is scoped and ready for coding, run: cmux agent scoped " + s.ID + " \"<summary>\"\n"
+	} else {
+		text += "Requirements:\n- Work only in this workspace unless the user explicitly says otherwise.\n- Keep the cmux runbook updated at " + home.RunbookPath(s.ID) + ".\n- When blocked, run: cmux agent status " + s.ID + " blocked \"<reason>\"\n- When ready for review, run: cmux agent status " + s.ID + " ready_for_review \"<summary>\"\n"
+	}
 	if issue.Description != "" {
 		text += "\nIssue description:\n" + issue.Description
 	}

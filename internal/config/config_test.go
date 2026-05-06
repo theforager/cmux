@@ -44,3 +44,18 @@ func TestLoadMalformedConfig(t *testing.T) {
 		t.Fatal("expected malformed config error")
 	}
 }
+
+func TestLoadOrDefaultAddsWorkflowTransitions(t *testing.T) {
+	t.Setenv("CMUX_HOME", t.TempDir())
+	cfg, err := LoadOrDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	transition, ok := Transition(cfg, "mark_needs_review")
+	if !ok {
+		t.Fatalf("missing mark_needs_review transition: %+v", cfg.Linear.Workflow.Transitions)
+	}
+	if len(transition.AddLabels) != 2 || transition.AddLabels[1] != "needs-review" {
+		t.Fatalf("mark_needs_review transition = %+v", transition)
+	}
+}

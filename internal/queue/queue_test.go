@@ -22,16 +22,16 @@ func TestJoinMarksExistingSessionByIdentifier(t *testing.T) {
 	}
 }
 
-func TestJoinLeavesUnstartedIssueQueued(t *testing.T) {
-	rows := Join([]types.LinearIssue{{ID: "issue-id", Identifier: "REB-124"}}, nil)
+func TestJoinLeavesUnstartedIssueWithLinearStateBadge(t *testing.T) {
+	rows := Join([]types.LinearIssue{{ID: "issue-id", Identifier: "REB-124", State: "In Progress"}}, nil)
 	if len(rows) != 1 {
 		t.Fatalf("len(rows) = %d, want 1", len(rows))
 	}
 	if rows[0].Started {
 		t.Fatalf("expected unstarted row: %+v", rows[0])
 	}
-	if rows[0].Status != types.AgentStatus("queued") {
-		t.Fatalf("status = %s, want queued", rows[0].Status)
+	if rows[0].Status != types.AgentStatus("in-progress") {
+		t.Fatalf("status = %s, want in-progress", rows[0].Status)
 	}
 }
 
@@ -44,6 +44,23 @@ func TestJoinPreservesLinearIssueOrder(t *testing.T) {
 	}, nil)
 	got := []string{rows[0].Issue.Identifier, rows[1].Issue.Identifier, rows[2].Issue.Identifier, rows[3].Issue.Identifier}
 	want := []string{"REB-3", "REB-2", "REB-1", "REB-0"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("order = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestJoinWithPresetSortsByStateOrderThenManualOrder(t *testing.T) {
+	rows := JoinWithPreset([]types.LinearIssue{
+		{Identifier: "REB-3", StateID: "backlog", SortOrder: 1},
+		{Identifier: "REB-2", StateID: "scoping", SortOrder: 1},
+		{Identifier: "REB-1", StateID: "todo", SortOrder: 2},
+		{Identifier: "REB-0", StateID: "todo", SortOrder: 1},
+		{Identifier: "REB-4", StateID: "progress", SortOrder: 1},
+	}, nil, types.QueuePreset{States: []string{"progress", "todo", "scoping", "backlog"}})
+	got := []string{rows[0].Issue.Identifier, rows[1].Issue.Identifier, rows[2].Issue.Identifier, rows[3].Issue.Identifier}
+	want := []string{"REB-4", "REB-0", "REB-1", "REB-2"}
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("order = %v, want %v", got, want)

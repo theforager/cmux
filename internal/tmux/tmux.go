@@ -103,6 +103,7 @@ func Has(name string) bool {
 }
 
 func Create(o CreateOptions) error {
+	_ = EnsureOptions()
 	args := []string{"new-session", "-d", "-s", o.Name, "-c", o.Dir}
 	if o.Mobile {
 		args = append(args, "-x", "78")
@@ -124,7 +125,6 @@ func Create(o CreateOptions) error {
 	if o.Title != "" {
 		_ = SetEnv(o.Name, "CMUX_TITLE", o.Title)
 	}
-	_ = EnsureKeyOptions()
 	if o.Command != "" {
 		_, err := process.Run("tmux", "send-keys", "-t", o.Name, "exec "+o.Command, "Enter")
 		return err
@@ -133,9 +133,18 @@ func Create(o CreateOptions) error {
 }
 
 func EnsureKeyOptions() error {
+	return EnsureOptions()
+}
+
+func EnsureOptions() error {
 	if err := EnsurePopupBinding(); err != nil {
 		return err
 	}
+	// Preserve modern TUI styling such as subtle input-box backgrounds.
+	_, _ = process.Run("tmux", "set-option", "-g", "default-terminal", "tmux-256color")
+	ensureTerminalFeature("xterm*:RGB")
+	ensureTerminalFeature("tmux*:RGB")
+	ensureTerminalFeature("screen*:RGB")
 	// Forward modified keys such as Option/Meta+Enter through tmux to TUIs.
 	_, _ = process.Run("tmux", "set-option", "-g", "extended-keys", "on")
 	_, _ = process.Run("tmux", "set-option", "-g", "xterm-keys", "on")

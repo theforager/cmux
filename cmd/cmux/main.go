@@ -419,7 +419,7 @@ func agentResetCmd() *cobra.Command {
 func queueCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "queue",
-		Short: "Open the Linear queue browser",
+		Short: "Open the Linear worklist browser",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			selected, err := tui.RunQueue()
 			if err != nil {
@@ -438,7 +438,7 @@ func queueCmd() *cobra.Command {
 func queueListCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "list [preset]",
-		Short: "Print Linear queue rows joined with cmux sessions",
+		Short: "Print Linear worklist rows joined with cmux sessions",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			preset := ""
@@ -446,7 +446,7 @@ func queueListCmd() *cobra.Command {
 				preset = args[0]
 			}
 			if !queue.Configured() {
-				fmt.Println("Linear queue not configured: set LINEAR_API_KEY and run cmux queue setup")
+				fmt.Println("Linear worklist not configured: set LINEAR_API_KEY and run cmux queue setup")
 				return nil
 			}
 			rows, used, err := queue.Rows(preset, 250)
@@ -477,7 +477,7 @@ func queueListCmd() *cobra.Command {
 func queueSetupCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "setup",
-		Short: "Create a saved Linear queue preset",
+		Short: "Create a saved Linear worklist preset",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !queue.Configured() {
 				return fmt.Errorf("LINEAR_API_KEY is not set")
@@ -741,7 +741,7 @@ func chooseStates(reader *bufio.Reader, states []types.LinearWorkflowState) []st
 	}
 	selected, err := tui.RunChecklist(tui.ChecklistOptions{
 		Title:    "Linear Workflow States",
-		Help:     "Check states in queue order. Empty uses Todo -> Scoping -> Backlog.",
+		Help:     "Check states in worklist order. Empty uses In Progress -> Todo -> Scoping -> Backlog.",
 		Items:    items,
 		Selected: defaultStateIDs(states),
 		Ordered:  true,
@@ -770,7 +770,7 @@ func chooseLabels(reader *bufio.Reader, labels []types.LinearLabel) []string {
 }
 
 func defaultStateIDs(states []types.LinearWorkflowState) []string {
-	wanted := []string{"todo", "to do", "scoping", "backlog"}
+	wanted := []string{"in progress", "todo", "to do", "scoping", "backlog"}
 	out := []string{}
 	seen := map[string]bool{}
 	for _, want := range wanted {

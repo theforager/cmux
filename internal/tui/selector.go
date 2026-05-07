@@ -157,7 +157,9 @@ func loadRows(fullQueue bool) ([]row, error) {
 		byTmux[s.TmuxSession] = agentRow(s, false)
 	}
 	childByParent := map[string][]string{}
+	activeTmux := map[string]bool{}
 	for _, s := range tmuxSessions {
+		activeTmux[s.Name] = true
 		if s.Kind == "workspace" && s.ParentID != "" {
 			childByParent[s.ParentID] = append(childByParent[s.ParentID], s.Name)
 		}
@@ -189,24 +191,24 @@ func loadRows(fullQueue bool) ([]row, error) {
 		}
 		r := agentRow(s, false)
 		r.workspaceShells = childByParent[r.id]
-		r.title += " (not running)"
+		r.status = "not-running"
 		rows = append(rows, r)
 	}
-	rows = append(rows, queueRows(fullQueue)...)
+	rows = append(rows, queueRows(fullQueue, activeTmux)...)
 	sortRows(rows)
 	return rows, nil
 }
 
-func queueRows(fullQueue bool) []row {
+func queueRows(fullQueue bool, activeTmux map[string]bool) []row {
 	if !queue.Configured() {
 		return []row{{
 			id:      "linear-setup",
-			title:   "Linear queue not configured: set LINEAR_API_KEY and run cmux queue setup",
+			title:   "Linear worklist not configured: set LINEAR_API_KEY and run cmux queue setup",
 			status:  "setup",
-			group:   "Queue",
+			group:   "Linear",
 			updated: "",
 			kind:    "notice",
-			detail:  "Linear queue needs LINEAR_API_KEY before cmux can fetch issues.",
+			detail:  "Linear worklist needs LINEAR_API_KEY before cmux can fetch issues.",
 		}}
 	}
 	limit := 8
@@ -219,13 +221,13 @@ func queueRows(fullQueue bool) []row {
 			id:     "linear-error",
 			title:  err.Error(),
 			status: "error",
-			group:  "Queue",
+			group:  "Linear",
 			kind:   "notice",
 			detail: "Queue preset could not be loaded or Linear returned an error.",
 		}}
 	}
 	if len(rows) == 0 {
-		return []row{{id: "linear-empty", title: "No matching Linear issues in " + preset.Name, status: "empty", group: "Queue", kind: "notice"}}
+		return []row{{id: "linear-empty", title: "No matching Linear issues in " + preset.Name, status: "empty", group: "Linear", kind: "notice"}}
 	}
 	displayLimit := limit
 	out := make([]row, 0, len(rows))
@@ -240,8 +242,7 @@ func queueRows(fullQueue bool) []row {
 			id:         qr.Issue.Identifier,
 			title:      qr.Issue.Title,
 			status:     string(qr.Status),
-			group:      "Queue",
-			updated:    valueOr(qr.Issue.State, ""),
+			group:      "Linear",
 			repo:       preset.RepoPath,
 			workspace:  preset.RepoPath,
 			linear:     qr.Issue.URL,
@@ -259,12 +260,15 @@ func queueRows(fullQueue bool) []row {
 			preview: qr.Issue.Description,
 		}
 		if qr.Session != nil {
-			sr := agentRow(*qr.Session, qr.Session.Runtime.TmuxAlive && !qr.Session.Runtime.PaneDead)
-			sr.group = "Queue"
+			sr := agentRow(*qr.Session, activeTmux[qr.Session.TmuxSession])
+			sr.group = "Linear"
 			sr.kind = "queue"
 			sr.queueIssue = qr.Issue.Identifier
 			sr.workspaceShells = r.workspaceShells
 			sr.updated = format.Age(qr.Session.LastUpdatedAt)
+			if !sr.active {
+				sr.status = "not-running"
+			}
 			r = sr
 		}
 		out = append(out, r)
@@ -286,11 +290,11 @@ func groupRank(group string) int {
 	switch group {
 	case "Needs attention":
 		return 0
-	case "Running":
+	case "Active":
 		return 1
 	case "Ready for review":
 		return 2
-	case "Queue":
+	case "Linear":
 		return 3
 	case "Stale":
 		return 4
@@ -703,7 +707,7 @@ func (m model) View() string {
 		if m.fullQueue {
 			b.WriteString(dim.Render("↑↓/jk nav  enter start/open  space select  a new work  . actions  tab dashboard  / filter  R refresh  ? help  q quit"))
 		} else {
-			b.WriteString(dim.Render("↑↓/jk nav  enter open/start  a new work  . actions  tab queue  / filter  R refresh  ? help  q quit"))
+			b.WriteString(dim.Render("↑↓/jk nav  enter open/start  a new work  . actions  tab Linear  / filter  R refresh  ? help  q quit"))
 		}
 	}
 	if m.message != "" {
@@ -1486,7 +1490,7 @@ func (m *model) chooseAction() error {
 	}
 	switch choices[m.actionSelected].id {
 	case "open":
-		if !r.active {
+		if !r.active || !tmux.Has(r.session) {
 			return fmt.Errorf("session is not running")
 		}
 		m.chosen = r.session
@@ -1508,12 +1512,11 @@ func (m *model) chooseAction() error {
 		}
 		m.chosen = name
 	case "restart":
-		if err := m.restartCurrent(); err != nil {
+		s, err := m.restartCurrent()
+		if err != nil {
 			return err
 		}
-		if r, ok := m.current(); ok && r.session != "" {
-			m.chosen = r.session
-		}
+		m.chosen = s.TmuxSession
 	case "status":
 		if !isAgentRow(r) {
 			return fmt.Errorf("select a structured agent session")
@@ -1571,7 +1574,7 @@ func (m *model) primaryAction() error {
 	if r.kind == "queue" && !r.active && !r.structured {
 		return m.startQueueFlow(false, false)
 	}
-	if !r.active {
+	if !r.active || !tmux.Has(r.session) {
 		m.mode = "actionMenu"
 		m.actionSelected = 0
 		return nil
@@ -1824,14 +1827,14 @@ func (m *model) openWorkspaceSession(createNew bool) (string, error) {
 	return name, nil
 }
 
-func (m *model) restartCurrent() error {
+func (m *model) restartCurrent() (types.AgentSession, error) {
 	r, ok := m.current()
 	if !ok || !isAgentRow(r) {
-		return fmt.Errorf("select a structured agent session")
+		return types.AgentSession{}, fmt.Errorf("select a structured agent session")
 	}
 	s, err := agent.Restart(r.id)
 	if err != nil {
-		return err
+		return s, err
 	}
 	rows, err := loadRows(m.fullQueue)
 	if err == nil {
@@ -1844,7 +1847,7 @@ func (m *model) restartCurrent() error {
 			}
 		}
 	}
-	return nil
+	return s, nil
 }
 
 func (m *model) applyFilter() {
@@ -1883,13 +1886,13 @@ func helpView() string {
 		cyan.Render("↑↓ j k") + "        navigate",
 		cyan.Render("home end") + "      first / last",
 		cyan.Render("pgup pgdn") + "     move by 5",
-		cyan.Render("enter") + "         open session or start queued issue",
+		cyan.Render("enter") + "         open session or start Linear issue",
 		cyan.Render(".") + "             actions for selected row",
 		cyan.Render("a") + "             new work menu",
-		cyan.Render("tab") + "           dashboard / full queue",
+		cyan.Render("tab") + "           dashboard / Linear worklist",
 		cyan.Render("i") + "             show selected session details",
 		cyan.Render("/") + "             filter",
-		cyan.Render("space") + "         select queued issue in full queue",
+		cyan.Render("space") + "         select Linear issue in full worklist",
 		cyan.Render("R") + "             scan sessions and refresh",
 		cyan.Render("q esc") + "         quit",
 		"",
@@ -1906,7 +1909,7 @@ func dashboardGroup(status types.AgentStatus) string {
 	case types.StatusBlocked, types.StatusTestsFailed, types.StatusWaiting, types.StatusCrashed:
 		return "Needs attention"
 	case types.StatusRunning, types.StatusIdle:
-		return "Running"
+		return "Active"
 	case types.StatusReadyForReview, types.StatusPROpened:
 		return "Ready for review"
 	case types.StatusStale:

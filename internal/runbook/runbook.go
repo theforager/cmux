@@ -18,6 +18,11 @@ type Summary struct {
 	ReviewSummary string
 }
 
+type Section struct {
+	Heading string
+	Body    string
+}
+
 func Read(sessionID string) Summary {
 	b, err := os.ReadFile(home.RunbookPath(sessionID))
 	if err != nil {
@@ -33,6 +38,26 @@ func Read(sessionID string) Summary {
 		NextAction:    section(text, "Next action"),
 		ReviewSummary: section(text, "Review summary"),
 	}
+}
+
+func ReadSections(sessionID string) []Section {
+	b, err := os.ReadFile(home.RunbookPath(sessionID))
+	if err != nil {
+		return nil
+	}
+	return sections(string(b))
+}
+
+func Clean(value string) string {
+	return clean(value)
+}
+
+func CleanBlock(value string) string {
+	value = strings.TrimSpace(value)
+	if isPlaceholder(value) {
+		return ""
+	}
+	return value
 }
 
 func (s Summary) Preview() string {
@@ -65,10 +90,39 @@ func section(text, heading string) string {
 	return strings.TrimSpace(rest)
 }
 
+func sections(text string) []Section {
+	pattern := regexp.MustCompile(`(?m)^## (.+?)\s*$`)
+	matches := pattern.FindAllStringSubmatchIndex(text, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	out := make([]Section, 0, len(matches))
+	for i, match := range matches {
+		heading := strings.TrimSpace(text[match[2]:match[3]])
+		start := match[1]
+		end := len(text)
+		if i+1 < len(matches) {
+			end = matches[i+1][0]
+		}
+		body := strings.TrimSpace(text[start:end])
+		out = append(out, Section{Heading: heading, Body: body})
+	}
+	return out
+}
+
 func clean(value string) string {
 	value = strings.TrimSpace(value)
-	if value == "- None." || value == "- None yet." || value == "- Not run yet." || value == "- Not ready for review yet." {
+	if isPlaceholder(value) {
 		return ""
 	}
 	return strings.ReplaceAll(value, "\n", " ")
+}
+
+func isPlaceholder(value string) bool {
+	switch strings.TrimSpace(value) {
+	case "- None.", "- None yet.", "- Not started.", "- Not run.", "- Not run yet.", "- Not ready.", "- Not ready for review yet.", "- Start implementation.", "- Pick the first concrete implementation step.":
+		return true
+	default:
+		return false
+	}
 }

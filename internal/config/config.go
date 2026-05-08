@@ -47,6 +47,7 @@ func DefaultLinearWorkflow() types.LinearWorkflowConfig {
 		"done": {
 			State:        "Done",
 			RemoveLabels: []string{"needs-review"},
+			PlaceAtTop:   true,
 		},
 		"abandon": {
 			State:        "$previous_queue_state",
@@ -112,6 +113,26 @@ func AddRepo(cfg types.Config, repo types.RepoConfig) types.Config {
 	}
 	cfg.Repos = append(cfg.Repos, repo)
 	return normalizeRepos(cfg)
+}
+
+func RememberRepo(path string) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil
+	}
+	abs, err := filepath.Abs(path)
+	if err == nil {
+		path = abs
+	}
+	cfg, err := Load()
+	if err != nil {
+		return err
+	}
+	if cfg.DefaultRepoPath == "" {
+		cfg.DefaultRepoPath = path
+	}
+	cfg = AddRepo(cfg, types.RepoConfig{Name: filepath.Base(path), Path: path})
+	return Save(cfg)
 }
 
 func normalizeRepos(cfg types.Config) types.Config {

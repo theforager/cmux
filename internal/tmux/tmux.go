@@ -146,9 +146,9 @@ func EnsureOptions() error {
 	ensureTerminalFeature("tmux*:RGB")
 	ensureTerminalFeature("screen*:RGB")
 	// Forward modified keys such as Option/Meta+Enter through tmux to TUIs.
-	_, _ = process.Run("tmux", "set-option", "-g", "extended-keys", "on")
+	_, _ = process.Run("tmux", "set-option", "-s", "extended-keys", "always")
 	_, _ = process.Run("tmux", "set-option", "-g", "xterm-keys", "on")
-	_, _ = process.Run("tmux", "bind-key", "-n", "M-Enter", "send-keys", "Escape", "Enter")
+	_, _ = process.Run("tmux", "unbind-key", "-n", "M-Enter")
 	ensureTerminalFeature("xterm*:extkeys")
 	ensureTerminalFeature("tmux*:extkeys")
 	ensureTerminalFeature("screen*:extkeys")

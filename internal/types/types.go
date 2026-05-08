@@ -137,6 +137,7 @@ type LinearTransition struct {
 	State        string   `json:"state,omitempty"`
 	AddLabels    []string `json:"addLabels,omitempty"`
 	RemoveLabels []string `json:"removeLabels,omitempty"`
+	PlaceAtTop   bool     `json:"placeAtTop,omitempty"`
 }
 
 type LinearWorkflowConfig struct {

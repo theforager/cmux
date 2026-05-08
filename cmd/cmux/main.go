@@ -571,7 +571,13 @@ func agentStatusCmd(kind string) *cobra.Command {
 					summary = joinArgs(args[2:])
 				}
 			}
-			s, err := agent.SetStatus(id, status, summary)
+			var s types.AgentSession
+			var err error
+			if kind == "done" {
+				s, err = agent.Complete(id, summary)
+			} else {
+				s, err = agent.SetStatus(id, status, summary)
+			}
 			if err != nil {
 				return err
 			}

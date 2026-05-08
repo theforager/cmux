@@ -58,4 +58,39 @@ func TestLoadOrDefaultAddsWorkflowTransitions(t *testing.T) {
 	if len(transition.AddLabels) != 2 || transition.AddLabels[1] != "needs-review" {
 		t.Fatalf("mark_needs_review transition = %+v", transition)
 	}
+	done, ok := Transition(cfg, "done")
+	if !ok {
+		t.Fatalf("missing done transition: %+v", cfg.Linear.Workflow.Transitions)
+	}
+	if !done.PlaceAtTop {
+		t.Fatalf("done transition should place issue at top: %+v", done)
+	}
+}
+
+func TestRememberRepoSavesRepoAndDefault(t *testing.T) {
+	t.Setenv("CMUX_HOME", t.TempDir())
+	repo := t.TempDir()
+	if err := RememberRepo(repo); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DefaultRepoPath != repo {
+		t.Fatalf("DefaultRepoPath = %q, want %q", cfg.DefaultRepoPath, repo)
+	}
+	if len(cfg.Repos) != 1 || cfg.Repos[0].Path != repo {
+		t.Fatalf("Repos = %+v, want %q", cfg.Repos, repo)
+	}
+	if err := RememberRepo(repo); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Repos) != 1 {
+		t.Fatalf("RememberRepo duplicated repo: %+v", cfg.Repos)
+	}
 }

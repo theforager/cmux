@@ -50,7 +50,16 @@ func Apply(s *types.AgentSession, event string) error {
 	if stateID == "" && labelIDs == nil {
 		return nil
 	}
-	updated, err := linear.UpdateIssue(s.Linear.IssueID, stateID, labelIDs)
+	options := linear.IssueUpdateOptions{}
+	if transition.PlaceAtTop && stateID != "" {
+		if top, ok, err := linear.TopSortOrder(stateID, issue.TeamID); err != nil {
+			return err
+		} else if ok {
+			sortOrder := top - 1
+			options.SortOrder = &sortOrder
+		}
+	}
+	updated, err := linear.UpdateIssueWithOptions(s.Linear.IssueID, stateID, labelIDs, options)
 	if err != nil {
 		return err
 	}

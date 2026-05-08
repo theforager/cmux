@@ -66,7 +66,7 @@ func ResetHardClean(worktree string) error {
 func EnsureWorktree(cwd, identifier, title, branchName string) (repo, branch, worktree string, err error) {
 	repo, err = Root(cwd)
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", fmt.Errorf("not a git repository: %s; choose a repo for Linear work or use Scratch session for non-git folders", cwd)
 	}
 	branch = branchName
 	if branch == "" {

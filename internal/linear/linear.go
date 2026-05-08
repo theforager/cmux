@@ -272,7 +272,46 @@ func UpsertComment(issueID, commentID, body string) (string, error) {
 	return out.CommentCreate.Comment.ID, nil
 }
 
+type IssueUpdateOptions struct {
+	SortOrder   *float64
+	Description *string
+}
+
+func TopSortOrder(stateID, teamID string) (float64, bool, error) {
+	if stateID == "" {
+		return 0, false, nil
+	}
+	filter := map[string]any{"state": map[string]any{"id": map[string]any{"in": []string{stateID}}}}
+	if teamID != "" {
+		filter["team"] = map[string]any{"id": map[string]any{"in": []string{teamID}}}
+	}
+	query := `query TopIssue($filter: IssueFilter!) {
+  issues(filter: $filter, first: 1, sort: [{ manual: { order: Ascending } }]) {
+    nodes { id sortOrder }
+  }
+}`
+	var out struct {
+		Issues struct {
+			Nodes []struct {
+				ID        string  `json:"id"`
+				SortOrder float64 `json:"sortOrder"`
+			} `json:"nodes"`
+		} `json:"issues"`
+	}
+	if err := graphql(query, map[string]any{"filter": filter}, &out); err != nil {
+		return 0, false, err
+	}
+	if len(out.Issues.Nodes) == 0 {
+		return 0, false, nil
+	}
+	return out.Issues.Nodes[0].SortOrder, true, nil
+}
+
 func UpdateIssue(issueID string, stateID string, labelIDs []string) (types.LinearIssue, error) {
+	return UpdateIssueWithOptions(issueID, stateID, labelIDs, IssueUpdateOptions{})
+}
+
+func UpdateIssueWithOptions(issueID string, stateID string, labelIDs []string, options IssueUpdateOptions) (types.LinearIssue, error) {
 	if issueID == "" {
 		return types.LinearIssue{}, nil
 	}
@@ -282,6 +321,12 @@ func UpdateIssue(issueID string, stateID string, labelIDs []string) (types.Linea
 	}
 	if labelIDs != nil {
 		input["labelIds"] = labelIDs
+	}
+	if options.SortOrder != nil {
+		input["sortOrder"] = *options.SortOrder
+	}
+	if options.Description != nil {
+		input["description"] = *options.Description
 	}
 	if len(input) == 0 {
 		return types.LinearIssue{}, nil

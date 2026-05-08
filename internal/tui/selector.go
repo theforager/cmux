@@ -11,6 +11,7 @@ import (
 	"github.com/theforager/cmux/internal/agent"
 	"github.com/theforager/cmux/internal/config"
 	"github.com/theforager/cmux/internal/format"
+	"github.com/theforager/cmux/internal/gitx"
 	"github.com/theforager/cmux/internal/home"
 	"github.com/theforager/cmux/internal/queue"
 	"github.com/theforager/cmux/internal/runbook"
@@ -28,6 +29,7 @@ type row struct {
 	status          string
 	group           string
 	updated         string
+	queueRank       int
 	session         string
 	repo            string
 	workspace       string
@@ -231,7 +233,7 @@ func queueRows(fullQueue bool, activeTmux map[string]bool) []row {
 	}
 	displayLimit := limit
 	out := make([]row, 0, len(rows))
-	for _, qr := range rows {
+	for rank, qr := range rows {
 		if !fullQueue && qr.Started {
 			continue
 		}
@@ -243,6 +245,7 @@ func queueRows(fullQueue bool, activeTmux map[string]bool) []row {
 			title:      qr.Issue.Title,
 			status:     string(qr.Status),
 			group:      "Linear",
+			queueRank:  rank,
 			repo:       preset.RepoPath,
 			workspace:  preset.RepoPath,
 			linear:     qr.Issue.URL,
@@ -264,6 +267,7 @@ func queueRows(fullQueue bool, activeTmux map[string]bool) []row {
 			sr.group = "Linear"
 			sr.kind = "queue"
 			sr.queueIssue = qr.Issue.Identifier
+			sr.queueRank = rank
 			sr.workspaceShells = r.workspaceShells
 			sr.updated = format.Age(qr.Session.LastUpdatedAt)
 			if !sr.active {
@@ -281,6 +285,9 @@ func sortRows(rows []row) {
 		gi, gj := groupRank(rows[i].group), groupRank(rows[j].group)
 		if gi != gj {
 			return gi < gj
+		}
+		if rows[i].group == "Linear" && rows[i].queueRank != rows[j].queueRank {
+			return rows[i].queueRank < rows[j].queueRank
 		}
 		return rows[i].updated > rows[j].updated
 	})
@@ -544,6 +551,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 				before := m.mode
+				selectedID := ""
+				if r, ok := m.current(); ok {
+					selectedID = r.id
+				}
 				if err := m.commitAction(); err != nil {
 					m.message = err.Error()
 				} else if m.chosen != "" {
@@ -553,11 +564,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if m.mode == before {
 						m.mode = "browse"
 						m.input = ""
-						rows, err := loadRows(m.fullQueue)
-						if err == nil {
-							m.rows = rows
-							m.applyFilter()
-						}
+						m.reloadRows(selectedID)
 					}
 				}
 			case "backspace", "ctrl+h":
@@ -673,7 +680,12 @@ func (m model) View() string {
 		b.WriteString(dim.Render("  no sessions") + "\n")
 	} else {
 		lastGroup := ""
-		for i, r := range m.filtered {
+		start, end := m.visibleRange()
+		if start > 0 {
+			b.WriteString(dim.Render(fmt.Sprintf("  ↑ %d more", start)) + "\n")
+		}
+		for i := start; i < end; i++ {
+			r := m.filtered[i]
 			if r.group != lastGroup {
 				lastGroup = r.group
 				b.WriteString(dim.Render("  "+r.group) + "\n")
@@ -692,6 +704,9 @@ func (m model) View() string {
 			} else {
 				b.WriteString("  " + line + "\n")
 			}
+		}
+		if end < len(m.filtered) {
+			b.WriteString(dim.Render(fmt.Sprintf("  ↓ %d more", len(m.filtered)-end)) + "\n")
 		}
 	}
 	b.WriteString("\n" + dim.Render("── preview ─────────────────────────────────────────") + "\n")
@@ -719,6 +734,34 @@ func (m model) View() string {
 		b.WriteString(renderMessage(m.message))
 	}
 	return b.String()
+}
+
+func (m model) visibleRange() (int, int) {
+	total := len(m.filtered)
+	if total == 0 {
+		return 0, 0
+	}
+	available := m.height - previewHeight(m.height) - 8
+	if m.message != "" {
+		available--
+	}
+	if available < 5 {
+		available = 5
+	}
+	if available > total {
+		available = total
+	}
+	if m.selected < available {
+		return 0, available
+	}
+	start := m.selected - available/2
+	if start+available > total {
+		start = total - available
+	}
+	if start < 0 {
+		start = 0
+	}
+	return start, start + available
 }
 
 func (m model) current() (row, bool) {
@@ -999,6 +1042,12 @@ func (m *model) commitAction() error {
 		if !info.IsDir() {
 			return fmt.Errorf("repository path is not a directory: %s", abs)
 		}
+		if _, err := gitx.Root(abs); err != nil {
+			return fmt.Errorf("not a git repository: %s; choose a repo for Linear work or use Scratch session for non-git folders", abs)
+		}
+		if err := config.RememberRepo(abs); err != nil {
+			return err
+		}
 		m.createRepo = abs
 		m.mode = "agentPick"
 		m.agentSelected = 0
@@ -1022,11 +1071,15 @@ func (m *model) commitAction() error {
 		}
 		return err
 	case "title":
-		if !hasRow || !r.active {
-			return fmt.Errorf("no active session selected")
+		if !hasRow || value == "" {
+			return fmt.Errorf("no session selected")
 		}
-		if err := tmux.SetTitle(r.session, value); err != nil {
-			return err
+		if r.active {
+			if err := tmux.SetTitle(r.session, value); err != nil {
+				return err
+			}
+		} else if !isAgentRow(r) {
+			return fmt.Errorf("session is not running")
 		}
 		if isAgentRow(r) && value != "" {
 			_, _ = state.Update(r.id, func(s types.AgentSession) types.AgentSession {
@@ -1046,6 +1099,14 @@ func (m *model) commitAction() error {
 			return agent.Delete(r.id)
 		}
 		return tmux.Kill(r.session)
+	case "close":
+		if !hasRow || !isAgentRow(r) {
+			return fmt.Errorf("select a structured agent session")
+		}
+		if strings.ToLower(value) != "y" {
+			return nil
+		}
+		return agent.Close(r.id)
 	case "cleanup":
 		if !hasRow || !isAgentRow(r) {
 			return fmt.Errorf("select a structured agent session")
@@ -1080,6 +1141,12 @@ func (m *model) commitAction() error {
 			return fmt.Errorf("select a structured agent session")
 		}
 		_, err := agent.MarkNeedsReview(r.id, value)
+		return err
+	case "doneSummary":
+		if !hasRow || !isAgentRow(r) {
+			return fmt.Errorf("select a structured agent session")
+		}
+		_, err := agent.Complete(r.id, value)
 		return err
 	case "abandonSummary":
 		if !hasRow || !isAgentRow(r) {
@@ -1208,6 +1275,28 @@ func (m *model) afterCreate() {
 	}
 }
 
+func (m *model) reloadRows(selectID string) {
+	rows, err := loadRows(m.fullQueue)
+	if err != nil {
+		m.message = err.Error()
+		return
+	}
+	m.rows = rows
+	m.applyFilter()
+	if selectID != "" {
+		m.selectRow(selectID)
+	}
+}
+
+func (m *model) selectRow(id string) {
+	for i, row := range m.filtered {
+		if row.id == id || row.queueIssue == id {
+			m.selected = i
+			return
+		}
+	}
+}
+
 func (m model) agentPicker() string {
 	var b strings.Builder
 	b.WriteString(cyan.Render("agent") + dim.Render("  ↑↓/jk select · enter create · 1-3 shortcut · esc cancel") + "\n")
@@ -1230,7 +1319,13 @@ func (m model) actionMenu() string {
 	choices := actionsFor(r, m.fullQueue)
 	var b strings.Builder
 	b.WriteString(cyan.Render("actions") + dim.Render("  "+r.id+" · ↑↓/jk select · enter run · esc cancel") + "\n")
+	lastSection := ""
 	for i, choice := range choices {
+		section := actionSection(choice.id)
+		if section != "" && section != lastSection {
+			lastSection = section
+			b.WriteString(dim.Render("  "+section) + "\n")
+		}
 		line := fmt.Sprintf("%-22s %s", choice.label, dim.Render(choice.description))
 		if i == m.actionSelected {
 			b.WriteString(green.Render("▌ "+line) + "\n")
@@ -1241,6 +1336,27 @@ func (m model) actionMenu() string {
 		}
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+func actionSection(id string) string {
+	switch id {
+	case "open", "restart", "workspace", "workspaceNew":
+		return "Open"
+	case "startQueue", "startScope", "startSelected":
+		return "Start"
+	case "markScoped", "needsReview", "done", "abandon":
+		return "Workflow"
+	case "detail", "path", "status":
+		return "Inspect"
+	case "title", "rename":
+		return "Name"
+	case "close":
+		return "Cleanup"
+	case "delete", "cleanup", "reset":
+		return "Advanced"
+	default:
+		return ""
+	}
 }
 
 func (m model) newMenu() string {
@@ -1335,11 +1451,13 @@ func (m model) prompt() string {
 	case "agentCustom":
 		return renderPromptInput("agent command", m.input) + dim.Render("enter create · esc cancel")
 	case "rename":
-		return renderPromptInput("rename", m.input) + dim.Render("enter save · esc cancel")
+		return renderPromptInput("session name", m.input) + dim.Render("enter save · esc cancel")
 	case "title":
-		return renderPromptInput("title", m.input) + dim.Render("enter save · esc cancel")
+		return renderPromptInput("display name", m.input) + dim.Render("enter save · esc cancel")
 	case "delete":
-		return red.Render("delete cmux session only? type y then enter  ") + dim.Render("worktree and branch are kept · esc cancel")
+		return red.Render("forget session? type y then enter  ") + dim.Render("agent stops; worktree and branch are kept · esc cancel")
+	case "close":
+		return red.Render("close session? type y then enter  ") + dim.Render("clean cmux worktree is removed; dirty workspaces are refused · esc cancel")
 	case "cleanup":
 		return red.Render("cleanup worktree? type y if clean, or type session id to force  ") + dim.Render("dirty worktrees are refused unless forced · esc cancel")
 	case "reset":
@@ -1367,6 +1485,8 @@ func (m model) prompt() string {
 		return renderPromptInput("scope summary", m.input) + dim.Render("moves Linear to ready state · esc cancel")
 	case "needsReviewSummary":
 		return renderPromptInput("review summary", m.input) + dim.Render("adds needs-review in Linear · esc cancel")
+	case "doneSummary":
+		return renderPromptInput("completion summary", m.input) + dim.Render("moves Linear issue to Done · esc cancel")
 	case "abandonSummary":
 		return renderPromptInput("abandon summary", m.input) + dim.Render("moves Linear back to original queue state · esc cancel")
 	default:
@@ -1535,6 +1655,12 @@ func (m *model) chooseAction() error {
 		}
 		m.mode = "needsReviewSummary"
 		m.input = r.lastSummary
+	case "done":
+		if !isAgentRow(r) {
+			return fmt.Errorf("select a structured agent session")
+		}
+		m.mode = "doneSummary"
+		m.input = r.lastSummary
 	case "abandon":
 		if !isAgentRow(r) {
 			return fmt.Errorf("select a structured agent session")
@@ -1548,13 +1674,16 @@ func (m *model) chooseAction() error {
 		m.mode = "rename"
 		m.input = tmux.Child(r.session)
 	case "title":
-		if !r.active {
+		if !r.active && !isAgentRow(r) {
 			return fmt.Errorf("session is not running")
 		}
 		m.mode = "title"
 		m.input = r.title
 	case "delete":
 		m.mode = "delete"
+		m.input = ""
+	case "close":
+		m.mode = "close"
 		m.input = ""
 	case "cleanup":
 		m.mode = "cleanup"
@@ -1662,7 +1791,7 @@ func repoChoices(preferred string) []repoChoice {
 	}
 	if cfg, err := config.LoadOrDefault(); err == nil {
 		for _, repo := range cfg.Repos {
-			add(valueOr(repo.Name, filepath.Base(repo.Path)), repo.Path, "configured")
+			add(valueOr(repo.Name, filepath.Base(repo.Path)), repo.Path, "previously used")
 		}
 		add(filepath.Base(cfg.DefaultRepoPath), cfg.DefaultRepoPath, "default")
 	}
@@ -1689,9 +1818,9 @@ func actionsFor(r row, fullQueue bool) []menuChoice {
 	if r.structured {
 		actions := []menuChoice{}
 		if r.active {
-			actions = append(actions, menuChoice{id: "open", label: "Open agent", description: "attach to tmux session"})
+			actions = append(actions, menuChoice{id: "open", label: "Open agent", description: "open session"})
 		} else {
-			actions = append(actions, menuChoice{id: "restart", label: "Restart agent", description: "create tmux session in workspace"})
+			actions = append(actions, menuChoice{id: "restart", label: "Restart agent", description: "start agent again in workspace"})
 		}
 		actions = append(actions, workspaceAction(r))
 		if len(r.workspaceShells) > 0 {
@@ -1702,29 +1831,28 @@ func actionsFor(r row, fullQueue bool) []menuChoice {
 		}
 		if r.linear != "" {
 			actions = append(actions, menuChoice{id: "needsReview", label: "Mark needs review", description: "add Linear needs-review label"})
+			actions = append(actions, menuChoice{id: "done", label: "Mark done", description: "move Linear issue to Done"})
 			actions = append(actions, menuChoice{id: "abandon", label: "Abandon work", description: "move Linear issue back to original queue state", danger: true})
 		}
 		return append(actions,
 			menuChoice{id: "detail", label: "Details", description: "show runbook and output"},
-			menuChoice{id: "status", label: "Set status", description: "update cmux status"},
-			menuChoice{id: "rename", label: "Rename tmux", description: "rename tmux session"},
-			menuChoice{id: "title", label: "Set title", description: "change display title"},
-			menuChoice{id: "delete", label: "Delete cmux session", description: "keep worktree and branch", danger: true},
-			menuChoice{id: "cleanup", label: "Cleanup worktree", description: "remove clean worktree", danger: true},
+			menuChoice{id: "status", label: "Set status", description: "advanced status override"},
+			menuChoice{id: "title", label: "Rename session", description: "change display name"},
+			menuChoice{id: "close", label: "Close session", description: closeDescription(r), danger: true},
+			menuChoice{id: "delete", label: "Forget session", description: "stop agent and keep workspace", danger: true},
 			menuChoice{id: "reset", label: "Reset workspace", description: "git reset --hard and clean", danger: true},
 		)
 	}
 	actions := []menuChoice{}
 	if r.active {
-		actions = append(actions, menuChoice{id: "open", label: "Open session", description: "attach to tmux session"})
+		actions = append(actions, menuChoice{id: "open", label: "Open session", description: "open unmanaged session"})
 	}
 	if r.workspace != "" {
 		actions = append(actions, menuChoice{id: "workspace", label: "Workspace terminal", description: "open shell in path"})
 	}
 	return append(actions,
-		menuChoice{id: "rename", label: "Rename tmux", description: "rename tmux session"},
-		menuChoice{id: "title", label: "Set title", description: "change display title"},
-		menuChoice{id: "delete", label: "Kill session", description: "kill tmux session", danger: true},
+		menuChoice{id: "rename", label: "Rename session", description: "change session name"},
+		menuChoice{id: "delete", label: "Kill session", description: "close unmanaged session", danger: true},
 	)
 }
 
@@ -1733,6 +1861,13 @@ func workspaceAction(r row) menuChoice {
 		return menuChoice{id: "workspace", label: "Open workspace terminal", description: "open attached terminal"}
 	}
 	return menuChoice{id: "workspace", label: "New workspace terminal", description: "create attached terminal"}
+}
+
+func closeDescription(r row) string {
+	if r.workspace != "" && r.repo != "" && r.workspace != r.repo {
+		return "remove clean worktree and hide session"
+	}
+	return "stop agent and hide session"
 }
 
 func newChoices() []menuChoice {
@@ -1943,7 +2078,7 @@ func nonEmpty(values []string) []string {
 
 func detailItems(r row) [][2]string {
 	values := [][2]string{
-		{"tmux", r.session},
+		{"session", r.session},
 		{"agent", r.agent},
 		{"phase", r.phase},
 		{"branch", valueOr(r.branch, "current")},

@@ -541,6 +541,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
+			if isConfirmMode(m.mode) {
+				switch key {
+				case "esc", "backspace", "ctrl+h", "n", "N":
+					m.mode = "browse"
+					m.input = ""
+				case "enter", "y", "Y":
+					selectedID := ""
+					if r, ok := m.current(); ok {
+						selectedID = r.id
+					}
+					if err := m.commitAction(); err != nil {
+						m.message = err.Error()
+					} else {
+						m.message = ""
+						m.mode = "browse"
+						m.input = ""
+						m.reloadRows(selectedID)
+					}
+				}
+				return m, nil
+			}
 			switch key {
 			case "esc":
 				m.mode = "browse"
@@ -1092,9 +1113,6 @@ func (m *model) commitAction() error {
 		if !hasRow {
 			return fmt.Errorf("no session selected")
 		}
-		if strings.ToLower(value) != "y" {
-			return nil
-		}
 		if isAgentRow(r) {
 			return agent.Delete(r.id)
 		}
@@ -1102,9 +1120,6 @@ func (m *model) commitAction() error {
 	case "close":
 		if !hasRow || !isAgentRow(r) {
 			return fmt.Errorf("select a structured agent session")
-		}
-		if strings.ToLower(value) != "y" {
-			return nil
 		}
 		return agent.Close(r.id)
 	case "cleanup":
@@ -1455,9 +1470,9 @@ func (m model) prompt() string {
 	case "title":
 		return renderPromptInput("display name", m.input) + dim.Render("enter save · esc cancel")
 	case "delete":
-		return red.Render("forget session? type y then enter  ") + dim.Render("agent stops; worktree and branch are kept · esc cancel")
+		return m.confirmPrompt("Forget session", []string{"Stop the agent session.", "Keep the workspace and branch."})
 	case "close":
-		return red.Render("close session? type y then enter  ") + dim.Render("clean cmux worktree is removed; dirty workspaces are refused · esc cancel")
+		return m.confirmPrompt("Close session", []string{"Stop the agent session.", "Remove a clean cmux-owned worktree.", "Refuse if the workspace has uncommitted changes."})
 	case "cleanup":
 		return red.Render("cleanup worktree? type y if clean, or type session id to force  ") + dim.Render("dirty worktrees are refused unless forced · esc cancel")
 	case "reset":
@@ -1496,6 +1511,30 @@ func (m model) prompt() string {
 
 func renderPromptInput(label, value string) string {
 	return cyan.Render(label+"  "+value) + cyan.Render("▌  ")
+}
+
+func (m model) confirmPrompt(title string, lines []string) string {
+	r, ok := m.current()
+	target := ""
+	if ok {
+		target = "  " + dim.Render(r.id)
+	}
+	var b strings.Builder
+	b.WriteString(red.Render(title) + target + "\n")
+	for _, line := range lines {
+		b.WriteString("  " + line + "\n")
+	}
+	b.WriteString(dim.Render("enter/y confirm · esc/n cancel"))
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func isConfirmMode(mode string) bool {
+	switch mode {
+	case "delete", "close":
+		return true
+	default:
+		return false
+	}
 }
 
 func (m *model) move(delta int) {

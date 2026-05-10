@@ -190,15 +190,34 @@ Every structured session has a local runbook:
 ~/.cmux/sessions/<session-id>/RUNBOOK.md
 ```
 
-The runbook is local durable context for the agent: current state, decisions,
-blockers, tests, and next steps. It should contain technical context, not a
-mirror of Linear status.
+The runbook is local durable context for the agent. Implementation sessions keep
+it lean: current state, decisions, tests, next action, and review notes. It
+should contain technical context, not a mirror of Linear status.
 
 For scoping sessions, the runbook becomes the handoff. When `Mark scoped` or
 `cmux agent scoped` runs, cmux reads the useful runbook sections and writes a
 replaceable `cmux scoped handoff` block into the Linear issue description. That
 lets the next coding agent start from Linear alone, even if the scoping tmux
 session is gone.
+
+Scoping runbooks use a handoff-focused shape:
+
+```text
+Goal
+Current understanding
+Key decisions
+Proposed plan
+Acceptance criteria
+Open questions / risks
+User confirmation
+Next coding steps
+```
+
+Before a scoping session can be marked scoped, the runbook must record user
+confirmation. The agent should walk through key decisions, open questions, and
+the proposed plan with the user, then record the approval under
+`## User confirmation`. This is separate from merely approving the command to
+run.
 
 The Linear scoped handoff preserves markdown and skips local/status-only
 placeholders such as `- None.`.

@@ -256,6 +256,9 @@ func MarkNeedsReview(id string, summary string) (types.AgentSession, error) {
 }
 
 func MarkScoped(id string, summary string) (types.AgentSession, error) {
+	if err := runbook.ValidateScopedHandoff(id); err != nil {
+		return types.AgentSession{}, err
+	}
 	s, err := state.Update(id, func(s types.AgentSession) types.AgentSession {
 		s.Status = types.StatusDone
 		s.LastSummary = summary
@@ -370,9 +373,6 @@ func ensureCleanWorkspace(s types.AgentSession) error {
 	return nil
 }
 
-const scopedStartMarker = "<!-- cmux:scoped:start -->"
-const scopedEndMarker = "<!-- cmux:scoped:end -->"
-
 func updateScopedDescription(s types.AgentSession, summary string) error {
 	if s.Linear.IssueID == "" {
 		return nil
@@ -381,51 +381,13 @@ func updateScopedDescription(s types.AgentSession, summary string) error {
 	if err != nil {
 		return err
 	}
-	block := scopedDescriptionBlock(s, summary, runbook.ReadSections(s.ID))
+	block := runbook.ScopedHandoff(s.ID, summary)
 	if block == "" {
 		return nil
 	}
-	description := replaceScopedBlock(issue.Description, block)
+	description := runbook.ReplaceScopedHandoff(issue.Description, block)
 	_, err = linear.UpdateIssueWithOptions(s.Linear.IssueID, "", nil, linear.IssueUpdateOptions{Description: &description})
 	return err
-}
-
-func scopedDescriptionBlock(s types.AgentSession, summary string, sections []runbook.Section) string {
-	lines := []string{"## cmux scoped handoff"}
-	add := func(label, value string) {
-		value = runbook.CleanBlock(value)
-		if value != "" {
-			lines = append(lines, "", "### "+label, value)
-		}
-	}
-	add("Summary", summary)
-	for _, section := range sections {
-		heading := strings.TrimSpace(section.Heading)
-		if strings.EqualFold(heading, "Goal") || strings.EqualFold(heading, "Review summary") {
-			continue
-		}
-		add(heading, section.Body)
-	}
-	if len(lines) == 1 {
-		return ""
-	}
-	return strings.Join(lines, "\n")
-}
-
-func replaceScopedBlock(description, block string) string {
-	wrapped := scopedStartMarker + "\n" + block + "\n" + scopedEndMarker
-	description = strings.TrimSpace(description)
-	start := strings.Index(description, scopedStartMarker)
-	end := strings.Index(description, scopedEndMarker)
-	if start >= 0 && end >= start {
-		end += len(scopedEndMarker)
-		next := strings.TrimSpace(description[:start] + wrapped + description[end:])
-		return next
-	}
-	if description == "" {
-		return wrapped
-	}
-	return description + "\n\n" + wrapped
 }
 
 func Restart(id string) (types.AgentSession, error) {
@@ -567,7 +529,7 @@ func ensureRunbook(s types.AgentSession, issue types.LinearIssue) error {
 		if issue.Identifier != "" {
 			goal = issue.Identifier + ": " + issue.Title
 		}
-		content := "# Agent Runbook\n\n## Goal\n" + goal + "\n\n## Current state\n- Not started.\n\n## Decisions made\n- None.\n\n## Blockers\n- None.\n\n## Tests run\n- Not run.\n\n## Next action\n- Pick the first concrete implementation step.\n\n## Review summary\n- Not ready.\n"
+		content := runbook.DefaultContent(goal, s.Phase)
 		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 			return err
 		}
@@ -589,7 +551,7 @@ func initialPrompt(s types.AgentSession, issue types.LinearIssue) string {
 	text += "Runbook: " + home.RunbookPath(s.ID) + "\n\n"
 	text += "Runbook rules: keep it short and technical. Do not mirror Linear/cmux status. Replace stale notes only when there is durable context: decisions, files or packages touched, exact tests run, real blockers, or a concrete next engineering step. Prefer 1-2 bullets per changed section and do not paste transcripts.\n\n"
 	if s.Phase == types.PhaseScoping {
-		text += "Mode: scoping. Do not implement code unless the user explicitly asks. Clarify the problem, repo/package, approach, acceptance criteria, risks, and next coding steps.\n\n"
+		text += "Mode: scoping. Do not implement code unless the user explicitly asks. Clarify the problem, repo/package, approach, acceptance criteria, risks, and next coding steps. Before marking scoped, walk the user through key decisions, open questions, and the proposed plan; wait for explicit approval; then record that approval under ## User confirmation in the runbook.\n\n"
 		text += "Requirements:\n- Keep the cmux runbook updated at " + home.RunbookPath(s.ID) + ".\n- When blocked, run: cmux agent status " + s.ID + " blocked \"<reason>\"\n- When the issue is scoped and ready for coding, run: cmux agent scoped " + s.ID + " \"<summary>\"\n"
 	} else {
 		text += "Requirements:\n- Work only in this workspace unless the user explicitly says otherwise.\n- Keep the cmux runbook updated at " + home.RunbookPath(s.ID) + ".\n- When blocked, run: cmux agent status " + s.ID + " blocked \"<reason>\"\n- When ready for human review, run: cmux agent needs-review " + s.ID + " \"<summary>\"\n"

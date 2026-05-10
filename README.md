@@ -25,6 +25,13 @@ cmux
 The CLI subcommands are still available for scripting, but the TUI is the
 primary workflow.
 
+For remote machines, `cmux ssh` opens the remote cmux console in one step:
+
+```bash
+cmux ssh dev@devship
+cmux ssh dev queue
+```
+
 ## Install
 
 ```bash
@@ -83,6 +90,40 @@ When creating work, cmux asks for the agent once:
 ↑↓ / j k       choose agent
 enter          create
 1 / 2 / 3      shortcut to Claude / Codex / Other
+```
+
+## Remote Access
+
+`cmux ssh` piggybacks on your normal SSH access and runs cmux on the remote
+host:
+
+```bash
+cmux ssh user@remote
+cmux ssh user@remote queue
+cmux ssh user@remote agent list
+```
+
+It runs `ssh -t <host> cmux [args...]`, so the remote machine must already have
+cmux installed and available on `PATH`.
+
+Host aliases can be stored in:
+
+```text
+~/.config/cmux/hosts
+```
+
+Format:
+
+```text
+dev=dev@devship
+prod=-p 2222 user@prod.example.com
+```
+
+Then:
+
+```bash
+cmux ssh dev
+cmux ssh prod queue
 ```
 
 ## Linear Worklist
@@ -239,6 +280,7 @@ cmux new [--agent|-a <cmd>] [--title|-t <text>] [--mobile|-m] [--no-attach] [pat
 cmux list
 cmux attach <name>
 cmux switch
+cmux ssh <host|alias> [cmux-args...]
 cmux kill <name>
 cmux title <text>
 cmux info

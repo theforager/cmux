@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/theforager/cmux/internal/agent"
 	"github.com/theforager/cmux/internal/config"
@@ -42,7 +44,7 @@ func rootCmd() *cobra.Command {
 		},
 	}
 	cmd.Version = version
-	cmd.AddCommand(newCmd(), listCmd(), attachCmd(), switchCmd(), killCmd(), titleCmd(), infoCmd(), debugCmd(), agentCmd(), queueCmd(), doctorCmd())
+	cmd.AddCommand(newCmd(), listCmd(), attachCmd(), switchCmd(), killCmd(), titleCmd(), infoCmd(), sshCmd(), debugCmd(), agentCmd(), queueCmd(), doctorCmd())
 	return cmd
 }
 
@@ -199,6 +201,28 @@ func infoCmd() *cobra.Command {
 				}
 			}
 			return nil
+		},
+	}
+}
+
+func sshCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:                "ssh <host|alias> [cmux-args...]",
+		Short:              "SSH to a remote host and run cmux",
+		Args:               cobra.MinimumNArgs(1),
+		DisableFlagParsing: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			hostArgs, err := resolveSSHHost(args[0])
+			if err != nil {
+				return err
+			}
+			sshArgs := append([]string{"ssh", "-t"}, hostArgs...)
+			sshArgs = append(sshArgs, append([]string{"cmux"}, args[1:]...)...)
+			path, err := exec.LookPath("ssh")
+			if err != nil {
+				return err
+			}
+			return syscall.Exec(path, sshArgs, os.Environ())
 		},
 	}
 }
@@ -687,6 +711,43 @@ func joinArgs(args []string) string {
 		out += arg
 	}
 	return out
+}
+
+func resolveSSHHost(target string) ([]string, error) {
+	if strings.TrimSpace(target) == "" {
+		return nil, fmt.Errorf("ssh host is required")
+	}
+	hostsPath := filepath.Join(configHome(), "cmux", "hosts")
+	b, err := os.ReadFile(hostsPath)
+	if err == nil {
+		prefix := target + "="
+		for _, line := range strings.Split(string(b), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			if strings.HasPrefix(line, prefix) {
+				return strings.Fields(strings.TrimSpace(strings.TrimPrefix(line, prefix))), nil
+			}
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	return []string{target}, nil
+}
+
+func configHome() string {
+	if value := os.Getenv("XDG_CONFIG_HOME"); strings.TrimSpace(value) != "" {
+		return value
+	}
+	return filepath.Join(homePath(), ".config")
+}
+
+func homePath() string {
+	if value := os.Getenv("HOME"); strings.TrimSpace(value) != "" {
+		return value
+	}
+	return "."
 }
 
 func valueOr(value, fallback string) string {

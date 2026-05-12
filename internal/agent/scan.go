@@ -34,6 +34,9 @@ func Scan() (ScanResult, error) {
 	for _, s := range sessions {
 		result.Scanned++
 		next := scanSession(s, time.Now())
+		if next.Status != s.Status || next.LastSummary != s.LastSummary {
+			next.LastUpdatedAt = format.Now()
+		}
 		if next.Status != s.Status || next.Runtime != s.Runtime || next.LastSummary != s.LastSummary {
 			result.Updated++
 			switch next.Status {
@@ -78,7 +81,6 @@ func scanSession(s types.AgentSession, now time.Time) types.AgentSession {
 	s.Runtime = runtime
 	s.Status = ClassifyRuntimeStatus(s.Status, runtime, now)
 	s.NeedsHuman = s.Status == types.StatusBlocked || s.Status == types.StatusTestsFailed || s.Status == types.StatusReadyForReview || s.Status == types.StatusWaiting || s.Status == types.StatusCrashed
-	s.LastUpdatedAt = format.Now()
 	return s
 }
 

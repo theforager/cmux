@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/theforager/cmux/internal/agent"
 	"github.com/theforager/cmux/internal/config"
@@ -29,6 +30,7 @@ type row struct {
 	status          string
 	group           string
 	updated         string
+	updatedAt       time.Time
 	queueRank       int
 	session         string
 	repo            string
@@ -269,7 +271,6 @@ func queueRows(fullQueue bool, activeTmux map[string]bool) []row {
 			sr.queueIssue = qr.Issue.Identifier
 			sr.queueRank = rank
 			sr.workspaceShells = r.workspaceShells
-			sr.updated = format.Age(qr.Session.LastUpdatedAt)
 			if !sr.active {
 				sr.status = "not-running"
 			}
@@ -289,7 +290,7 @@ func sortRows(rows []row) {
 		if rows[i].group == "Linear" && rows[i].queueRank != rows[j].queueRank {
 			return rows[i].queueRank < rows[j].queueRank
 		}
-		return rows[i].updated > rows[j].updated
+		return rows[i].updatedAt.After(rows[j].updatedAt)
 	})
 }
 
@@ -321,6 +322,7 @@ func rawTmuxRow(s tmux.Session) row {
 		status:          status,
 		group:           dashboardGroup(types.AgentStatus(status)),
 		updated:         format.AgeUnix(s.Created),
+		updatedAt:       time.Unix(s.Created, 0),
 		session:         s.Name,
 		workspace:       s.Dir,
 		agent:           valueOr(s.Agent, "shell"),
@@ -348,7 +350,8 @@ func agentRow(s types.AgentSession, active bool) row {
 		title:           s.Title,
 		status:          string(s.Status),
 		group:           dashboardGroup(s.Status),
-		updated:         format.Age(s.LastUpdatedAt),
+		updated:         agentRowAge(s),
+		updatedAt:       agentRowTime(s),
 		session:         s.TmuxSession,
 		repo:            s.RepoPath,
 		workspace:       valueOr(s.WorktreePath, s.RepoPath),
@@ -370,6 +373,29 @@ func agentRow(s types.AgentSession, active bool) row {
 		kind:            "session",
 		structured:      true,
 	}
+}
+
+func agentRowAge(s types.AgentSession) string {
+	t := agentRowTime(s)
+	if t.IsZero() {
+		return "?"
+	}
+	return format.Age(t.UTC().Format(time.RFC3339))
+}
+
+func agentRowTime(s types.AgentSession) time.Time {
+	switch s.Status {
+	case types.StatusRunning, types.StatusIdle, types.StatusWaiting, types.StatusStale, types.StatusCrashed:
+		if s.Runtime.LastActivityAt != "" {
+			if t, err := time.Parse(time.RFC3339, s.Runtime.LastActivityAt); err == nil {
+				return t
+			}
+		}
+	}
+	if t, err := time.Parse(time.RFC3339, s.LastUpdatedAt); err == nil {
+		return t
+	}
+	return time.Time{}
 }
 
 func (m model) Init() tea.Cmd { return nil }

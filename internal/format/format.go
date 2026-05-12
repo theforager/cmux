@@ -47,8 +47,14 @@ func AgeUnix(value int64) string {
 }
 
 func age(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	if d < 10*time.Second {
+		return "now"
+	}
 	if d < time.Minute {
-		return "0m"
+		return plural(int(d.Seconds()), "s")
 	}
 	if d < time.Hour {
 		return plural(int(d.Minutes()), "m")

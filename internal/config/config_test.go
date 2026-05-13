@@ -94,3 +94,36 @@ func TestRememberRepoSavesRepoAndDefault(t *testing.T) {
 		t.Fatalf("RememberRepo duplicated repo: %+v", cfg.Repos)
 	}
 }
+
+func TestRememberEditorSavesCommandAndDefault(t *testing.T) {
+	t.Setenv("CMUX_HOME", t.TempDir())
+	if err := RememberEditor("cursor"); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DefaultEditorCommand != "cursor" {
+		t.Fatalf("DefaultEditorCommand = %q, want cursor", cfg.DefaultEditorCommand)
+	}
+	if len(cfg.EditorCommands) != 1 || cfg.EditorCommands[0] != "cursor" {
+		t.Fatalf("EditorCommands = %+v, want cursor", cfg.EditorCommands)
+	}
+	if err := RememberEditor("cursor"); err != nil {
+		t.Fatal(err)
+	}
+	if err := RememberEditor("code"); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DefaultEditorCommand != "code" {
+		t.Fatalf("DefaultEditorCommand = %q, want code", cfg.DefaultEditorCommand)
+	}
+	if len(cfg.EditorCommands) != 2 || cfg.EditorCommands[0] != "code" || cfg.EditorCommands[1] != "cursor" {
+		t.Fatalf("EditorCommands = %+v, want code/cursor without duplicates", cfg.EditorCommands)
+	}
+}

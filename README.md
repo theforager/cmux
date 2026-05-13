@@ -58,7 +58,8 @@ go build -o ./cmux-dev ./cmd/cmux
 4. Start one Linear issue, start a scoping session, or select up to 3 issues for
    a capped batch start.
 5. Use `.` on a session for actions such as open, workspace terminal, mark
-   scoped, mark needs review, mark done, close session, or reset workspace.
+   scoped, mark needs review, mark done, open in editor, close session, or
+   reset workspace.
 
 The main dashboard shows only a bounded Linear section. The full Linear
 worklist lives behind `tab` or `cmux queue`.
@@ -166,6 +167,10 @@ Common actions:
 
 - `Open agent`: attach to the agent session.
 - `Workspace terminal`: open an attached shell in the workspace.
+- `Open in editor`: open the workspace with Cursor, VS Code, Zed, or a custom
+  command. Chosen commands are remembered for the next editor picker. The
+  command runs where cmux is running, so under `cmux ssh` it runs on the remote
+  host.
 - `Mark scoped`: finish a scoping session and move the Linear issue to the ready
   state.
 - `Mark needs review`: add the Linear `needs-review` label and put the session
@@ -273,6 +278,8 @@ Important fields:
 
 - `defaultAgent`: default agent command when one is not chosen.
 - `repos`: remembered repositories for the repo picker.
+- `defaultEditorCommand`: first editor command shown in the editor picker.
+- `editorCommands`: remembered editor commands and executable paths.
 - `queuePresets`: saved Linear worklist presets.
 - `linear.workflow.transitions`: Linear lifecycle mapping for start, scoped,
   review, done, and abandon actions.

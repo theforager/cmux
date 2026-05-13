@@ -3,11 +3,13 @@ package tui
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/theforager/cmux/internal/agent"
 	"github.com/theforager/cmux/internal/config"
@@ -62,6 +64,7 @@ type model struct {
 	selected       int
 	agentSelected  int
 	repoSelected   int
+	editorSelected int
 	actionSelected int
 	newSelected    int
 	filter         string
@@ -99,6 +102,13 @@ type menuChoice struct {
 	label       string
 	description string
 	danger      bool
+}
+
+type editorChoice struct {
+	label       string
+	command     string
+	description string
+	custom      bool
 }
 
 var (
@@ -562,6 +572,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.moveRepo(1)
 				case "enter":
 					if err := m.chooseRepo(); err != nil {
+						m.message = err.Error()
+					}
+				}
+				return m, nil
+			}
+			if m.mode == "editorPick" {
+				switch key {
+				case "esc":
+					m.mode = "browse"
+					m.input = ""
+					m.message = ""
+				case "up", "k":
+					m.moveEditor(-1)
+				case "down", "j", "tab":
+					m.moveEditor(1)
+				case "enter":
+					if err := m.chooseEditor(); err != nil {
 						m.message = err.Error()
 					}
 				}
@@ -1105,6 +1132,11 @@ func (m *model) commitAction() error {
 			return fmt.Errorf("enter an agent command")
 		}
 		return m.createWithAgent(value)
+	case "editorCustom":
+		if value == "" {
+			return fmt.Errorf("enter an editor command")
+		}
+		return m.openEditor(value)
 	case "rename":
 		if !hasRow || !r.active || value == "" {
 			return fmt.Errorf("no active session selected")
@@ -1381,7 +1413,7 @@ func (m model) actionMenu() string {
 
 func actionSection(id string) string {
 	switch id {
-	case "open", "restart", "workspace", "workspaceNew":
+	case "open", "restart", "workspace", "workspaceNew", "editor":
 		return "Open"
 	case "startQueue", "startScope", "startSelected":
 		return "Start"
@@ -1426,6 +1458,25 @@ func (m model) repoPicker() string {
 		}
 		line := fmt.Sprintf("%-18s %s", choice.label, dim.Render(desc))
 		if i == m.repoSelected {
+			b.WriteString(green.Render("▌ "+line) + "\n")
+		} else {
+			b.WriteString("  " + line + "\n")
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func (m model) editorPicker() string {
+	choices := editorChoices()
+	var b strings.Builder
+	b.WriteString(cyan.Render("editor") + dim.Render("  ↑↓/jk select · enter open · esc cancel") + "\n")
+	for i, choice := range choices {
+		command := choice.command
+		if command == "" {
+			command = "type command"
+		}
+		line := fmt.Sprintf("%-12s %-16s %s", choice.label, command, dim.Render(choice.description))
+		if i == m.editorSelected {
 			b.WriteString(green.Render("▌ "+line) + "\n")
 		} else {
 			b.WriteString("  " + line + "\n")
@@ -1489,6 +1540,10 @@ func (m model) prompt() string {
 		return m.repoPicker()
 	case "repoPath":
 		return renderPromptInput("repo path", m.input) + dim.Render("queue worktrees will be created from this repo")
+	case "editorPick":
+		return m.editorPicker()
+	case "editorCustom":
+		return renderPromptInput("editor command", m.input) + dim.Render("examples: cursor, code, zed, open -a Cursor")
 	case "agentCustom":
 		return renderPromptInput("agent command", m.input) + dim.Render("enter create · esc cancel")
 	case "rename":
@@ -1606,6 +1661,21 @@ func (m *model) moveRepo(delta int) {
 	}
 }
 
+func (m *model) moveEditor(delta int) {
+	choices := editorChoices()
+	if len(choices) == 0 {
+		m.editorSelected = 0
+		return
+	}
+	m.editorSelected += delta
+	if m.editorSelected < 0 {
+		m.editorSelected = len(choices) - 1
+	}
+	if m.editorSelected >= len(choices) {
+		m.editorSelected = 0
+	}
+}
+
 func (m *model) moveAction(delta int) {
 	r, ok := m.current()
 	if !ok {
@@ -1696,6 +1766,14 @@ func (m *model) chooseAction() error {
 			return err
 		}
 		m.chosen = name
+	case "editor":
+		workspace := valueOr(r.workspace, r.repo)
+		if workspace == "" {
+			return fmt.Errorf("no workspace path recorded")
+		}
+		m.mode = "editorPick"
+		m.editorSelected = 0
+		m.input = ""
 	case "restart":
 		s, err := m.restartCurrent()
 		if err != nil {
@@ -1830,6 +1908,29 @@ func (m *model) chooseRepo() error {
 	return nil
 }
 
+func (m *model) chooseEditor() error {
+	choices := editorChoices()
+	if len(choices) == 0 {
+		m.mode = "editorCustom"
+		m.input = ""
+		return nil
+	}
+	if m.editorSelected < 0 {
+		m.editorSelected = 0
+	}
+	if m.editorSelected >= len(choices) {
+		m.editorSelected = len(choices) - 1
+	}
+	choice := choices[m.editorSelected]
+	if choice.custom {
+		m.mode = "editorCustom"
+		m.input = ""
+		m.message = ""
+		return nil
+	}
+	return m.openEditor(choice.command)
+}
+
 type repoChoice struct {
 	label       string
 	path        string
@@ -1866,6 +1967,48 @@ func repoChoices(preferred string) []repoChoice {
 	return choices
 }
 
+func editorChoices() []editorChoice {
+	choices := []editorChoice{}
+	add := func(label, command, description string) {
+		command = strings.TrimSpace(command)
+		if command == "" {
+			return
+		}
+		for _, choice := range choices {
+			if choice.command == command {
+				return
+			}
+		}
+		choices = append(choices, editorChoice{label: label, command: command, description: description})
+	}
+	if cfg, err := config.LoadOrDefault(); err == nil {
+		add(editorLabel(cfg.DefaultEditorCommand), cfg.DefaultEditorCommand, "default")
+		for _, command := range cfg.EditorCommands {
+			add(editorLabel(command), command, "previously used")
+		}
+	}
+	add("CMUX_EDITOR", os.Getenv("CMUX_EDITOR"), "environment")
+	add("Cursor", "cursor", "open in Cursor")
+	add("VS Code", "code", "open in Visual Studio Code")
+	add("Zed", "zed", "open in Zed")
+	choices = append(choices, editorChoice{label: "Custom", description: "type command or executable path", custom: true})
+	return choices
+}
+
+func editorLabel(command string) string {
+	command = strings.TrimSpace(command)
+	switch filepath.Base(command) {
+	case "cursor":
+		return "Cursor"
+	case "code":
+		return "VS Code"
+	case "zed":
+		return "Zed"
+	default:
+		return format.Trunc(command, 12)
+	}
+}
+
 func actionsFor(r row, fullQueue bool) []menuChoice {
 	if r.kind == "queue" && !r.structured {
 		actions := []menuChoice{
@@ -1888,6 +2031,9 @@ func actionsFor(r row, fullQueue bool) []menuChoice {
 			actions = append(actions, menuChoice{id: "restart", label: "Restart agent", description: "start agent again in workspace"})
 		}
 		actions = append(actions, workspaceAction(r))
+		if r.workspace != "" || r.repo != "" {
+			actions = append(actions, menuChoice{id: "editor", label: "Open in editor", description: "open workspace in Cursor, VS Code, or custom editor"})
+		}
 		if len(r.workspaceShells) > 0 {
 			actions = append(actions, menuChoice{id: "workspaceNew", label: "New workspace terminal", description: "create another attached terminal"})
 		}
@@ -1914,6 +2060,7 @@ func actionsFor(r row, fullQueue bool) []menuChoice {
 	}
 	if r.workspace != "" {
 		actions = append(actions, menuChoice{id: "workspace", label: "Workspace terminal", description: "open shell in path"})
+		actions = append(actions, menuChoice{id: "editor", label: "Open in editor", description: "open path in Cursor, VS Code, or custom editor"})
 	}
 	return append(actions,
 		menuChoice{id: "rename", label: "Rename session", description: "change session name"},
@@ -2025,6 +2172,105 @@ func (m *model) openWorkspaceSession(createNew bool) (string, error) {
 		return "", err
 	}
 	return name, nil
+}
+
+func (m *model) openEditor(command string) error {
+	r, ok := m.current()
+	if !ok {
+		return fmt.Errorf("no session selected")
+	}
+	workspace := valueOr(r.workspace, r.repo)
+	if workspace == "" {
+		return fmt.Errorf("no workspace path recorded")
+	}
+	abs, err := filepath.Abs(workspace)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("workspace is not a directory: %s", abs)
+	}
+	if err := startEditorCommand(command, abs); err != nil {
+		return err
+	}
+	if err := config.RememberEditor(command); err != nil {
+		return err
+	}
+	m.mode = "browse"
+	m.input = ""
+	m.message = "Opened in editor: " + abs
+	return nil
+}
+
+func startEditorCommand(command, path string) error {
+	parts, err := splitEditorCommand(command)
+	if err != nil {
+		return err
+	}
+	if len(parts) == 0 {
+		return fmt.Errorf("enter an editor command")
+	}
+	args := append([]string{}, parts[1:]...)
+	args = append(args, path)
+	cmd := exec.Command(parts[0], args...)
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	return cmd.Process.Release()
+}
+
+func splitEditorCommand(command string) ([]string, error) {
+	var parts []string
+	var current strings.Builder
+	var quote rune
+	escaped := false
+	flush := func() {
+		if current.Len() == 0 {
+			return
+		}
+		parts = append(parts, current.String())
+		current.Reset()
+	}
+	for _, r := range strings.TrimSpace(command) {
+		if escaped {
+			current.WriteRune(r)
+			escaped = false
+			continue
+		}
+		if r == '\\' && quote != '\'' {
+			escaped = true
+			continue
+		}
+		if quote != 0 {
+			if r == quote {
+				quote = 0
+			} else {
+				current.WriteRune(r)
+			}
+			continue
+		}
+		if r == '\'' || r == '"' {
+			quote = r
+			continue
+		}
+		if unicode.IsSpace(r) {
+			flush()
+			continue
+		}
+		current.WriteRune(r)
+	}
+	if escaped {
+		current.WriteRune('\\')
+	}
+	if quote != 0 {
+		return nil, fmt.Errorf("unterminated quote in editor command")
+	}
+	flush()
+	return parts, nil
 }
 
 func (m *model) restartCurrent() (types.AgentSession, error) {
@@ -2184,7 +2430,7 @@ func cleanDetail(value string) string {
 }
 
 func renderMessage(message string) string {
-	if strings.HasPrefix(message, "Workspace:") {
+	if strings.HasPrefix(message, "Workspace:") || strings.HasPrefix(message, "Opened in editor:") {
 		return cyan.Render(message)
 	}
 	return red.Render("Error: " + message)

@@ -149,10 +149,12 @@ type LinearConfig struct {
 }
 
 type Config struct {
-	DefaultAgent       string        `json:"defaultAgent,omitempty"`
-	DefaultRepoPath    string        `json:"defaultRepoPath,omitempty"`
-	Repos              []RepoConfig  `json:"repos,omitempty"`
-	QueuePresets       []QueuePreset `json:"queuePresets,omitempty"`
-	DefaultQueuePreset string        `json:"defaultQueuePreset,omitempty"`
-	Linear             LinearConfig  `json:"linear,omitempty"`
+	DefaultAgent         string        `json:"defaultAgent,omitempty"`
+	DefaultRepoPath      string        `json:"defaultRepoPath,omitempty"`
+	DefaultEditorCommand string        `json:"defaultEditorCommand,omitempty"`
+	Repos                []RepoConfig  `json:"repos,omitempty"`
+	EditorCommands       []string      `json:"editorCommands,omitempty"`
+	QueuePresets         []QueuePreset `json:"queuePresets,omitempty"`
+	DefaultQueuePreset   string        `json:"defaultQueuePreset,omitempty"`
+	Linear               LinearConfig  `json:"linear,omitempty"`
 }

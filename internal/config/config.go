@@ -91,6 +91,7 @@ func LoadOrDefault() (types.Config, error) {
 
 func Save(cfg types.Config) error {
 	cfg = normalizeRepos(cfg)
+	cfg = normalizeEditors(cfg)
 	if err := os.MkdirAll(home.Dir(), 0o755); err != nil {
 		return err
 	}
@@ -135,6 +136,20 @@ func RememberRepo(path string) error {
 	return Save(cfg)
 }
 
+func RememberEditor(command string) error {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return nil
+	}
+	cfg, err := Load()
+	if err != nil {
+		return err
+	}
+	cfg.DefaultEditorCommand = command
+	cfg.EditorCommands = append(cfg.EditorCommands, command)
+	return Save(cfg)
+}
+
 func normalizeRepos(cfg types.Config) types.Config {
 	seen := map[string]bool{}
 	repos := []types.RepoConfig{}
@@ -151,6 +166,26 @@ func normalizeRepos(cfg types.Config) types.Config {
 		repos = append(repos, repo)
 	}
 	cfg.Repos = repos
+	return cfg
+}
+
+func normalizeEditors(cfg types.Config) types.Config {
+	seen := map[string]bool{}
+	commands := []string{}
+	cfg.DefaultEditorCommand = strings.TrimSpace(cfg.DefaultEditorCommand)
+	add := func(command string) {
+		command = strings.TrimSpace(command)
+		if command == "" || seen[command] {
+			return
+		}
+		seen[command] = true
+		commands = append(commands, command)
+	}
+	add(cfg.DefaultEditorCommand)
+	for _, command := range cfg.EditorCommands {
+		add(command)
+	}
+	cfg.EditorCommands = commands
 	return cfg
 }
 

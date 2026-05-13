@@ -212,6 +212,7 @@ func sshCmd() *cobra.Command {
 		Args:               cobra.MinimumNArgs(1),
 		DisableFlagParsing: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			_ = tmux.EnsureKeyOptions()
 			hostArgs, err := resolveSSHHost(args[0])
 			if err != nil {
 				return err

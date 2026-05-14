@@ -52,7 +52,7 @@ go build -o ./cmux-dev ./cmd/cmux
 ## Daily Workflow
 
 1. Run `cmux`.
-2. Triage active sessions first: needs attention, active work, review, stale,
+2. Triage active sessions first: needs attention, active work, review,
    done/other.
 3. Use `tab` to open the full Linear worklist.
 4. Start one Linear issue, start a scoping session, or select up to 3 issues for
@@ -237,9 +237,10 @@ placeholders such as `- None.`.
 - recent terminal output
 - git dirty summary
 
-Scan updates conservative runtime statuses such as `crashed`,
-`waiting_for_input`, and `stale`. Manual statuses like blocked, review, done,
-and PR opened are preserved unless the runtime state makes them impossible.
+Scan updates conservative runtime statuses such as `crashed` and
+`waiting_for_input`. Inactivity is shown as an age, not promoted into a status.
+Manual statuses like blocked, review, done, and PR opened are preserved unless
+the runtime state makes them impossible.
 
 ## Storage
 

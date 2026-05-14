@@ -41,11 +41,11 @@ func TestClassifyRuntimeStatusWaitingPrompt(t *testing.T) {
 	}
 }
 
-func TestClassifyRuntimeStatusStale(t *testing.T) {
+func TestClassifyRuntimeStatusDoesNotMarkStaleForInactivity(t *testing.T) {
 	now := time.Date(2026, 5, 3, 12, 0, 0, 0, time.UTC)
-	last := now.Add(-7 * time.Hour).Format(time.RFC3339)
+	last := now.Add(-48 * time.Hour).Format(time.RFC3339)
 	status := ClassifyRuntimeStatus(types.StatusRunning, types.RuntimeData{TmuxAlive: true, LastActivityAt: last, CurrentCommand: "claude"}, now)
-	if status != types.StatusStale {
-		t.Fatalf("status = %s, want %s", status, types.StatusStale)
+	if status != types.StatusRunning {
+		t.Fatalf("status = %s, want %s", status, types.StatusRunning)
 	}
 }

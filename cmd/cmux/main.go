@@ -380,7 +380,7 @@ func agentScanCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Printf("scanned=%d updated=%d crashed=%d waiting=%d stale=%d\n", result.Scanned, result.Updated, result.Crashed, result.Waiting, result.Stale)
+			fmt.Printf("scanned=%d updated=%d crashed=%d waiting=%d\n", result.Scanned, result.Updated, result.Crashed, result.Waiting)
 			return nil
 		},
 	}

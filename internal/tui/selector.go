@@ -314,12 +314,10 @@ func groupRank(group string) int {
 		return 2
 	case "Linear":
 		return 3
-	case "Stale":
-		return 4
 	case "Done/Other":
-		return 5
+		return 4
 	default:
-		return 6
+		return 5
 	}
 }
 
@@ -505,10 +503,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.mode = "statusSummary"
 					m.input = ""
 				case "8":
-					m.pending = types.StatusStale
-					m.mode = "statusSummary"
-					m.input = ""
-				case "9":
 					m.pending = types.StatusCrashed
 					m.mode = "statusSummary"
 					m.input = ""
@@ -1571,9 +1565,8 @@ func (m model) prompt() string {
 			"  5 ready_for_review",
 			"  6 pr_opened",
 			"  7 done",
-			"  8 stale",
-			"  9 crashed",
-			dim.Render("press 1-9 · esc cancel"),
+			"  8 crashed",
+			dim.Render("press 1-8 · esc cancel"),
 		}, "\n")
 	case "statusSummary":
 		return renderPromptInput("summary for "+string(m.pending), m.input) + dim.Render("enter save · esc cancel")
@@ -2358,8 +2351,6 @@ func dashboardGroup(status types.AgentStatus) string {
 		return "Active"
 	case types.StatusReadyForReview, types.StatusPROpened:
 		return "Ready for review"
-	case types.StatusStale:
-		return "Stale"
 	default:
 		return "Done/Other"
 	}

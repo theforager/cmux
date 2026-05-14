@@ -14,7 +14,6 @@ import (
 
 const (
 	waitingAfter = 10 * time.Minute
-	staleAfter   = 6 * time.Hour
 )
 
 type ScanResult struct {
@@ -22,7 +21,6 @@ type ScanResult struct {
 	Updated int
 	Crashed int
 	Waiting int
-	Stale   int
 }
 
 func Scan() (ScanResult, error) {
@@ -44,8 +42,6 @@ func Scan() (ScanResult, error) {
 				result.Crashed++
 			case types.StatusWaiting:
 				result.Waiting++
-			case types.StatusStale:
-				result.Stale++
 			}
 		}
 		if err := state.Write(next); err != nil {
@@ -102,9 +98,6 @@ func ClassifyRuntimeStatus(current types.AgentStatus, runtime types.RuntimeData,
 		return current
 	}
 	idle := now.Sub(lastActivity)
-	if idle >= staleAfter {
-		return types.StatusStale
-	}
 	if idle >= waitingAfter && looksLikePrompt(runtime.CurrentCommand, runtime.Preview) {
 		return types.StatusWaiting
 	}

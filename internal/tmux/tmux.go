@@ -279,7 +279,7 @@ func Capture(session string, lines int) string {
 }
 
 func Inspect(session string) (PaneInfo, error) {
-	out, err := process.Run("tmux", "display-message", "-t", session, "-p", "#{pane_last_activity}|#{pane_dead}|#{pane_dead_status}|#{pane_current_command}")
+	out, err := process.Run("tmux", "display-message", "-t", session, "-p", "#{pane_last_activity}|#{window_activity}|#{session_activity}|#{session_created}|#{pane_dead}|#{pane_dead_status}|#{pane_current_command}")
 	if err != nil {
 		if IsMissingSessionError(err) || strings.Contains(strings.ToLower(err.Error()), "no server running") {
 			return PaneInfo{Alive: false}, nil
@@ -288,17 +288,15 @@ func Inspect(session string) (PaneInfo, error) {
 	}
 	parts := strings.Split(strings.TrimSpace(out), "|")
 	info := PaneInfo{Alive: true}
-	if len(parts) > 0 {
-		info.LastActivityUnix = parseInt64(parts[0])
+	info.LastActivityUnix = firstUnix(parts, 0, 1, 2, 3)
+	if len(parts) > 4 {
+		info.PaneDead = parts[4] == "1"
 	}
-	if len(parts) > 1 {
-		info.PaneDead = parts[1] == "1"
+	if len(parts) > 5 {
+		info.ExitStatus = strings.TrimSpace(parts[5])
 	}
-	if len(parts) > 2 {
-		info.ExitStatus = strings.TrimSpace(parts[2])
-	}
-	if len(parts) > 3 {
-		info.CurrentCommand = strings.TrimSpace(parts[3])
+	if len(parts) > 6 {
+		info.CurrentCommand = strings.TrimSpace(parts[6])
 	}
 	return info, nil
 }
@@ -371,6 +369,18 @@ func parseInt64(v string) int64 {
 		}
 	}
 	return n
+}
+
+func firstUnix(parts []string, indexes ...int) int64 {
+	for _, index := range indexes {
+		if index < 0 || index >= len(parts) {
+			continue
+		}
+		if n := parseInt64(parts[index]); n > 0 {
+			return n
+		}
+	}
+	return 0
 }
 
 func filepathAbs(path string) (string, error) {

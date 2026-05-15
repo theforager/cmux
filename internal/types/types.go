@@ -152,6 +152,7 @@ type Config struct {
 	DefaultAgent         string        `json:"defaultAgent,omitempty"`
 	DefaultRepoPath      string        `json:"defaultRepoPath,omitempty"`
 	DefaultEditorCommand string        `json:"defaultEditorCommand,omitempty"`
+	DefaultSSHTarget     string        `json:"defaultSshTarget,omitempty"`
 	Repos                []RepoConfig  `json:"repos,omitempty"`
 	EditorCommands       []string      `json:"editorCommands,omitempty"`
 	QueuePresets         []QueuePreset `json:"queuePresets,omitempty"`

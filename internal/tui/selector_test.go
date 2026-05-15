@@ -21,3 +21,20 @@ func TestSplitEditorCommandRejectsUnterminatedQuote(t *testing.T) {
 		t.Fatal("expected unterminated quote error")
 	}
 }
+
+func TestRemoteWorkspaceCommand(t *testing.T) {
+	got := remoteWorkspaceCommand("remoteCursor", "devship", "/home/dev/rebar cosmos")
+	want := "cursor --remote ssh-remote+devship '/home/dev/rebar cosmos'"
+	if got != want {
+		t.Fatalf("remoteWorkspaceCommand = %q, want %q", got, want)
+	}
+}
+
+func TestShellQuote(t *testing.T) {
+	if got := shellQuote("/home/dev/rebar-cosmos"); got != "/home/dev/rebar-cosmos" {
+		t.Fatalf("shellQuote safe = %q", got)
+	}
+	if got := shellQuote("/home/dev/rebar cosmos"); got != "'/home/dev/rebar cosmos'" {
+		t.Fatalf("shellQuote spaced = %q", got)
+	}
+}

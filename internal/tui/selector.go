@@ -65,6 +65,8 @@ type model struct {
 	agentSelected  int
 	repoSelected   int
 	editorSelected int
+	workspaceMode  int
+	workspacePick  int
 	actionSelected int
 	newSelected    int
 	filter         string
@@ -72,6 +74,7 @@ type model struct {
 	create         string
 	createRepo     string
 	target         string
+	pendingAction  string
 	pending        types.AgentStatus
 	mode           string
 	message        string
@@ -111,12 +114,29 @@ type editorChoice struct {
 	custom      bool
 }
 
+type workspaceChoice struct {
+	id          string
+	label       string
+	description string
+	disabled    bool
+}
+
+const (
+	workspaceModeTerminal = iota
+	workspaceModeEditor
+	workspaceModeRemote
+)
+
+var workspaceModeNames = []string{"Terminal", "Editor", "Remote"}
+
 var (
-	cyan  = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
-	dim   = lipgloss.NewStyle().Faint(true)
-	green = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
-	red   = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
-	bold  = lipgloss.NewStyle().Bold(true)
+	cyan        = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
+	dim         = lipgloss.NewStyle().Faint(true)
+	green       = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
+	red         = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
+	bold        = lipgloss.NewStyle().Bold(true)
+	activeTab   = lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(lipgloss.Color("6")).Bold(true).Padding(0, 1)
+	inactiveTab = lipgloss.NewStyle().Foreground(lipgloss.Color("6")).Padding(0, 1)
 )
 
 func Run(popup bool) (string, error) {
@@ -447,6 +467,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.moveAction(1)
 				case "enter":
 					if err := m.chooseAction(); err != nil {
+						m.message = err.Error()
+					} else if m.chosen != "" {
+						return m, tea.Quit
+					}
+				}
+				return m, nil
+			}
+			if m.mode == "workspaceOpen" {
+				switch key {
+				case "esc", "backspace", "ctrl+h":
+					m.mode = "actionMenu"
+					m.message = ""
+				case "left":
+					m.moveWorkspaceMode(-1)
+				case "right":
+					m.moveWorkspaceMode(1)
+				case "up", "k":
+					m.moveWorkspaceChoice(-1)
+				case "down", "j", "tab":
+					m.moveWorkspaceChoice(1)
+				case "enter":
+					if err := m.chooseWorkspace(); err != nil {
 						m.message = err.Error()
 					} else if m.chosen != "" {
 						return m, tea.Quit
@@ -1131,6 +1173,22 @@ func (m *model) commitAction() error {
 			return fmt.Errorf("enter an editor command")
 		}
 		return m.openEditor(value)
+	case "sshTarget":
+		if value == "" {
+			return fmt.Errorf("enter an SSH target")
+		}
+		if err := config.RememberSSHTarget(value); err != nil {
+			return err
+		}
+		m.mode = "workspaceOpen"
+		m.input = ""
+		pending := m.pendingAction
+		m.pendingAction = ""
+		if pending == "" || pending == "setSSH" {
+			m.message = "SSH target: " + value
+			return nil
+		}
+		return m.runWorkspaceAction(pending)
 	case "rename":
 		if !hasRow || !r.active || value == "" {
 			return fmt.Errorf("no active session selected")
@@ -1407,7 +1465,7 @@ func (m model) actionMenu() string {
 
 func actionSection(id string) string {
 	switch id {
-	case "open", "restart", "workspace", "workspaceNew", "editor":
+	case "open", "restart", "workspace", "workspaceNew", "editor", "workspaceOpen":
 		return "Open"
 	case "startQueue", "startScope", "startSelected":
 		return "Start"
@@ -1479,6 +1537,51 @@ func (m model) editorPicker() string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
+func (m model) workspaceOpenPanel() string {
+	r, ok := m.current()
+	if !ok {
+		return dim.Render("no row selected")
+	}
+	choices := workspaceChoices(r, m.workspaceMode)
+	selected := m.workspacePick
+	if selected < 0 || selected >= len(choices) {
+		selected = 0
+	}
+	var b strings.Builder
+	b.WriteString(cyan.Render("open workspace") + dim.Render("  "+r.id+" · ←/→ mode · ↑↓/jk select · enter run/show · esc cancel") + "\n")
+	b.WriteString("  " + renderWorkspaceTabs(m.workspaceMode) + "\n")
+	descWidth := m.width - 32
+	if descWidth < 24 {
+		descWidth = 24
+	}
+	for i, choice := range choices {
+		line := fmt.Sprintf("%-22s %s", choice.label, dim.Render(format.Trunc(choice.description, descWidth)))
+		switch {
+		case i == selected && choice.disabled:
+			b.WriteString(red.Render("▌ "+line) + "\n")
+		case i == selected:
+			b.WriteString(green.Render("▌ "+line) + "\n")
+		case choice.disabled:
+			b.WriteString("  " + dim.Render(line) + "\n")
+		default:
+			b.WriteString("  " + line + "\n")
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func renderWorkspaceTabs(selected int) string {
+	tabs := make([]string, 0, len(workspaceModeNames))
+	for i, name := range workspaceModeNames {
+		if i == selected {
+			tabs = append(tabs, activeTab.Render(name))
+		} else {
+			tabs = append(tabs, inactiveTab.Render(name))
+		}
+	}
+	return strings.Join(tabs, " ")
+}
+
 func (m model) detailView() string {
 	r, ok := m.current()
 	if !ok {
@@ -1534,10 +1637,14 @@ func (m model) prompt() string {
 		return m.repoPicker()
 	case "repoPath":
 		return renderPromptInput("repo path", m.input) + dim.Render("queue worktrees will be created from this repo")
+	case "workspaceOpen":
+		return m.workspaceOpenPanel()
 	case "editorPick":
 		return m.editorPicker()
 	case "editorCustom":
 		return renderPromptInput("editor command", m.input) + dim.Render("examples: cursor, code, zed, open -a Cursor")
+	case "sshTarget":
+		return renderPromptInput("ssh target", m.input) + dim.Render("saved for remote workspace commands · enter continue · esc cancel")
 	case "agentCustom":
 		return renderPromptInput("agent command", m.input) + dim.Render("enter create · esc cancel")
 	case "rename":
@@ -1669,6 +1776,38 @@ func (m *model) moveEditor(delta int) {
 	}
 }
 
+func (m *model) moveWorkspaceMode(delta int) {
+	m.workspaceMode += delta
+	if m.workspaceMode < 0 {
+		m.workspaceMode = len(workspaceModeNames) - 1
+	}
+	if m.workspaceMode >= len(workspaceModeNames) {
+		m.workspaceMode = 0
+	}
+	m.workspacePick = 0
+	m.message = ""
+}
+
+func (m *model) moveWorkspaceChoice(delta int) {
+	r, ok := m.current()
+	if !ok {
+		m.workspacePick = 0
+		return
+	}
+	choices := workspaceChoices(r, m.workspaceMode)
+	if len(choices) == 0 {
+		m.workspacePick = 0
+		return
+	}
+	m.workspacePick += delta
+	if m.workspacePick < 0 {
+		m.workspacePick = len(choices) - 1
+	}
+	if m.workspacePick >= len(choices) {
+		m.workspacePick = 0
+	}
+}
+
 func (m *model) moveAction(delta int) {
 	r, ok := m.current()
 	if !ok {
@@ -1767,6 +1906,15 @@ func (m *model) chooseAction() error {
 		m.mode = "editorPick"
 		m.editorSelected = 0
 		m.input = ""
+	case "workspaceOpen":
+		workspace := valueOr(r.workspace, r.repo)
+		if workspace == "" {
+			return fmt.Errorf("no workspace path recorded")
+		}
+		m.mode = "workspaceOpen"
+		m.workspaceMode = workspaceModeTerminal
+		m.workspacePick = 0
+		m.message = ""
 	case "restart":
 		s, err := m.restartCurrent()
 		if err != nil {
@@ -1924,6 +2072,84 @@ func (m *model) chooseEditor() error {
 	return m.openEditor(choice.command)
 }
 
+func (m *model) chooseWorkspace() error {
+	r, ok := m.current()
+	if !ok {
+		return fmt.Errorf("no row selected")
+	}
+	choices := workspaceChoices(r, m.workspaceMode)
+	if len(choices) == 0 {
+		return fmt.Errorf("no workspace actions available")
+	}
+	if m.workspacePick < 0 {
+		m.workspacePick = 0
+	}
+	if m.workspacePick >= len(choices) {
+		m.workspacePick = len(choices) - 1
+	}
+	choice := choices[m.workspacePick]
+	if choice.disabled && choice.id != "setSSH" {
+		m.pendingAction = choice.id
+		m.mode = "sshTarget"
+		m.input = defaultSSHTarget()
+		m.message = ""
+		return nil
+	}
+	return m.runWorkspaceAction(choice.id)
+}
+
+func (m *model) runWorkspaceAction(id string) error {
+	if strings.HasPrefix(id, "editorCommand:") {
+		return m.openEditor(strings.TrimPrefix(id, "editorCommand:"))
+	}
+	switch id {
+	case "workspaceCurrent":
+		name, err := m.openWorkspaceSession(false)
+		if err != nil {
+			return err
+		}
+		m.chosen = name
+	case "workspaceNew":
+		name, err := m.openWorkspaceSession(true)
+		if err != nil {
+			return err
+		}
+		m.chosen = name
+	case "copyCD":
+		path, err := m.workspacePath()
+		if err != nil {
+			return err
+		}
+		m.message = "Command: cd " + shellQuote(path)
+	case "editorCustom":
+		m.mode = "editorCustom"
+		m.input = ""
+		m.message = ""
+	case "remoteCursor", "remoteCode", "remoteSSH":
+		target := defaultSSHTarget()
+		if target == "" {
+			m.pendingAction = id
+			m.mode = "sshTarget"
+			m.input = ""
+			m.message = ""
+			return nil
+		}
+		path, err := m.workspacePath()
+		if err != nil {
+			return err
+		}
+		m.message = "Command: " + remoteWorkspaceCommand(id, target, path)
+	case "setSSH":
+		m.pendingAction = id
+		m.mode = "sshTarget"
+		m.input = defaultSSHTarget()
+		m.message = ""
+	default:
+		return fmt.Errorf("unknown workspace action: %s", id)
+	}
+	return nil
+}
+
 type repoChoice struct {
 	label       string
 	path        string
@@ -2002,6 +2228,56 @@ func editorLabel(command string) string {
 	}
 }
 
+func workspaceChoices(r row, mode int) []workspaceChoice {
+	target := defaultSSHTarget()
+	switch mode {
+	case workspaceModeTerminal:
+		choices := []workspaceChoice{}
+		if len(r.workspaceShells) > 0 {
+			choices = append(choices, workspaceChoice{id: "workspaceCurrent", label: "Current shell", description: r.workspaceShells[0]})
+		}
+		choices = append(choices,
+			workspaceChoice{id: "workspaceNew", label: "New shell", description: "create a tmux shell in this workspace"},
+			workspaceChoice{id: "copyCD", label: "CD command", description: "cd " + shellQuote(valueOr(r.workspace, r.repo))},
+		)
+		return choices
+	case workspaceModeEditor:
+		choices := []workspaceChoice{}
+		for _, choice := range editorChoices() {
+			if choice.custom {
+				choices = append(choices, workspaceChoice{id: "editorCustom", label: "Custom editor", description: "type command"})
+				continue
+			}
+			choices = append(choices, workspaceChoice{
+				id:          "editorCommand:" + choice.command,
+				label:       choice.label,
+				description: choice.command + " " + shellQuote(valueOr(r.workspace, r.repo)),
+			})
+		}
+		return choices
+	case workspaceModeRemote:
+		missing := target == ""
+		desc := func(id string) string {
+			if missing {
+				return "needs SSH target"
+			}
+			return remoteWorkspaceCommand(id, target, valueOr(r.workspace, r.repo))
+		}
+		setDesc := "set once for remote commands"
+		if target != "" {
+			setDesc = "currently " + target
+		}
+		return []workspaceChoice{
+			{id: "remoteCursor", label: "Cursor remote", description: desc("remoteCursor"), disabled: missing},
+			{id: "remoteCode", label: "VS Code remote", description: desc("remoteCode"), disabled: missing},
+			{id: "remoteSSH", label: "SSH cd command", description: desc("remoteSSH"), disabled: missing},
+			{id: "setSSH", label: "Set SSH target", description: setDesc},
+		}
+	default:
+		return nil
+	}
+}
+
 func actionsFor(r row, fullQueue bool) []menuChoice {
 	if r.kind == "queue" && !r.structured {
 		actions := []menuChoice{
@@ -2023,12 +2299,8 @@ func actionsFor(r row, fullQueue bool) []menuChoice {
 		} else {
 			actions = append(actions, menuChoice{id: "restart", label: "Restart agent", description: "start agent again in workspace"})
 		}
-		actions = append(actions, workspaceAction(r))
 		if r.workspace != "" || r.repo != "" {
-			actions = append(actions, menuChoice{id: "editor", label: "Open in editor", description: "open workspace in Cursor, VS Code, or custom editor"})
-		}
-		if len(r.workspaceShells) > 0 {
-			actions = append(actions, menuChoice{id: "workspaceNew", label: "New workspace terminal", description: "create another attached terminal"})
+			actions = append(actions, menuChoice{id: "workspaceOpen", label: "Open workspace...", description: "terminal, editor, and remote commands"})
 		}
 		if r.phase == types.PhaseScoping {
 			actions = append(actions, menuChoice{id: "markScoped", label: "Mark scoped", description: "move Linear issue to ready queue"})
@@ -2052,20 +2324,12 @@ func actionsFor(r row, fullQueue bool) []menuChoice {
 		actions = append(actions, menuChoice{id: "open", label: "Open session", description: "open unmanaged session"})
 	}
 	if r.workspace != "" {
-		actions = append(actions, menuChoice{id: "workspace", label: "Workspace terminal", description: "open shell in path"})
-		actions = append(actions, menuChoice{id: "editor", label: "Open in editor", description: "open path in Cursor, VS Code, or custom editor"})
+		actions = append(actions, menuChoice{id: "workspaceOpen", label: "Open workspace...", description: "terminal, editor, and remote commands"})
 	}
 	return append(actions,
 		menuChoice{id: "rename", label: "Rename session", description: "change session name"},
 		menuChoice{id: "delete", label: "Kill session", description: "close unmanaged session", danger: true},
 	)
-}
-
-func workspaceAction(r row) menuChoice {
-	if len(r.workspaceShells) > 0 {
-		return menuChoice{id: "workspace", label: "Open workspace terminal", description: "open attached terminal"}
-	}
-	return menuChoice{id: "workspace", label: "New workspace terminal", description: "create attached terminal"}
 }
 
 func closeDescription(r row) string {
@@ -2115,17 +2379,24 @@ func (m model) selectedQueueIssues() []string {
 }
 
 func (m *model) showWorkspacePath() {
-	r, ok := m.current()
-	if !ok {
-		m.message = "No session selected"
-		return
-	}
-	path := valueOr(r.workspace, r.repo)
-	if path == "" {
-		m.message = "No workspace path recorded"
+	path, err := m.workspacePath()
+	if err != nil {
+		m.message = err.Error()
 		return
 	}
 	m.message = "Workspace: " + path
+}
+
+func (m *model) workspacePath() (string, error) {
+	r, ok := m.current()
+	if !ok {
+		return "", fmt.Errorf("no session selected")
+	}
+	path := valueOr(r.workspace, r.repo)
+	if path == "" {
+		return "", fmt.Errorf("no workspace path recorded")
+	}
+	return path, nil
 }
 
 func (m *model) openWorkspaceSession(createNew bool) (string, error) {
@@ -2421,7 +2692,7 @@ func cleanDetail(value string) string {
 }
 
 func renderMessage(message string) string {
-	if strings.HasPrefix(message, "Workspace:") || strings.HasPrefix(message, "Opened in editor:") {
+	if strings.HasPrefix(message, "Workspace:") || strings.HasPrefix(message, "Opened in editor:") || strings.HasPrefix(message, "Command:") || strings.HasPrefix(message, "SSH target:") {
 		return cyan.Render(message)
 	}
 	return red.Render("Error: " + message)
@@ -2477,6 +2748,53 @@ func splitTargets(value string) []string {
 		}
 	}
 	return out
+}
+
+func defaultSSHTarget() string {
+	cfg, err := config.LoadOrDefault()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(cfg.DefaultSSHTarget)
+}
+
+func remoteWorkspaceCommand(id, target, path string) string {
+	target = strings.TrimSpace(target)
+	switch id {
+	case "remoteCursor":
+		return "cursor --remote ssh-remote+" + target + " " + shellQuote(path)
+	case "remoteCode":
+		return "code --remote ssh-remote+" + target + " " + shellQuote(path)
+	case "remoteSSH":
+		return "ssh -t " + shellQuote(target) + " " + shellQuote("cd "+shellQuote(path)+" && exec $SHELL -l")
+	default:
+		return ""
+	}
+}
+
+func shellQuote(value string) string {
+	if value == "" {
+		return "''"
+	}
+	if isShellSafe(value) {
+		return value
+	}
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+}
+
+func isShellSafe(value string) bool {
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			continue
+		}
+		switch r {
+		case '/', '.', '_', '-', '+', ':', '@', '=':
+			continue
+		default:
+			return false
+		}
+	}
+	return value != ""
 }
 
 func defaultRepoPath() string {

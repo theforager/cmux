@@ -166,11 +166,10 @@ The action menu is opened with `.` on a selected row.
 Common actions:
 
 - `Open agent`: attach to the agent session.
-- `Workspace terminal`: open an attached shell in the workspace.
-- `Open in editor`: open the workspace with Cursor, VS Code, Zed, or a custom
-  command. Chosen commands are remembered for the next editor picker. The
-  command runs where cmux is running, so under `cmux ssh` it runs on the remote
-  host.
+- `Open workspace...`: switch between Terminal, Editor, and Remote modes with
+  left/right. Terminal opens tmux shells, Editor runs local editor commands, and
+  Remote shows copyable `cursor --remote`, `code --remote`, or SSH cd commands.
+  If no SSH target is saved, cmux prompts once and remembers it.
 - `Mark scoped`: finish a scoping session and move the Linear issue to the ready
   state.
 - `Mark needs review`: add the Linear `needs-review` label and put the session
@@ -281,6 +280,7 @@ Important fields:
 - `repos`: remembered repositories for the repo picker.
 - `defaultEditorCommand`: first editor command shown in the editor picker.
 - `editorCommands`: remembered editor commands and executable paths.
+- `defaultSshTarget`: remembered SSH target for remote workspace commands.
 - `queuePresets`: saved Linear worklist presets.
 - `linear.workflow.transitions`: Linear lifecycle mapping for start, scoped,
   review, done, and abandon actions.

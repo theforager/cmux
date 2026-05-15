@@ -150,6 +150,19 @@ func RememberEditor(command string) error {
 	return Save(cfg)
 }
 
+func RememberSSHTarget(target string) error {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return nil
+	}
+	cfg, err := Load()
+	if err != nil {
+		return err
+	}
+	cfg.DefaultSSHTarget = target
+	return Save(cfg)
+}
+
 func normalizeRepos(cfg types.Config) types.Config {
 	seen := map[string]bool{}
 	repos := []types.RepoConfig{}

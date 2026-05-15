@@ -127,3 +127,17 @@ func TestRememberEditorSavesCommandAndDefault(t *testing.T) {
 		t.Fatalf("EditorCommands = %+v, want code/cursor without duplicates", cfg.EditorCommands)
 	}
 }
+
+func TestRememberSSHTargetSavesDefault(t *testing.T) {
+	t.Setenv("CMUX_HOME", t.TempDir())
+	if err := RememberSSHTarget("devship"); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DefaultSSHTarget != "devship" {
+		t.Fatalf("DefaultSSHTarget = %q, want devship", cfg.DefaultSSHTarget)
+	}
+}

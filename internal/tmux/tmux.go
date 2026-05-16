@@ -52,7 +52,7 @@ func Inside() bool { return os.Getenv("TMUX") != "" }
 func List() ([]Session, error) {
 	out, err := process.Run("tmux", "list-sessions", "-F", "#{session_name}|#{session_created}")
 	if err != nil {
-		if strings.Contains(err.Error(), "no server running") {
+		if IsNoServerError(err) {
 			return nil, nil
 		}
 		return nil, err
@@ -63,6 +63,9 @@ func List() ([]Session, error) {
 			continue
 		}
 		parts := strings.Split(line, "|")
+		if len(parts) < 2 {
+			continue
+		}
 		created := parseInt64(parts[1])
 		s := Session{Name: parts[0], Created: created}
 		s.Title, _ = ShowEnv(s.Name, "CMUX_TITLE")
@@ -219,7 +222,19 @@ func IsMissingSessionError(err error) bool {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "can't find session") || strings.Contains(msg, "no server running")
+	return strings.Contains(msg, "can't find session") || IsNoServerError(err)
+}
+
+func IsNoServerError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no server running") ||
+		strings.Contains(msg, "no sessions") ||
+		strings.Contains(msg, "failed to connect to server") ||
+		strings.Contains(msg, "can't find server") ||
+		(strings.Contains(msg, "error connecting to") && strings.Contains(msg, "no such file or directory"))
 }
 
 func Current() (string, error) {
@@ -281,7 +296,7 @@ func Capture(session string, lines int) string {
 func Inspect(session string) (PaneInfo, error) {
 	out, err := process.Run("tmux", "display-message", "-t", session, "-p", "#{pane_last_activity}|#{window_activity}|#{session_activity}|#{session_created}|#{pane_dead}|#{pane_dead_status}|#{pane_current_command}")
 	if err != nil {
-		if IsMissingSessionError(err) || strings.Contains(strings.ToLower(err.Error()), "no server running") {
+		if IsMissingSessionError(err) {
 			return PaneInfo{Alive: false}, nil
 		}
 		return PaneInfo{Alive: false}, err

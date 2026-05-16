@@ -43,6 +43,7 @@ type row struct {
 	linear          string
 	phase           string
 	lastSummary     string
+	linearState     string
 	currentState    string
 	nextAction      string
 	blockers        string
@@ -62,6 +63,8 @@ type model struct {
 	rows           []row
 	filtered       []row
 	selected       int
+	agentMode      int
+	agentPick      int
 	agentSelected  int
 	repoSelected   int
 	editorSelected int
@@ -120,6 +123,23 @@ type workspaceChoice struct {
 	description string
 	disabled    bool
 }
+
+type agentActionChoice struct {
+	id          string
+	label       string
+	command     string
+	description string
+	custom      bool
+	disabled    bool
+}
+
+const (
+	agentModeAuto = iota
+	agentModeScoping
+	agentModeImplementation
+)
+
+var agentModeNames = []string{"Auto", "Scoping", "Implementation"}
 
 const (
 	workspaceModeTerminal = iota
@@ -273,17 +293,18 @@ func queueRows(fullQueue bool, activeTmux map[string]bool) []row {
 			break
 		}
 		r := row{
-			id:         qr.Issue.Identifier,
-			title:      qr.Issue.Title,
-			status:     string(qr.Status),
-			group:      "Linear",
-			queueRank:  rank,
-			repo:       preset.RepoPath,
-			workspace:  preset.RepoPath,
-			linear:     qr.Issue.URL,
-			branch:     qr.Issue.BranchName,
-			kind:       "queue",
-			queueIssue: qr.Issue.Identifier,
+			id:          qr.Issue.Identifier,
+			title:       qr.Issue.Title,
+			status:      string(qr.Status),
+			group:       "Linear",
+			queueRank:   rank,
+			repo:        preset.RepoPath,
+			workspace:   preset.RepoPath,
+			linear:      qr.Issue.URL,
+			linearState: qr.Issue.State,
+			branch:      qr.Issue.BranchName,
+			kind:        "queue",
+			queueIssue:  qr.Issue.Identifier,
 			detail: strings.Join(nonEmpty([]string{
 				"preset: " + preset.Name,
 				"repo: " + preset.RepoPath,
@@ -300,6 +321,7 @@ func queueRows(fullQueue bool, activeTmux map[string]bool) []row {
 			sr.kind = "queue"
 			sr.queueIssue = qr.Issue.Identifier
 			sr.queueRank = rank
+			sr.linearState = qr.Issue.State
 			sr.workspaceShells = r.workspaceShells
 			if !sr.active {
 				sr.status = "not-running"
@@ -387,6 +409,7 @@ func agentRow(s types.AgentSession, active bool) row {
 		agent:           valueOr(s.AgentCommand, s.Provider),
 		runbook:         home.RunbookPath(s.ID),
 		linear:          s.Linear.URL,
+		linearState:     s.Linear.State,
 		phase:           s.Phase,
 		lastSummary:     s.LastSummary,
 		currentState:    notes.CurrentState,
@@ -474,14 +497,36 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
+			if m.mode == "agentOpen" {
+				switch key {
+				case "esc", "backspace", "ctrl+h":
+					m.mode = "actionMenu"
+					m.message = ""
+				case "left", "h":
+					m.moveAgentMode(-1)
+				case "right", "l":
+					m.moveAgentMode(1)
+				case "up", "k":
+					m.moveAgentAction(-1)
+				case "down", "j", "tab":
+					m.moveAgentAction(1)
+				case "enter":
+					if err := m.chooseAgentAction(); err != nil {
+						m.message = err.Error()
+					} else if m.chosen != "" {
+						return m, tea.Quit
+					}
+				}
+				return m, nil
+			}
 			if m.mode == "workspaceOpen" {
 				switch key {
 				case "esc", "backspace", "ctrl+h":
 					m.mode = "actionMenu"
 					m.message = ""
-				case "left":
+				case "left", "h":
 					m.moveWorkspaceMode(-1)
-				case "right":
+				case "right", "l":
 					m.moveWorkspaceMode(1)
 				case "up", "k":
 					m.moveWorkspaceChoice(-1)
@@ -570,26 +615,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					} else if m.chosen != "" {
 						return m, tea.Quit
 					}
-				case "1":
-					if err := m.createWithAgent("claude"); err != nil {
-						m.message = err.Error()
-					} else if m.chosen != "" {
-						return m, tea.Quit
-					} else {
-						m.afterCreate()
-					}
-				case "2":
-					if err := m.createWithAgent("codex"); err != nil {
-						m.message = err.Error()
-					} else if m.chosen != "" {
-						return m, tea.Quit
-					} else {
-						m.afterCreate()
-					}
-				case "3":
-					m.mode = "agentCustom"
-					m.input = ""
-					m.message = ""
 				}
 				return m, nil
 			}
@@ -804,11 +829,7 @@ func (m model) View() string {
 			if r.kind == "queue" && !r.active && m.selectedQueue[r.queueIssue] {
 				mark = "✓"
 			}
-			status := r.status
-			if len(r.workspaceShells) > 0 {
-				status += " ⧉"
-			}
-			line := fmt.Sprintf("%s%s %-16s %-20s %s  %s", glyph(r.status), mark, format.Trunc(r.id, 16), format.Trunc(status, 20), r.title, dim.Render(r.updated))
+			line := renderRowLine(r, mark, m.width)
 			if i == m.selected {
 				b.WriteString(green.Render("▌ "+line) + "\n")
 			} else {
@@ -1092,6 +1113,70 @@ func compactPreviewText(value string) string {
 		value = strings.ReplaceAll(value, "  ", " ")
 	}
 	return value
+}
+
+func renderRowLine(r row, mark string, width int) string {
+	local := format.Trunc(localStateCluster(r), 20)
+	linear := format.Trunc(linearStateLabel(r), 14)
+	id := format.Trunc(r.id, 16)
+	updated := strings.TrimSpace(r.updated)
+	titleWidth := width - 2 - 1 - 17 - 21 - 15
+	if updated != "" {
+		titleWidth -= len(updated) + 2
+	}
+	if titleWidth < 20 {
+		titleWidth = 20
+	}
+	title := format.Trunc(r.title, titleWidth)
+	line := fmt.Sprintf("%s %-16s %-20s %-14s %s", mark, id, local, linear, title)
+	if updated != "" {
+		line += "  " + dim.Render(updated)
+	}
+	return line
+}
+
+func localStateCluster(r row) string {
+	if r.kind == "queue" && !r.structured && !r.active {
+		return "-"
+	}
+	status := localStatusLabel(r.status)
+	parts := []string{}
+	if status == "-" {
+		parts = append(parts, "-")
+	} else {
+		parts = append(parts, strings.TrimSpace(glyph(r.status)+" "+status))
+	}
+	if len(r.workspaceShells) > 0 {
+		parts = append(parts, "⧉")
+	}
+	return strings.Join(parts, " ")
+}
+
+func localStatusLabel(status string) string {
+	switch status {
+	case "not-running":
+		return "stopped"
+	case "waiting_for_input":
+		return "waiting"
+	case "ready_for_review":
+		return "review"
+	case "pr_opened":
+		return "pr"
+	case "":
+		return "-"
+	default:
+		return status
+	}
+}
+
+func linearStateLabel(r row) string {
+	if strings.TrimSpace(r.linearState) != "" {
+		return r.linearState
+	}
+	if r.linear != "" || r.queueIssue != "" {
+		return "-"
+	}
+	return "-"
 }
 
 func queueTeam(r row) string {
@@ -1424,7 +1509,7 @@ func (m *model) selectRow(id string) {
 
 func (m model) agentPicker() string {
 	var b strings.Builder
-	b.WriteString(cyan.Render("agent") + dim.Render("  ↑↓/jk select · enter create · 1-3 shortcut · esc cancel") + "\n")
+	b.WriteString(cyan.Render("agent") + dim.Render("  ↑↓/jk select · enter create · esc cancel") + "\n")
 	for i, choice := range agentChoices {
 		line := fmt.Sprintf("%-8s %s", choice.label, dim.Render(choice.description))
 		if i == m.agentSelected {
@@ -1465,19 +1550,15 @@ func (m model) actionMenu() string {
 
 func actionSection(id string) string {
 	switch id {
-	case "open", "restart", "workspace", "workspaceNew", "editor", "workspaceOpen":
+	case "agentOpen", "workspaceOpen", "startSelected":
 		return "Open"
-	case "startQueue", "startScope", "startSelected":
-		return "Start"
-	case "markScoped", "needsReview", "done", "abandon":
-		return "Workflow"
-	case "detail", "path", "status":
+	case "submit", "abandon":
+		return "Finish"
+	case "detail", "path":
 		return "Inspect"
 	case "title", "rename":
-		return "Name"
-	case "close":
-		return "Cleanup"
-	case "delete", "cleanup", "reset":
+		return "Session"
+	case "deleteWorktree", "delete":
 		return "Advanced"
 	default:
 		return ""
@@ -1537,6 +1618,56 @@ func (m model) editorPicker() string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
+func (m model) agentOpenPanel() string {
+	r, ok := m.current()
+	if !ok {
+		return dim.Render("no row selected")
+	}
+	choices := agentActionChoices(r, m.agentMode)
+	selected := m.agentPick
+	if selected < 0 || selected >= len(choices) {
+		selected = 0
+	}
+	var b strings.Builder
+	b.WriteString(cyan.Render("agent") + dim.Render("  "+r.id+" · ←/→/h/l mode · ↑↓/jk select · enter open/start · esc cancel") + "\n")
+	b.WriteString("  " + renderAgentTabs(r, m.agentMode) + "\n")
+	descWidth := m.width - 32
+	if descWidth < 24 {
+		descWidth = 24
+	}
+	for i, choice := range choices {
+		line := fmt.Sprintf("%-18s %s", choice.label, dim.Render(format.Trunc(choice.description, descWidth)))
+		switch {
+		case i == selected && choice.disabled:
+			b.WriteString(red.Render("▌ "+line) + "\n")
+		case i == selected:
+			b.WriteString(green.Render("▌ "+line) + "\n")
+		case choice.disabled:
+			b.WriteString("  " + dim.Render(line) + "\n")
+		default:
+			b.WriteString("  " + line + "\n")
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func renderAgentTabs(r row, selected int) string {
+	resolved := resolvedAgentMode(r, selected)
+	tabs := make([]string, 0, len(agentModeNames))
+	for i, name := range agentModeNames {
+		label := name
+		if i == agentModeAuto {
+			label = "Auto: " + agentModeLabel(resolved)
+		}
+		if i == selected {
+			tabs = append(tabs, activeTab.Render(label))
+		} else {
+			tabs = append(tabs, inactiveTab.Render(label))
+		}
+	}
+	return strings.Join(tabs, " ")
+}
+
 func (m model) workspaceOpenPanel() string {
 	r, ok := m.current()
 	if !ok {
@@ -1548,7 +1679,7 @@ func (m model) workspaceOpenPanel() string {
 		selected = 0
 	}
 	var b strings.Builder
-	b.WriteString(cyan.Render("open workspace") + dim.Render("  "+r.id+" · ←/→ mode · ↑↓/jk select · enter run/show · esc cancel") + "\n")
+	b.WriteString(cyan.Render("open workspace") + dim.Render("  "+r.id+" · ←/→/h/l mode · ↑↓/jk select · enter run/show · esc cancel") + "\n")
 	b.WriteString("  " + renderWorkspaceTabs(m.workspaceMode) + "\n")
 	descWidth := m.width - 32
 	if descWidth < 24 {
@@ -1637,6 +1768,8 @@ func (m model) prompt() string {
 		return m.repoPicker()
 	case "repoPath":
 		return renderPromptInput("repo path", m.input) + dim.Render("queue worktrees will be created from this repo")
+	case "agentOpen":
+		return m.agentOpenPanel()
 	case "workspaceOpen":
 		return m.workspaceOpenPanel()
 	case "editorPick":
@@ -1652,11 +1785,14 @@ func (m model) prompt() string {
 	case "title":
 		return renderPromptInput("display name", m.input) + dim.Render("enter save · esc cancel")
 	case "delete":
-		return m.confirmPrompt("Forget session", []string{"Stop the agent session.", "Keep the workspace and branch."})
+		if r, ok := m.current(); ok && !isAgentRow(r) {
+			return m.confirmPrompt("Kill session", []string{"Close this unmanaged tmux session."})
+		}
+		return m.confirmPrompt("Stop session", []string{"Stop the agent session.", "Keep the workspace and branch."})
 	case "close":
-		return m.confirmPrompt("Close session", []string{"Stop the agent session.", "Remove a clean cmux-owned worktree.", "Refuse if the workspace has uncommitted changes."})
+		return m.confirmPrompt("Stop and clean up", []string{"Stop the agent session.", "Remove a clean cmux-owned worktree.", "Refuse if the workspace has uncommitted changes."})
 	case "cleanup":
-		return red.Render("cleanup worktree? type y if clean, or type session id to force  ") + dim.Render("dirty worktrees are refused unless forced · esc cancel")
+		return red.Render("delete worktree? enter y if clean, or type session id to force  ") + dim.Render("dirty worktrees are refused unless forced · esc cancel")
 	case "reset":
 		if r, ok := m.current(); ok {
 			return red.Render("reset workspace? type "+r.id+" then enter  ") + dim.Render("runs git reset --hard and git clean -fd · esc cancel")
@@ -1678,9 +1814,9 @@ func (m model) prompt() string {
 	case "statusSummary":
 		return renderPromptInput("summary for "+string(m.pending), m.input) + dim.Render("enter save · esc cancel")
 	case "scopedSummary":
-		return renderPromptInput("scope summary", m.input) + dim.Render("moves Linear to ready state · esc cancel")
+		return renderPromptInput("scoped handoff", m.input) + dim.Render("updates Linear with scope and moves forward · esc cancel")
 	case "needsReviewSummary":
-		return renderPromptInput("review summary", m.input) + dim.Render("adds needs-review in Linear · esc cancel")
+		return renderPromptInput("review handoff", m.input) + dim.Render("updates Linear for review · esc cancel")
 	case "doneSummary":
 		return renderPromptInput("completion summary", m.input) + dim.Render("moves Linear issue to Done · esc cancel")
 	case "abandonSummary":
@@ -1773,6 +1909,38 @@ func (m *model) moveEditor(delta int) {
 	}
 	if m.editorSelected >= len(choices) {
 		m.editorSelected = 0
+	}
+}
+
+func (m *model) moveAgentMode(delta int) {
+	m.agentMode += delta
+	if m.agentMode < 0 {
+		m.agentMode = len(agentModeNames) - 1
+	}
+	if m.agentMode >= len(agentModeNames) {
+		m.agentMode = 0
+	}
+	m.agentPick = 0
+	m.message = ""
+}
+
+func (m *model) moveAgentAction(delta int) {
+	r, ok := m.current()
+	if !ok {
+		m.agentPick = 0
+		return
+	}
+	choices := agentActionChoices(r, m.agentMode)
+	if len(choices) == 0 {
+		m.agentPick = 0
+		return
+	}
+	m.agentPick += delta
+	if m.agentPick < 0 {
+		m.agentPick = len(choices) - 1
+	}
+	if m.agentPick >= len(choices) {
+		m.agentPick = 0
 	}
 }
 
@@ -1876,15 +2044,11 @@ func (m *model) chooseAction() error {
 		m.actionSelected = 0
 	}
 	switch choices[m.actionSelected].id {
-	case "open":
-		if !r.active || !tmux.Has(r.session) {
-			return fmt.Errorf("session is not running")
-		}
-		m.chosen = r.session
-	case "startQueue":
-		return m.startQueueFlow(false, false)
-	case "startScope":
-		return m.startQueueFlow(false, true)
+	case "agentOpen":
+		m.mode = "agentOpen"
+		m.agentMode = agentModeAuto
+		m.agentPick = 0
+		m.message = ""
 	case "startSelected":
 		return m.startQueueFlow(true, false)
 	case "detail":
@@ -1892,20 +2056,6 @@ func (m *model) chooseAction() error {
 	case "path":
 		m.showWorkspacePath()
 		m.mode = "browse"
-	case "workspace", "workspaceNew":
-		name, err := m.openWorkspaceSession(choices[m.actionSelected].id == "workspaceNew")
-		if err != nil {
-			return err
-		}
-		m.chosen = name
-	case "editor":
-		workspace := valueOr(r.workspace, r.repo)
-		if workspace == "" {
-			return fmt.Errorf("no workspace path recorded")
-		}
-		m.mode = "editorPick"
-		m.editorSelected = 0
-		m.input = ""
 	case "workspaceOpen":
 		workspace := valueOr(r.workspace, r.repo)
 		if workspace == "" {
@@ -1915,42 +2065,24 @@ func (m *model) chooseAction() error {
 		m.workspaceMode = workspaceModeTerminal
 		m.workspacePick = 0
 		m.message = ""
-	case "restart":
-		s, err := m.restartCurrent()
-		if err != nil {
+	case "submit":
+		if !isAgentRow(r) {
+			return fmt.Errorf("select a structured agent session")
+		}
+		if err := m.submitAndClose(r); err != nil {
 			return err
 		}
-		m.chosen = s.TmuxSession
-	case "status":
-		if !isAgentRow(r) {
-			return fmt.Errorf("select a structured agent session")
-		}
-		m.mode = "statusPick"
-		m.input = ""
-	case "markScoped":
-		if !isAgentRow(r) {
-			return fmt.Errorf("select a structured agent session")
-		}
-		m.mode = "scopedSummary"
-		m.input = ""
-	case "needsReview":
-		if !isAgentRow(r) {
-			return fmt.Errorf("select a structured agent session")
-		}
-		m.mode = "needsReviewSummary"
-		m.input = r.lastSummary
-	case "done":
-		if !isAgentRow(r) {
-			return fmt.Errorf("select a structured agent session")
-		}
-		m.mode = "doneSummary"
-		m.input = r.lastSummary
+		m.mode = "browse"
+		m.reloadRows(r.id)
 	case "abandon":
 		if !isAgentRow(r) {
 			return fmt.Errorf("select a structured agent session")
 		}
-		m.mode = "abandonSummary"
-		m.input = ""
+		if err := m.abandonAndClose(r); err != nil {
+			return err
+		}
+		m.mode = "browse"
+		m.reloadRows(r.id)
 	case "rename":
 		if !r.active {
 			return fmt.Errorf("session is not running")
@@ -1966,17 +2098,63 @@ func (m *model) chooseAction() error {
 	case "delete":
 		m.mode = "delete"
 		m.input = ""
-	case "close":
-		m.mode = "close"
-		m.input = ""
-	case "cleanup":
+	case "deleteWorktree":
 		m.mode = "cleanup"
-		m.input = ""
-	case "reset":
-		m.mode = "reset"
 		m.input = ""
 	}
 	return nil
+}
+
+func (m *model) submitAndClose(r row) error {
+	if err := preflightSubmitClose(r); err != nil {
+		return err
+	}
+	switch submitMode(r) {
+	case "scopedSummary":
+		if _, err := agent.MarkScoped(r.id, ""); err != nil {
+			return err
+		}
+	case "doneSummary":
+		if _, err := agent.Complete(r.id, ""); err != nil {
+			return err
+		}
+	default:
+		if _, err := agent.MarkNeedsReview(r.id, ""); err != nil {
+			return err
+		}
+	}
+	return agent.Close(r.id)
+}
+
+func (m *model) abandonAndClose(r row) error {
+	if _, err := agent.Abandon(r.id, ""); err != nil {
+		return err
+	}
+	if isCmuxOwnedSeparateWorktree(r) {
+		return agent.CleanupWorktree(r.id, true)
+	}
+	return agent.Delete(r.id)
+}
+
+func preflightSubmitClose(r row) error {
+	if r.workspace != "" {
+		dirty, summary := gitx.StatusSummary(r.workspace)
+		if dirty {
+			return agent.WorktreeDirtyError{Path: r.workspace, Summary: summary}
+		}
+	}
+	if r.workspace != "" && r.repo != "" && r.workspace != r.repo && !isCmuxOwnedSeparateWorktree(r) {
+		return fmt.Errorf("worktree is outside cmux worktrees; submit will not close it: %s", r.workspace)
+	}
+	return nil
+}
+
+func isCmuxOwnedSeparateWorktree(r row) bool {
+	if strings.TrimSpace(r.workspace) == "" || r.workspace == r.repo {
+		return false
+	}
+	rel, err := filepath.Rel(home.WorktreesDir(), r.workspace)
+	return err == nil && rel != "." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && !filepath.IsAbs(rel)
 }
 
 func (m *model) primaryAction() error {
@@ -1985,7 +2163,11 @@ func (m *model) primaryAction() error {
 		return nil
 	}
 	if r.kind == "queue" && !r.active && !r.structured {
-		return m.startQueueFlow(false, false)
+		m.mode = "agentOpen"
+		m.agentMode = agentModeAuto
+		m.agentPick = 0
+		m.message = ""
+		return nil
 	}
 	if !r.active || !tmux.Has(r.session) {
 		m.mode = "actionMenu"
@@ -2070,6 +2252,106 @@ func (m *model) chooseEditor() error {
 		return nil
 	}
 	return m.openEditor(choice.command)
+}
+
+func (m *model) chooseAgentAction() error {
+	r, ok := m.current()
+	if !ok {
+		return fmt.Errorf("no row selected")
+	}
+	choices := agentActionChoices(r, m.agentMode)
+	if len(choices) == 0 {
+		return fmt.Errorf("no agent actions available")
+	}
+	if m.agentPick < 0 {
+		m.agentPick = 0
+	}
+	if m.agentPick >= len(choices) {
+		m.agentPick = len(choices) - 1
+	}
+	choice := choices[m.agentPick]
+	if choice.disabled {
+		return fmt.Errorf("%s", choice.description)
+	}
+	if choice.custom {
+		if err := m.prepareAgentStart(); err != nil {
+			return err
+		}
+		m.mode = "agentCustom"
+		m.input = ""
+		m.message = ""
+		return nil
+	}
+	switch choice.id {
+	case "openExisting":
+		if !r.active || !tmux.Has(r.session) {
+			return fmt.Errorf("session is not running")
+		}
+		m.chosen = r.session
+	case "restartExisting":
+		s, err := m.restartCurrent()
+		if err != nil {
+			return err
+		}
+		m.chosen = s.TmuxSession
+	case "startAgent":
+		return m.startAgentFromPanel(choice.command)
+	default:
+		return fmt.Errorf("unknown agent action: %s", choice.id)
+	}
+	return nil
+}
+
+func (m *model) startAgentFromPanel(command string) error {
+	r, ok := m.current()
+	if !ok {
+		return fmt.Errorf("no row selected")
+	}
+	if r.kind != "queue" || r.structured {
+		return fmt.Errorf("agent session already exists")
+	}
+	issue := r.queueIssue
+	if issue == "" {
+		issue = r.id
+	}
+	if issue == "" {
+		return fmt.Errorf("no Linear issue selected")
+	}
+	cwd := valueOr(r.repo, ".")
+	mode := resolvedAgentMode(r, m.agentMode)
+	s, err := agent.Start(agent.StartOptions{Cwd: cwd, IssueKey: issue, Agent: command, Scoping: mode == agentModeScoping})
+	if err != nil {
+		return err
+	}
+	if s.TmuxSession != "" {
+		m.chosen = s.TmuxSession
+	}
+	return nil
+}
+
+func (m *model) prepareAgentStart() error {
+	r, ok := m.current()
+	if !ok {
+		return fmt.Errorf("no row selected")
+	}
+	if r.kind != "queue" || r.structured {
+		return fmt.Errorf("custom agent start is only available before a session exists")
+	}
+	issue := r.queueIssue
+	if issue == "" {
+		issue = r.id
+	}
+	if issue == "" {
+		return fmt.Errorf("no Linear issue selected")
+	}
+	mode := resolvedAgentMode(r, m.agentMode)
+	m.create = "queue"
+	if mode == agentModeScoping {
+		m.create = "queueScope"
+	}
+	m.createRepo = valueOr(r.repo, ".")
+	m.target = issue
+	return nil
 }
 
 func (m *model) chooseWorkspace() error {
@@ -2228,6 +2510,71 @@ func editorLabel(command string) string {
 	}
 }
 
+func agentActionChoices(r row, mode int) []agentActionChoice {
+	if r.structured {
+		if r.active {
+			return []agentActionChoice{{id: "openExisting", label: "Current agent", description: "attach to running agent"}}
+		}
+		return []agentActionChoice{{id: "restartExisting", label: "Restart agent", description: "restart in the existing workspace"}}
+	}
+	if r.kind != "queue" {
+		if r.active {
+			return []agentActionChoice{{id: "openExisting", label: "Current session", description: "attach to running session"}}
+		}
+		return []agentActionChoice{{id: "openExisting", label: "Current session", description: "session is not running", disabled: true}}
+	}
+	if r.queueIssue == "" {
+		return []agentActionChoice{{id: "startAgent", label: "Agent", description: "no Linear issue selected", disabled: true}}
+	}
+	resolved := agentModeLabel(resolvedAgentMode(r, mode))
+	choices := make([]agentActionChoice, 0, len(agentChoices))
+	for _, choice := range agentChoices {
+		if choice.custom {
+			choices = append(choices, agentActionChoice{id: "startAgent", label: "Custom", description: "type command · " + resolved, custom: true})
+			continue
+		}
+		choices = append(choices, agentActionChoice{
+			id:          "startAgent",
+			label:       choice.label,
+			command:     choice.command,
+			description: choice.command + " · " + resolved,
+		})
+	}
+	return choices
+}
+
+func resolvedAgentMode(r row, selected int) int {
+	if selected == agentModeScoping || selected == agentModeImplementation {
+		return selected
+	}
+	if r.phase == types.PhaseScoping {
+		return agentModeScoping
+	}
+	state := strings.ToLower(strings.TrimSpace(r.linearState))
+	switch state {
+	case "backlog", "scoping":
+		return agentModeScoping
+	case "todo", "in progress", "in_progress", "started", "review", "needs review", "needs-review":
+		return agentModeImplementation
+	default:
+		if r.queueIssue != "" {
+			return agentModeScoping
+		}
+		return agentModeImplementation
+	}
+}
+
+func agentModeLabel(mode int) string {
+	switch mode {
+	case agentModeScoping:
+		return "Scoping"
+	case agentModeImplementation:
+		return "Implementation"
+	default:
+		return "Auto"
+	}
+}
+
 func workspaceChoices(r row, mode int) []workspaceChoice {
 	target := defaultSSHTarget()
 	switch mode {
@@ -2281,8 +2628,7 @@ func workspaceChoices(r row, mode int) []workspaceChoice {
 func actionsFor(r row, fullQueue bool) []menuChoice {
 	if r.kind == "queue" && !r.structured {
 		actions := []menuChoice{
-			{id: "startQueue", label: "Start work", description: "move to active work and launch agent"},
-			{id: "startScope", label: "Start scoping", description: "move to scoping and launch planning agent"},
+			{id: "agentOpen", label: "Agent...", description: "start from Linear state with optional mode override"},
 		}
 		if fullQueue {
 			actions = append(actions, menuChoice{id: "startSelected", label: "Start selected", description: "batch up to 3 selected issues"})
@@ -2294,34 +2640,28 @@ func actionsFor(r row, fullQueue bool) []menuChoice {
 	}
 	if r.structured {
 		actions := []menuChoice{}
-		if r.active {
-			actions = append(actions, menuChoice{id: "open", label: "Open agent", description: "open session"})
-		} else {
-			actions = append(actions, menuChoice{id: "restart", label: "Restart agent", description: "start agent again in workspace"})
+		agentDesc := "attach to running agent"
+		if !r.active {
+			agentDesc = "restart agent in workspace"
 		}
+		actions = append(actions, menuChoice{id: "agentOpen", label: "Agent...", description: agentDesc})
 		if r.workspace != "" || r.repo != "" {
 			actions = append(actions, menuChoice{id: "workspaceOpen", label: "Open workspace...", description: "terminal, editor, and remote commands"})
 		}
-		if r.phase == types.PhaseScoping {
-			actions = append(actions, menuChoice{id: "markScoped", label: "Mark scoped", description: "move Linear issue to ready queue"})
-		}
-		if r.linear != "" {
-			actions = append(actions, menuChoice{id: "needsReview", label: "Mark needs review", description: "add Linear needs-review label"})
-			actions = append(actions, menuChoice{id: "done", label: "Mark done", description: "move Linear issue to Done"})
-			actions = append(actions, menuChoice{id: "abandon", label: "Abandon work", description: "move Linear issue back to original queue state", danger: true})
-		}
-		return append(actions,
+		actions = append(actions,
+			menuChoice{id: "submit", label: "Submit work", description: submitDescription(r)},
+			menuChoice{id: "abandon", label: "Abandon", description: "move this attempt back to the queue", danger: true},
 			menuChoice{id: "detail", label: "Details", description: "show runbook and output"},
-			menuChoice{id: "status", label: "Set status", description: "advanced status override"},
 			menuChoice{id: "title", label: "Rename session", description: "change display name"},
-			menuChoice{id: "close", label: "Close session", description: closeDescription(r), danger: true},
-			menuChoice{id: "delete", label: "Forget session", description: "stop agent and keep workspace", danger: true},
-			menuChoice{id: "reset", label: "Reset workspace", description: "git reset --hard and clean", danger: true},
 		)
+		if r.workspace != "" && r.repo != "" && r.workspace != r.repo {
+			actions = append(actions, menuChoice{id: "deleteWorktree", label: "Delete worktree", description: "remove the cmux worktree only", danger: true})
+		}
+		return actions
 	}
 	actions := []menuChoice{}
 	if r.active {
-		actions = append(actions, menuChoice{id: "open", label: "Open session", description: "open unmanaged session"})
+		actions = append(actions, menuChoice{id: "agentOpen", label: "Agent...", description: "attach to running session"})
 	}
 	if r.workspace != "" {
 		actions = append(actions, menuChoice{id: "workspaceOpen", label: "Open workspace...", description: "terminal, editor, and remote commands"})
@@ -2332,11 +2672,30 @@ func actionsFor(r row, fullQueue bool) []menuChoice {
 	)
 }
 
-func closeDescription(r row) string {
-	if r.workspace != "" && r.repo != "" && r.workspace != r.repo {
-		return "remove clean worktree and hide session"
+func submitDescription(r row) string {
+	switch submitMode(r) {
+	case "scopedSummary":
+		return "publish scoped handoff and move forward"
+	case "doneSummary":
+		return "complete the issue"
+	default:
+		return "publish handoff for review"
 	}
-	return "stop agent and hide session"
+}
+
+func submitMode(r row) string {
+	if r.phase == types.PhaseScoping {
+		return "scopedSummary"
+	}
+	status := strings.ToLower(string(r.status))
+	state := strings.ToLower(strings.TrimSpace(r.linearState))
+	if status == string(types.StatusReadyForReview) || status == string(types.StatusPROpened) || state == "ready for review" || state == "review" {
+		return "doneSummary"
+	}
+	if r.linear == "" {
+		return "doneSummary"
+	}
+	return "needsReviewSummary"
 }
 
 func newChoices() []menuChoice {

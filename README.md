@@ -57,12 +57,18 @@ go build -o ./cmux-dev ./cmd/cmux
 3. Use `tab` to open the full Linear worklist.
 4. Start one Linear issue, start a scoping session, or select up to 3 issues for
    a capped batch start.
-5. Use `.` on a session for actions such as open, workspace terminal, mark
-   scoped, mark needs review, mark done, open in editor, close session, or
-   reset workspace.
+5. Use `.` on a row for open, submit, abandon, inspect, rename, and advanced
+   worktree cleanup actions.
 
 The main dashboard shows only a bounded Linear section. The full Linear
 worklist lives behind `tab` or `cmux queue`.
+
+Rows keep local execution state next to local badges, then show Linear state:
+
+```text
+REB-135  ◐ waiting ⧉    In Progress   Fix account menu keyboard nav
+REB-27   -              Todo          Add pricing CTA tracking
+```
 
 ## TUI Keys
 
@@ -165,26 +171,21 @@ The action menu is opened with `.` on a selected row.
 
 Common actions:
 
-- `Open agent`: attach to the agent session.
+- `Agent...`: open or restart an existing session, or start a new Linear agent.
+  Use left/right or h/l to switch Auto, Scoping, and Implementation modes. Auto
+  derives the mode from the Linear state.
 - `Open workspace...`: switch between Terminal, Editor, and Remote modes with
-  left/right. Terminal opens tmux shells, Editor runs local editor commands, and
-  Remote shows copyable `cursor --remote`, `code --remote`, or SSH cd commands.
-  If no SSH target is saved, cmux prompts once and remembers it.
-- `Mark scoped`: finish a scoping session and move the Linear issue to the ready
-  state.
-- `Mark needs review`: add the Linear `needs-review` label and put the session
-  in the review group.
-- `Mark done`: verify the workspace is clean, move the Linear issue to `Done`,
-  and place it at the top of the Linear Done column.
-- `Close session`: stop the agent, remove a clean cmux-owned worktree, and hide
-  the local session. Dirty workspaces are refused.
-- `Forget session`: stop and hide the local session while keeping the workspace
-  and branch.
-- `Reset workspace`: destructive; runs `git reset --hard` and `git clean -fd`
-  for a cmux-owned worktree.
-
-`Close session` and `Forget session` show a confirmation pane. `Reset workspace`
-requires typing the session id.
+  left/right or h/l. Terminal opens tmux shells, Editor runs local editor
+  commands, and Remote shows copyable `cursor --remote`, `code --remote`, or SSH
+  cd commands. If no SSH target is saved, cmux prompts once and remembers it.
+- `Submit work`: publish the right Linear handoff for the current mode, then
+  close the local cmux session. Dirty workspaces are refused so changes are not
+  lost.
+- `Abandon`: move this attempt back to its queue state and close the local cmux
+  session. cmux-owned worktrees are discarded.
+- `Rename session`: change the cmux display name.
+- `Delete worktree`: advanced escape hatch for removing a cmux-owned worktree.
+  Clean worktrees require `y`; dirty worktrees require typing the session id.
 
 ## Runbooks And Scoping
 
@@ -198,7 +199,7 @@ The runbook is local durable context for the agent. Implementation sessions keep
 it lean: current state, decisions, tests, next action, and review notes. It
 should contain technical context, not a mirror of Linear status.
 
-For scoping sessions, the runbook becomes the handoff. When `Mark scoped` or
+For scoping sessions, the runbook becomes the handoff. When `Submit work` or
 `cmux agent scoped` runs, cmux reads the useful runbook sections and writes a
 replaceable `cmux scoped handoff` block into the Linear issue description. That
 lets the next coding agent start from Linear alone, even if the scoping tmux
@@ -288,10 +289,10 @@ Important fields:
 Default Linear workflow behavior:
 
 - Start scoping -> `Scoping`, add `cmux`, remove `needs-review`
-- Mark scoped -> `Todo`, add `cmux`, remove `needs-review`
+- Submit scoping -> `Todo`, add `cmux`, remove `needs-review`
 - Start work -> `In Progress`, add `cmux`, remove `needs-review`
-- Mark needs review -> add `cmux` and `needs-review`
-- Mark done -> `Done`, remove `needs-review`, place at top of Done
+- Submit implementation -> add `cmux` and `needs-review`
+- Submit review -> `Done`, remove `needs-review`, place at top of Done
 - Abandon -> original queue state, remove `needs-review`
 
 Workflow names are configurable so cmux can adapt to different Linear boards.

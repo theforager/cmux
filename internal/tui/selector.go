@@ -76,6 +76,8 @@ type model struct {
 	input          string
 	create         string
 	createRepo     string
+	createAgent    string
+	createCustom   bool
 	target         string
 	pendingAction  string
 	pending        types.AgentStatus
@@ -133,13 +135,21 @@ type agentActionChoice struct {
 	disabled    bool
 }
 
+type actionDoneMsg struct {
+	id       string
+	selectID string
+	err      error
+}
+
 const (
 	agentModeAuto = iota
+	agentModeFresh
 	agentModeScoping
 	agentModeImplementation
 )
 
-var agentModeNames = []string{"Auto", "Scoping", "Implementation"}
+var agentModeNames = []string{"Fresh", "Scoping", "Implementation"}
+var agentModeValues = []int{agentModeFresh, agentModeScoping, agentModeImplementation}
 
 const (
 	workspaceModeTerminal = iota
@@ -160,16 +170,12 @@ var (
 )
 
 func Run(popup bool) (string, error) {
-	rows, err := loadRows(false)
+	rows, err := loadRows(false, false)
 	if err != nil {
 		return "", err
 	}
 	m := model{rows: rows, filtered: rows, mode: "browse", width: 80, height: 24, selectedQueue: map[string]bool{}}
-	opts := []tea.ProgramOption{}
-	if !popup {
-		opts = []tea.ProgramOption{tea.WithAltScreen()}
-	}
-	p := tea.NewProgram(m, opts...)
+	p := tea.NewProgram(m)
 	final, err := p.Run()
 	if err != nil {
 		return "", err
@@ -181,12 +187,12 @@ func Run(popup bool) (string, error) {
 }
 
 func RunQueue() (string, error) {
-	rows, err := loadRows(true)
+	rows, err := loadRows(true, false)
 	if err != nil {
 		return "", err
 	}
 	m := model{rows: rows, filtered: rows, mode: "browse", width: 80, height: 24, fullQueue: true, selectedQueue: map[string]bool{}}
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	p := tea.NewProgram(m)
 	final, err := p.Run()
 	if err != nil {
 		return "", err
@@ -197,8 +203,8 @@ func RunQueue() (string, error) {
 	return "", nil
 }
 
-func loadRows(fullQueue bool) ([]row, error) {
-	_, _ = agent.Scan()
+func loadRows(fullQueue bool, refreshLinear bool) ([]row, error) {
+	_, _ = agent.ScanWithOptions(agent.ScanOptions{RefreshLinear: refreshLinear})
 	tmuxSessions, err := tmux.List()
 	if err != nil {
 		return nil, err
@@ -259,7 +265,7 @@ func queueRows(fullQueue bool, activeTmux map[string]bool) []row {
 			id:      "linear-setup",
 			title:   "Linear worklist not configured: set LINEAR_API_KEY and run cmux queue setup",
 			status:  "setup",
-			group:   "Linear",
+			group:   "Linear worklist",
 			updated: "",
 			kind:    "notice",
 			detail:  "Linear worklist needs LINEAR_API_KEY before cmux can fetch issues.",
@@ -275,13 +281,13 @@ func queueRows(fullQueue bool, activeTmux map[string]bool) []row {
 			id:     "linear-error",
 			title:  err.Error(),
 			status: "error",
-			group:  "Linear",
+			group:  "Linear worklist",
 			kind:   "notice",
 			detail: "Queue preset could not be loaded or Linear returned an error.",
 		}}
 	}
 	if len(rows) == 0 {
-		return []row{{id: "linear-empty", title: "No matching Linear issues in " + preset.Name, status: "empty", group: "Linear", kind: "notice"}}
+		return []row{{id: "linear-empty", title: "No matching Linear issues in " + preset.Name, status: "empty", group: "Linear worklist", kind: "notice"}}
 	}
 	displayLimit := limit
 	out := make([]row, 0, len(rows))
@@ -296,7 +302,7 @@ func queueRows(fullQueue bool, activeTmux map[string]bool) []row {
 			id:          qr.Issue.Identifier,
 			title:       qr.Issue.Title,
 			status:      string(qr.Status),
-			group:       "Linear",
+			group:       "Linear worklist",
 			queueRank:   rank,
 			repo:        preset.RepoPath,
 			workspace:   preset.RepoPath,
@@ -317,7 +323,7 @@ func queueRows(fullQueue bool, activeTmux map[string]bool) []row {
 		}
 		if qr.Session != nil {
 			sr := agentRow(*qr.Session, activeTmux[qr.Session.TmuxSession])
-			sr.group = "Linear"
+			sr.group = "Linear worklist"
 			sr.kind = "queue"
 			sr.queueIssue = qr.Issue.Identifier
 			sr.queueRank = rank
@@ -339,7 +345,7 @@ func sortRows(rows []row) {
 		if gi != gj {
 			return gi < gj
 		}
-		if rows[i].group == "Linear" && rows[i].queueRank != rows[j].queueRank {
+		if rows[i].group == "Linear worklist" && rows[i].queueRank != rows[j].queueRank {
 			return rows[i].queueRank < rows[j].queueRank
 		}
 		return rows[i].updatedAt.After(rows[j].updatedAt)
@@ -348,18 +354,14 @@ func sortRows(rows []row) {
 
 func groupRank(group string) int {
 	switch group {
-	case "Needs attention":
+	case "Agent sessions":
 		return 0
-	case "Active":
+	case "Linear worklist":
 		return 1
-	case "Ready for review":
+	case "Done / other":
 		return 2
-	case "Linear":
-		return 3
-	case "Done/Other":
-		return 4
 	default:
-		return 5
+		return 3
 	}
 }
 
@@ -449,10 +451,28 @@ func agentRowTime(s types.AgentSession) time.Time {
 	return time.Time{}
 }
 
-func (m model) Init() tea.Cmd { return nil }
+func (m model) Init() tea.Cmd { return tea.ClearScreen }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case actionDoneMsg:
+		if msg.err != nil {
+			m.mode = "browse"
+			m.message = msg.err.Error()
+			return m, nil
+		}
+		switch msg.id {
+		case "submit":
+			m.message = "Submitted work"
+		case "abandon":
+			m.message = "Abandoned work"
+		default:
+			m.message = ""
+		}
+		m.mode = "browse"
+		m.input = ""
+		m.reloadRows(msg.selectID)
+		return m, nil
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -482,24 +502,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if m.mode == "actionMenu" {
 				switch key {
-				case "esc", "backspace", "ctrl+h", ".":
+				case "esc", "backspace", "ctrl+h", ".", "q":
 					m.mode = "browse"
 				case "up", "k":
 					m.moveAction(-1)
 				case "down", "j", "tab":
 					m.moveAction(1)
 				case "enter":
-					if err := m.chooseAction(); err != nil {
+					cmd, err := m.chooseAction()
+					if err != nil {
 						m.message = err.Error()
 					} else if m.chosen != "" {
 						return m, tea.Quit
+					} else if cmd != nil {
+						return m, cmd
 					}
 				}
 				return m, nil
 			}
+			if m.mode == "busy" {
+				return m, nil
+			}
 			if m.mode == "agentOpen" {
 				switch key {
-				case "esc", "backspace", "ctrl+h":
+				case "esc", "backspace", "ctrl+h", "q":
 					m.mode = "actionMenu"
 					m.message = ""
 				case "left", "h":
@@ -521,7 +547,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if m.mode == "workspaceOpen" {
 				switch key {
-				case "esc", "backspace", "ctrl+h":
+				case "esc", "backspace", "ctrl+h", "q":
 					m.mode = "actionMenu"
 					m.message = ""
 				case "left", "h":
@@ -543,7 +569,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if m.mode == "newMenu" {
 				switch key {
-				case "esc", "backspace", "ctrl+h", "a":
+				case "esc", "backspace", "ctrl+h", "a", "q":
 					m.mode = "browse"
 				case "up", "k":
 					m.moveNew(-1)
@@ -559,7 +585,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if m.mode == "statusPick" {
 				switch key {
-				case "esc":
+				case "esc", "q":
 					m.mode = "browse"
 				case "1":
 					m.pending = types.StatusRunning
@@ -598,11 +624,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if m.mode == "agentPick" {
 				switch key {
-				case "esc":
+				case "esc", "q":
 					m.mode = "browse"
 					m.input = ""
 					m.create = ""
 					m.createRepo = ""
+					m.createAgent = ""
+					m.createCustom = false
 					m.target = ""
 					m.message = ""
 				case "up", "k":
@@ -620,11 +648,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if m.mode == "repoPick" {
 				switch key {
-				case "esc":
+				case "esc", "q":
 					m.mode = "browse"
 					m.input = ""
 					m.create = ""
 					m.createRepo = ""
+					m.createAgent = ""
+					m.createCustom = false
 					m.target = ""
 					m.message = ""
 				case "up", "k":
@@ -634,13 +664,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				case "enter":
 					if err := m.chooseRepo(); err != nil {
 						m.message = err.Error()
+					} else if m.chosen != "" {
+						return m, tea.Quit
 					}
 				}
 				return m, nil
 			}
 			if m.mode == "editorPick" {
 				switch key {
-				case "esc":
+				case "esc", "q":
 					m.mode = "browse"
 					m.input = ""
 					m.message = ""
@@ -657,7 +689,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if isConfirmMode(m.mode) {
 				switch key {
-				case "esc", "backspace", "ctrl+h", "n", "N":
+				case "esc", "backspace", "ctrl+h", "q", "n", "N":
 					m.mode = "browse"
 					m.input = ""
 				case "enter", "y", "Y":
@@ -758,7 +790,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.selected = len(m.filtered) - 1
 			}
 		case "R":
-			rows, err := loadRows(m.fullQueue)
+			rows, err := loadRows(m.fullQueue, true)
 			if err == nil {
 				m.rows = rows
 				m.applyFilter()
@@ -768,7 +800,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "tab":
 			m.fullQueue = !m.fullQueue
 			m.filter = ""
-			rows, err := loadRows(m.fullQueue)
+			rows, err := loadRows(m.fullQueue, m.fullQueue)
 			if err == nil {
 				m.rows = rows
 				m.applyFilter()
@@ -785,6 +817,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.message = err.Error()
 			} else if m.chosen != "" {
 				return m, tea.Quit
+			}
+		}
+		if isSpaceToggleKey(msg) && key != " " {
+			if m.fullQueue {
+				m.toggleQueueSelection()
 			}
 		}
 	}
@@ -857,6 +894,9 @@ func (m model) View() string {
 		}
 	}
 	if m.message != "" {
+		if m.mode == "busy" {
+			return b.String()
+		}
 		if prompt != "" {
 			b.WriteString("\n")
 		} else {
@@ -1414,6 +1454,29 @@ func (m *model) createWithAgent(agentCommand string) error {
 			m.chosen = first.TmuxSession
 		}
 		return nil
+	case "queueFresh":
+		targets := splitTargets(m.target)
+		if len(targets) == 0 {
+			return fmt.Errorf("select a Linear issue")
+		}
+		if len(targets) > queue.BatchLimit {
+			return fmt.Errorf("batch start is capped at %d issues", queue.BatchLimit)
+		}
+		cwd := valueOr(m.createRepo, ".")
+		var first types.AgentSession
+		for _, target := range targets {
+			s, err := agent.Start(agent.StartOptions{Cwd: cwd, IssueKey: target, Agent: agentCommand, Fresh: true})
+			if err != nil {
+				return err
+			}
+			if first.ID == "" {
+				first = s
+			}
+		}
+		if len(targets) == 1 && first.TmuxSession != "" {
+			m.chosen = first.TmuxSession
+		}
+		return nil
 	case "queueScope":
 		targets := splitTargets(m.target)
 		if len(targets) == 0 {
@@ -1474,11 +1537,13 @@ func (m *model) afterCreate() {
 	m.input = ""
 	m.create = ""
 	m.createRepo = ""
+	m.createAgent = ""
+	m.createCustom = false
 	m.target = ""
 	m.agentSelected = 0
 	m.message = ""
 	m.selectedQueue = map[string]bool{}
-	rows, err := loadRows(m.fullQueue)
+	rows, err := loadRows(m.fullQueue, false)
 	if err == nil {
 		m.rows = rows
 		m.applyFilter()
@@ -1486,7 +1551,7 @@ func (m *model) afterCreate() {
 }
 
 func (m *model) reloadRows(selectID string) {
-	rows, err := loadRows(m.fullQueue)
+	rows, err := loadRows(m.fullQueue, false)
 	if err != nil {
 		m.message = err.Error()
 		return
@@ -1652,17 +1717,13 @@ func (m model) agentOpenPanel() string {
 }
 
 func renderAgentTabs(r row, selected int) string {
-	resolved := resolvedAgentMode(r, selected)
 	tabs := make([]string, 0, len(agentModeNames))
 	for i, name := range agentModeNames {
-		label := name
-		if i == agentModeAuto {
-			label = "Auto: " + agentModeLabel(resolved)
-		}
-		if i == selected {
-			tabs = append(tabs, activeTab.Render(label))
+		mode := agentModeValues[i]
+		if mode == selected {
+			tabs = append(tabs, activeTab.Render(name))
 		} else {
-			tabs = append(tabs, inactiveTab.Render(label))
+			tabs = append(tabs, inactiveTab.Render(name))
 		}
 	}
 	return strings.Join(tabs, " ")
@@ -1772,6 +1833,8 @@ func (m model) prompt() string {
 		return m.agentOpenPanel()
 	case "workspaceOpen":
 		return m.workspaceOpenPanel()
+	case "busy":
+		return renderMessage(m.message)
 	case "editorPick":
 		return m.editorPicker()
 	case "editorCustom":
@@ -1913,13 +1976,14 @@ func (m *model) moveEditor(delta int) {
 }
 
 func (m *model) moveAgentMode(delta int) {
-	m.agentMode += delta
-	if m.agentMode < 0 {
-		m.agentMode = len(agentModeNames) - 1
+	index := agentModeIndex(m.agentMode) + delta
+	if index < 0 {
+		index = len(agentModeValues) - 1
 	}
-	if m.agentMode >= len(agentModeNames) {
-		m.agentMode = 0
+	if index >= len(agentModeValues) {
+		index = 0
 	}
+	m.agentMode = agentModeValues[index]
 	m.agentPick = 0
 	m.message = ""
 }
@@ -2031,14 +2095,14 @@ func (m *model) chooseNew() {
 	}
 }
 
-func (m *model) chooseAction() error {
+func (m *model) chooseAction() (tea.Cmd, error) {
 	r, ok := m.current()
 	if !ok {
-		return fmt.Errorf("no row selected")
+		return nil, fmt.Errorf("no row selected")
 	}
 	choices := actionsFor(r, m.fullQueue)
 	if len(choices) == 0 {
-		return fmt.Errorf("no actions available")
+		return nil, fmt.Errorf("no actions available")
 	}
 	if m.actionSelected < 0 || m.actionSelected >= len(choices) {
 		m.actionSelected = 0
@@ -2046,11 +2110,11 @@ func (m *model) chooseAction() error {
 	switch choices[m.actionSelected].id {
 	case "agentOpen":
 		m.mode = "agentOpen"
-		m.agentMode = agentModeAuto
+		m.agentMode = autoAgentMode(r)
 		m.agentPick = 0
 		m.message = ""
 	case "startSelected":
-		return m.startQueueFlow(true, false)
+		return nil, m.startQueueFlow(true, false)
 	case "detail":
 		m.mode = "detail"
 	case "path":
@@ -2059,7 +2123,7 @@ func (m *model) chooseAction() error {
 	case "workspaceOpen":
 		workspace := valueOr(r.workspace, r.repo)
 		if workspace == "" {
-			return fmt.Errorf("no workspace path recorded")
+			return nil, fmt.Errorf("no workspace path recorded")
 		}
 		m.mode = "workspaceOpen"
 		m.workspaceMode = workspaceModeTerminal
@@ -2067,31 +2131,27 @@ func (m *model) chooseAction() error {
 		m.message = ""
 	case "submit":
 		if !isAgentRow(r) {
-			return fmt.Errorf("select a structured agent session")
+			return nil, fmt.Errorf("select a structured agent session")
 		}
-		if err := m.submitAndClose(r); err != nil {
-			return err
-		}
-		m.mode = "browse"
-		m.reloadRows(r.id)
+		m.mode = "busy"
+		m.message = "Submitting work..."
+		return m.runLongAction("submit", r), nil
 	case "abandon":
 		if !isAgentRow(r) {
-			return fmt.Errorf("select a structured agent session")
+			return nil, fmt.Errorf("select a structured agent session")
 		}
-		if err := m.abandonAndClose(r); err != nil {
-			return err
-		}
-		m.mode = "browse"
-		m.reloadRows(r.id)
+		m.mode = "busy"
+		m.message = "Abandoning work..."
+		return m.runLongAction("abandon", r), nil
 	case "rename":
 		if !r.active {
-			return fmt.Errorf("session is not running")
+			return nil, fmt.Errorf("session is not running")
 		}
 		m.mode = "rename"
 		m.input = tmux.Child(r.session)
 	case "title":
 		if !r.active && !isAgentRow(r) {
-			return fmt.Errorf("session is not running")
+			return nil, fmt.Errorf("session is not running")
 		}
 		m.mode = "title"
 		m.input = r.title
@@ -2102,7 +2162,22 @@ func (m *model) chooseAction() error {
 		m.mode = "cleanup"
 		m.input = ""
 	}
-	return nil
+	return nil, nil
+}
+
+func (m *model) runLongAction(id string, r row) tea.Cmd {
+	return func() tea.Msg {
+		var err error
+		switch id {
+		case "submit":
+			err = m.submitAndClose(r)
+		case "abandon":
+			err = m.abandonAndClose(r)
+		default:
+			err = fmt.Errorf("unknown action: %s", id)
+		}
+		return actionDoneMsg{id: id, selectID: r.id, err: err}
+	}
 }
 
 func (m *model) submitAndClose(r row) error {
@@ -2164,7 +2239,7 @@ func (m *model) primaryAction() error {
 	}
 	if r.kind == "queue" && !r.active && !r.structured {
 		m.mode = "agentOpen"
-		m.agentMode = agentModeAuto
+		m.agentMode = autoAgentMode(r)
 		m.agentPick = 0
 		m.message = ""
 		return nil
@@ -2225,6 +2300,24 @@ func (m *model) chooseRepo() error {
 		return nil
 	}
 	m.createRepo = choice.path
+	if m.createCustom {
+		m.createCustom = false
+		m.mode = "agentCustom"
+		m.input = ""
+		m.message = ""
+		return nil
+	}
+	if m.createAgent != "" {
+		command := m.createAgent
+		m.createAgent = ""
+		if err := m.createWithAgent(command); err != nil {
+			return err
+		}
+		if m.chosen == "" {
+			m.afterCreate()
+		}
+		return nil
+	}
 	m.mode = "agentPick"
 	m.agentSelected = 0
 	m.input = ""
@@ -2277,8 +2370,9 @@ func (m *model) chooseAgentAction() error {
 		if err := m.prepareAgentStart(); err != nil {
 			return err
 		}
-		m.mode = "agentCustom"
-		m.input = ""
+		m.createCustom = true
+		m.mode = "repoPick"
+		m.repoSelected = 0
 		m.message = ""
 		return nil
 	}
@@ -2303,29 +2397,13 @@ func (m *model) chooseAgentAction() error {
 }
 
 func (m *model) startAgentFromPanel(command string) error {
-	r, ok := m.current()
-	if !ok {
-		return fmt.Errorf("no row selected")
-	}
-	if r.kind != "queue" || r.structured {
-		return fmt.Errorf("agent session already exists")
-	}
-	issue := r.queueIssue
-	if issue == "" {
-		issue = r.id
-	}
-	if issue == "" {
-		return fmt.Errorf("no Linear issue selected")
-	}
-	cwd := valueOr(r.repo, ".")
-	mode := resolvedAgentMode(r, m.agentMode)
-	s, err := agent.Start(agent.StartOptions{Cwd: cwd, IssueKey: issue, Agent: command, Scoping: mode == agentModeScoping})
-	if err != nil {
+	if err := m.prepareAgentStart(); err != nil {
 		return err
 	}
-	if s.TmuxSession != "" {
-		m.chosen = s.TmuxSession
-	}
+	m.createAgent = command
+	m.mode = "repoPick"
+	m.repoSelected = 0
+	m.message = ""
 	return nil
 }
 
@@ -2346,7 +2424,9 @@ func (m *model) prepareAgentStart() error {
 	}
 	mode := resolvedAgentMode(r, m.agentMode)
 	m.create = "queue"
-	if mode == agentModeScoping {
+	if mode == agentModeFresh {
+		m.create = "queueFresh"
+	} else if mode == agentModeScoping {
 		m.create = "queueScope"
 	}
 	m.createRepo = valueOr(r.repo, ".")
@@ -2544,9 +2624,13 @@ func agentActionChoices(r row, mode int) []agentActionChoice {
 }
 
 func resolvedAgentMode(r row, selected int) int {
-	if selected == agentModeScoping || selected == agentModeImplementation {
+	if selected == agentModeFresh || selected == agentModeScoping || selected == agentModeImplementation {
 		return selected
 	}
+	return autoAgentMode(r)
+}
+
+func autoAgentMode(r row) int {
 	if r.phase == types.PhaseScoping {
 		return agentModeScoping
 	}
@@ -2564,8 +2648,19 @@ func resolvedAgentMode(r row, selected int) int {
 	}
 }
 
+func agentModeIndex(mode int) int {
+	for i, value := range agentModeValues {
+		if value == mode {
+			return i
+		}
+	}
+	return 0
+}
+
 func agentModeLabel(mode int) string {
 	switch mode {
+	case agentModeFresh:
+		return "Fresh"
 	case agentModeScoping:
 		return "Scoping"
 	case agentModeImplementation:
@@ -2896,6 +2991,20 @@ func splitEditorCommand(command string) ([]string, error) {
 	return parts, nil
 }
 
+func isSpaceToggleKey(msg tea.KeyMsg) bool {
+	key := msg.String()
+	if key == " " || key == "shift+space" || key == "shift+ " {
+		return true
+	}
+	if msg.Type == tea.KeySpace {
+		return true
+	}
+	if len(msg.Runes) == 1 && msg.Runes[0] == '\u00a0' {
+		return true
+	}
+	return false
+}
+
 func (m *model) restartCurrent() (types.AgentSession, error) {
 	r, ok := m.current()
 	if !ok || !isAgentRow(r) {
@@ -2905,7 +3014,7 @@ func (m *model) restartCurrent() (types.AgentSession, error) {
 	if err != nil {
 		return s, err
 	}
-	rows, err := loadRows(m.fullQueue)
+	rows, err := loadRows(m.fullQueue, false)
 	if err == nil {
 		m.rows = rows
 		m.applyFilter()
@@ -2975,14 +3084,10 @@ func isAgentRow(r row) bool {
 
 func dashboardGroup(status types.AgentStatus) string {
 	switch status {
-	case types.StatusBlocked, types.StatusTestsFailed, types.StatusWaiting, types.StatusCrashed:
-		return "Needs attention"
-	case types.StatusRunning, types.StatusIdle:
-		return "Active"
-	case types.StatusReadyForReview, types.StatusPROpened:
-		return "Ready for review"
+	case types.StatusDone, types.StatusStale:
+		return "Done / other"
 	default:
-		return "Done/Other"
+		return "Agent sessions"
 	}
 }
 
@@ -3061,12 +3166,8 @@ func glyph(status string) string {
 	switch status {
 	case "running":
 		return "●"
-	case "waiting_for_input":
-		return "◐"
-	case "blocked":
-		return "!"
-	case "tests_failed", "crashed":
-		return "✕"
+	case "waiting_for_input", "blocked", "tests_failed", "crashed":
+		return "▲"
 	case "ready_for_review":
 		return "◆"
 	case "done":

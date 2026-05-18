@@ -11,6 +11,7 @@ const (
 const (
 	PhaseWork    = "work"
 	PhaseScoping = "scoping"
+	PhaseFresh   = "fresh"
 )
 
 type AgentStatus string

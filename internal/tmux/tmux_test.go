@@ -36,6 +36,12 @@ func TestFirstUnixReturnsZeroWhenMissing(t *testing.T) {
 	}
 }
 
+func TestStartCommandDoesNotExecAgent(t *testing.T) {
+	if got := startCommand(" codex "); got != "codex" {
+		t.Fatalf("startCommand = %q, want codex", got)
+	}
+}
+
 type errString string
 
 func (e errString) Error() string {

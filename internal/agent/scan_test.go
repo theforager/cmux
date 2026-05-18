@@ -32,10 +32,27 @@ func TestClassifyRuntimeStatusPreservesPreparedIdleWithoutTmux(t *testing.T) {
 	}
 }
 
-func TestClassifyRuntimeStatusWaitingPrompt(t *testing.T) {
+func TestClassifyRuntimeStatusDoesNotTreatShellPromptAsWaiting(t *testing.T) {
 	now := time.Date(2026, 5, 3, 12, 0, 0, 0, time.UTC)
 	last := now.Add(-20 * time.Minute).Format(time.RFC3339)
 	status := ClassifyRuntimeStatus(types.StatusRunning, types.RuntimeData{TmuxAlive: true, LastActivityAt: last, CurrentCommand: "zsh", Preview: "repo $"}, now)
+	if status != types.StatusIdle {
+		t.Fatalf("status = %s, want %s", status, types.StatusIdle)
+	}
+}
+
+func TestClassifyRuntimeStatusShellAfterAgentExitIsIdle(t *testing.T) {
+	now := time.Date(2026, 5, 3, 12, 0, 0, 0, time.UTC)
+	status := ClassifyRuntimeStatus(types.StatusRunning, types.RuntimeData{TmuxAlive: true, CurrentCommand: "fish"}, now)
+	if status != types.StatusIdle {
+		t.Fatalf("status = %s, want %s", status, types.StatusIdle)
+	}
+}
+
+func TestClassifyRuntimeStatusWaitingForApprovalPrompt(t *testing.T) {
+	now := time.Date(2026, 5, 3, 12, 0, 0, 0, time.UTC)
+	last := now.Add(-20 * time.Minute).Format(time.RFC3339)
+	status := ClassifyRuntimeStatus(types.StatusRunning, types.RuntimeData{TmuxAlive: true, LastActivityAt: last, CurrentCommand: "codex", Preview: "Permission required: allow command? yes/no"}, now)
 	if status != types.StatusWaiting {
 		t.Fatalf("status = %s, want %s", status, types.StatusWaiting)
 	}

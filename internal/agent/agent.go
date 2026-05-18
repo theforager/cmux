@@ -25,6 +25,7 @@ type StartOptions struct {
 	Title       string
 	Scratch     bool
 	Scoping     bool
+	Fresh       bool
 	Worktree    bool
 	NoWorktree  bool
 	PrepareOnly bool
@@ -82,9 +83,28 @@ func startIssue(o StartOptions) (types.AgentSession, error) {
 		phase = types.PhaseScoping
 		sessionID = issue.Identifier + "-scope"
 		transition = lifecycle.EventStartScoping
+	} else if o.Fresh {
+		phase = types.PhaseFresh
 	}
 	if existing, err := state.Read(sessionID); err == nil {
-		return existing, nil
+		if strings.TrimSpace(o.Agent) != "" {
+			existing.AgentCommand = o.Agent
+			existing.Provider = Provider(o.Agent)
+		}
+		existing.Title = issue.Title
+		existing.Linear.IssueID = issue.ID
+		existing.Linear.Identifier = issue.Identifier
+		existing.Linear.URL = issue.URL
+		existing.Linear.State = issue.State
+		existing.Linear.StateID = issue.StateID
+		if issue.BranchName != "" {
+			existing.Branch = issue.BranchName
+		}
+		if o.PrepareOnly || sessionAlive(existing.TmuxSession) {
+			_ = state.Write(existing)
+			return existing, nil
+		}
+		return restartSession(existing, issue)
 	}
 	repo := o.Cwd
 	worktree := o.Cwd
@@ -188,19 +208,59 @@ func launch(s types.AgentSession, issue types.LinearIssue) error {
 	if err := tmux.Create(tmux.CreateOptions{Name: s.TmuxSession, Dir: s.WorktreePath, Command: s.AgentCommand, Title: s.Title, Agent: s.Provider}); err != nil {
 		return err
 	}
-	if s.Type != types.TypeScratch {
+	if s.Type != types.TypeScratch && s.Phase != types.PhaseFresh {
 		// Let the agent finish drawing before sending the initial prompt.
 		timeSleep()
-		tmp, err := os.CreateTemp("", "cmux-agent-prompt-*")
-		if err == nil {
-			_, _ = tmp.WriteString(initialPrompt(s, issue))
-			_ = tmp.Close()
-			_, _ = process.Run("tmux", "load-buffer", "-b", "cmux-agent-prompt", tmp.Name())
-			_, _ = process.Run("tmux", "paste-buffer", "-t", s.TmuxSession, "-b", "cmux-agent-prompt")
-			timeSleep()
-			_, _ = process.Run("tmux", "send-keys", "-t", s.TmuxSession, "C-m")
-			_ = os.Remove(tmp.Name())
+		if err := ensureSessionAlive(s); err != nil {
+			return err
 		}
+		tmp, err := os.CreateTemp("", "cmux-agent-prompt-*")
+		if err != nil {
+			return err
+		}
+		_, writeErr := tmp.WriteString(initialPrompt(s, issue))
+		closeErr := tmp.Close()
+		defer os.Remove(tmp.Name())
+		if writeErr != nil {
+			return writeErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if _, err := process.Run("tmux", "load-buffer", "-b", "cmux-agent-prompt", tmp.Name()); err != nil {
+			return err
+		}
+		if _, err := process.Run("tmux", "paste-buffer", "-t", s.TmuxSession, "-b", "cmux-agent-prompt"); err != nil {
+			return err
+		}
+		timeSleep()
+		if err := ensureSessionAlive(s); err != nil {
+			return err
+		}
+		if _, err := process.Run("tmux", "send-keys", "-t", s.TmuxSession, "C-m"); err != nil {
+			return err
+		}
+		timeSleep()
+		if err := ensureSessionAlive(s); err != nil {
+			return err
+		}
+	}
+	if err := ensureSessionAlive(s); err != nil {
+		return err
+	}
+	return nil
+}
+
+func ensureSessionAlive(s types.AgentSession) error {
+	info, err := tmux.Inspect(s.TmuxSession)
+	if err != nil {
+		return err
+	}
+	if !info.Alive {
+		return fmt.Errorf("agent session exited during startup: %s", s.TmuxSession)
+	}
+	if info.PaneDead {
+		return fmt.Errorf("agent pane exited during startup: %s exit=%s", s.TmuxSession, valueOr(info.ExitStatus, "unknown"))
 	}
 	return nil
 }
@@ -395,9 +455,15 @@ func Restart(id string) (types.AgentSession, error) {
 	if err != nil {
 		return s, err
 	}
-	if tmux.Has(s.TmuxSession) {
+	if sessionAlive(s.TmuxSession) {
 		return s, nil
 	}
+	_ = tmux.KillIfExists(s.TmuxSession)
+	issue := types.LinearIssue{Identifier: s.Linear.Identifier, Title: s.Title, Description: "Resume from the cmux runbook.", URL: s.Linear.URL, BranchName: s.Branch, State: s.Linear.State}
+	return restartSession(s, issue)
+}
+
+func restartSession(s types.AgentSession, issue types.LinearIssue) (types.AgentSession, error) {
 	name, err := tmux.GenerateSessionName(valueOr(s.WorktreePath, s.RepoPath), s.ID)
 	if err != nil {
 		return s, err
@@ -408,11 +474,18 @@ func Restart(id string) (types.AgentSession, error) {
 	if err := state.Write(s); err != nil {
 		return s, err
 	}
-	issue := types.LinearIssue{Identifier: s.Linear.Identifier, Title: s.Title, Description: "Resume from the cmux runbook.", URL: s.Linear.URL, BranchName: s.Branch, State: s.Linear.State}
 	if err := launch(s, issue); err != nil {
 		return s, err
 	}
 	return s, state.Write(s)
+}
+
+func sessionAlive(name string) bool {
+	if strings.TrimSpace(name) == "" {
+		return false
+	}
+	info, err := tmux.Inspect(name)
+	return err == nil && info.Alive && !info.PaneDead
 }
 
 func CleanupWorktree(id string, force bool) error {
@@ -550,16 +623,52 @@ func initialPrompt(s types.AgentSession, issue types.LinearIssue) string {
 	text += "Workspace: " + valueOr(s.WorktreePath, s.RepoPath) + "\n"
 	text += "Runbook: " + home.RunbookPath(s.ID) + "\n\n"
 	text += "Runbook rules: keep it short and technical. Do not mirror Linear/cmux status. Replace stale notes only when there is durable context: decisions, files or packages touched, exact tests run, real blockers, or a concrete next engineering step. Prefer 1-2 bullets per changed section and do not paste transcripts.\n\n"
+	if notes := runbookPromptContext(s.ID); notes != "" {
+		text += "Current runbook notes:\n" + notes + "\n\n"
+	}
+	if s.Phase == types.PhaseWork && issue.Identifier != "" {
+		if notes := runbookPromptContext(issue.Identifier + "-scope"); notes != "" {
+			text += "Prior scoping runbook notes:\n" + notes + "\n\n"
+		}
+	}
 	if s.Phase == types.PhaseScoping {
 		text += "Mode: scoping. Do not implement code unless the user explicitly asks. Clarify the problem, repo/package, approach, acceptance criteria, risks, and next coding steps. Before marking scoped, walk the user through key decisions, open questions, and the proposed plan; wait for explicit approval; then record that approval under ## User confirmation in the runbook.\n\n"
 		text += "Requirements:\n- Keep the cmux runbook updated at " + home.RunbookPath(s.ID) + ".\n- When blocked, run: cmux agent status " + s.ID + " blocked \"<reason>\"\n- When the issue is scoped and ready for coding, run: cmux agent scoped " + s.ID + " \"<summary>\"\n"
 	} else {
+		text += "Mode: implementation. Use the Linear issue, current runbook, and any prior scoping notes as context. Make the requested code changes in this workspace and leave review-ready notes in the runbook.\n\n"
 		text += "Requirements:\n- Work only in this workspace unless the user explicitly says otherwise.\n- Keep the cmux runbook updated at " + home.RunbookPath(s.ID) + ".\n- When blocked, run: cmux agent status " + s.ID + " blocked \"<reason>\"\n- When ready for human review, run: cmux agent needs-review " + s.ID + " \"<summary>\"\n"
 	}
 	if issue.Description != "" {
 		text += "\nIssue description:\n" + issue.Description
 	}
 	return text
+}
+
+func runbookPromptContext(sessionID string) string {
+	sections := runbook.ReadSections(sessionID)
+	parts := []string{}
+	for _, section := range sections {
+		heading := strings.TrimSpace(section.Heading)
+		if heading == "" || strings.EqualFold(heading, "Goal") {
+			continue
+		}
+		body := runbook.CleanBlock(section.Body)
+		if body == "" {
+			continue
+		}
+		parts = append(parts, "## "+heading+"\n"+body)
+	}
+	return truncPromptContext(strings.Join(parts, "\n\n"), 4000)
+}
+
+func truncPromptContext(value string, max int) string {
+	if len(value) <= max {
+		return value
+	}
+	if max <= 3 {
+		return value[:max]
+	}
+	return value[:max-3] + "..."
 }
 
 func firstWord(command string) string {

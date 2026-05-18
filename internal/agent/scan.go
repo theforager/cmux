@@ -1,11 +1,13 @@
 package agent
 
 import (
+	"os"
 	"strings"
 	"time"
 
 	"github.com/theforager/cmux/internal/format"
 	"github.com/theforager/cmux/internal/gitx"
+	"github.com/theforager/cmux/internal/linear"
 	"github.com/theforager/cmux/internal/runbook"
 	"github.com/theforager/cmux/internal/state"
 	"github.com/theforager/cmux/internal/tmux"
@@ -23,7 +25,15 @@ type ScanResult struct {
 	Waiting int
 }
 
+type ScanOptions struct {
+	RefreshLinear bool
+}
+
 func Scan() (ScanResult, error) {
+	return ScanWithOptions(ScanOptions{RefreshLinear: true})
+}
+
+func ScanWithOptions(o ScanOptions) (ScanResult, error) {
 	sessions, err := state.List()
 	if err != nil {
 		return ScanResult{}, err
@@ -31,7 +41,7 @@ func Scan() (ScanResult, error) {
 	var result ScanResult
 	for _, s := range sessions {
 		result.Scanned++
-		next := scanSession(s, time.Now())
+		next := scanSession(s, time.Now(), o)
 		if next.Status != s.Status || next.LastSummary != s.LastSummary {
 			next.LastUpdatedAt = format.Now()
 		}
@@ -51,7 +61,7 @@ func Scan() (ScanResult, error) {
 	return result, nil
 }
 
-func scanSession(s types.AgentSession, now time.Time) types.AgentSession {
+func scanSession(s types.AgentSession, now time.Time, o ScanOptions) types.AgentSession {
 	info, _ := tmux.Inspect(s.TmuxSession)
 	runtime := types.RuntimeData{
 		LastScannedAt:  now.UTC().Format(time.RFC3339),
@@ -76,8 +86,47 @@ func scanSession(s types.AgentSession, now time.Time) types.AgentSession {
 	}
 	s.Runtime = runtime
 	s.Status = ClassifyRuntimeStatus(s.Status, runtime, now)
+	if o.RefreshLinear {
+		refreshLinearMetadata(&s)
+	}
 	s.NeedsHuman = s.Status == types.StatusBlocked || s.Status == types.StatusTestsFailed || s.Status == types.StatusReadyForReview || s.Status == types.StatusWaiting || s.Status == types.StatusCrashed
 	return s
+}
+
+func refreshLinearMetadata(s *types.AgentSession) {
+	if os.Getenv("LINEAR_API_KEY") == "" {
+		return
+	}
+	identifier := valueOr(s.Linear.Identifier, s.Linear.IssueID)
+	if identifier == "" {
+		return
+	}
+	issue, err := linear.Issue(identifier)
+	if err != nil {
+		s.Linear.LastSyncError = err.Error()
+		return
+	}
+	if issue.ID != "" {
+		s.Linear.IssueID = issue.ID
+	}
+	if issue.Identifier != "" {
+		s.Linear.Identifier = issue.Identifier
+	}
+	if issue.URL != "" {
+		s.Linear.URL = issue.URL
+	}
+	if issue.State != "" {
+		s.Linear.State = issue.State
+		s.Linear.StateID = issue.StateID
+	}
+	if issue.BranchName != "" {
+		s.Branch = issue.BranchName
+	}
+	if issue.Title != "" {
+		s.Title = issue.Title
+	}
+	s.Linear.LastSyncAt = format.Now()
+	s.Linear.LastSyncError = ""
 }
 
 func ClassifyRuntimeStatus(current types.AgentStatus, runtime types.RuntimeData, now time.Time) types.AgentStatus {
@@ -93,12 +142,15 @@ func ClassifyRuntimeStatus(current types.AgentStatus, runtime types.RuntimeData,
 	if isManualStatus(current) {
 		return current
 	}
+	if looksLikeShell(runtime.CurrentCommand) {
+		return types.StatusIdle
+	}
 	lastActivity := parseRFC3339(runtime.LastActivityAt)
 	if lastActivity.IsZero() {
 		return current
 	}
 	idle := now.Sub(lastActivity)
-	if idle >= waitingAfter && looksLikePrompt(runtime.CurrentCommand, runtime.Preview) {
+	if idle >= waitingAfter && looksLikeUserApprovalPrompt(runtime.Preview) {
 		return types.StatusWaiting
 	}
 	if current == "" || current == types.StatusIdle || current == types.StatusStale || current == types.StatusCrashed || current == types.StatusWaiting {
@@ -116,17 +168,50 @@ func isManualStatus(status types.AgentStatus) bool {
 	}
 }
 
-func looksLikePrompt(command, preview string) bool {
-	command = strings.TrimSpace(strings.ToLower(command))
-	if command == "zsh" || command == "bash" || command == "fish" || command == "sh" {
+func looksLikeShell(command string) bool {
+	switch strings.TrimSpace(strings.ToLower(command)) {
+	case "zsh", "bash", "fish", "sh":
 		return true
-	}
-	lines := strings.Split(strings.TrimSpace(preview), "\n")
-	if len(lines) == 0 {
+	default:
 		return false
 	}
-	last := strings.TrimSpace(lines[len(lines)-1])
-	return strings.HasPrefix(last, ">") || strings.HasSuffix(last, "$") || strings.HasSuffix(last, "%") || strings.HasSuffix(last, "#")
+}
+
+func looksLikeUserApprovalPrompt(preview string) bool {
+	text := strings.ToLower(strings.TrimSpace(preview))
+	if text == "" {
+		return false
+	}
+	approval := []string{
+		"permission",
+		"approval",
+		"approve",
+		"allow",
+		"authorize",
+		"authorization",
+		"confirm",
+		"do you want to",
+	}
+	choice := []string{
+		"yes/no",
+		"y/n",
+		"[y/n]",
+		"(y/n)",
+		"allow/deny",
+		"approve/deny",
+		"accept",
+		"deny",
+	}
+	return containsAny(text, approval) && containsAny(text, choice)
+}
+
+func containsAny(value string, needles []string) bool {
+	for _, needle := range needles {
+		if strings.Contains(value, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 func parseRFC3339(value string) time.Time {

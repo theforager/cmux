@@ -52,8 +52,7 @@ go build -o ./cmux-dev ./cmd/cmux
 ## Daily Workflow
 
 1. Run `cmux`.
-2. Triage active sessions first: needs attention, active work, review,
-   done/other.
+2. Triage agent sessions first, then Linear worklist rows, then done / other.
 3. Use `tab` to open the full Linear worklist.
 4. Start one Linear issue, start a scoping session, or select up to 3 issues for
    a capped batch start.
@@ -172,8 +171,9 @@ The action menu is opened with `.` on a selected row.
 Common actions:
 
 - `Agent...`: open or restart an existing session, or start a new Linear agent.
-  Use left/right or h/l to switch Auto, Scoping, and Implementation modes. Auto
-  derives the mode from the Linear state.
+  Use left/right or h/l to switch Fresh, Scoping, and Implementation modes. The
+  initially selected mode is derived from the Linear state. Fresh starts an
+  empty tracked agent without pasting the cmux runbook prompt.
 - `Open workspace...`: switch between Terminal, Editor, and Remote modes with
   left/right or h/l. Terminal opens tmux shells, Editor runs local editor
   commands, and Remote shows copyable `cursor --remote`, `code --remote`, or SSH
@@ -238,7 +238,9 @@ placeholders such as `- None.`.
 - git dirty summary
 
 Scan updates conservative runtime statuses such as `crashed` and
-`waiting_for_input`. Inactivity is shown as an age, not promoted into a status.
+`waiting_for_input`. `waiting_for_input` is only for approval/permission-style
+prompts, not a normal shell or agent prompt. Inactivity is shown as an age, not
+promoted into a status.
 Manual statuses like blocked, review, done, and PR opened are preserved unless
 the runtime state makes them impossible.
 
@@ -315,7 +317,7 @@ cmux info
 cmux doctor
 cmux debug
 
-cmux agent start [ISSUE] [--scope] [--agent <cmd>] [--title <text>] [--worktree] [--no-worktree] [--prepare]
+cmux agent start [ISSUE] [--scope] [--fresh] [--agent <cmd>] [--title <text>] [--worktree] [--no-worktree] [--prepare]
 cmux agent scratch [--agent <cmd>] [--title <text>]
 cmux agent list
 cmux agent open <id>

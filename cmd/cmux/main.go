@@ -44,7 +44,7 @@ func rootCmd() *cobra.Command {
 		},
 	}
 	cmd.Version = version
-	cmd.AddCommand(newCmd(), listCmd(), attachCmd(), switchCmd(), killCmd(), titleCmd(), infoCmd(), sshCmd(), debugCmd(), agentCmd(), queueCmd(), doctorCmd())
+	cmd.AddCommand(newCmd(), listCmd(), inventoryCmd(), attachCmd(), switchCmd(), killCmd(), titleCmd(), infoCmd(), sshCmd(), debugCmd(), agentCmd(), queueCmd(), doctorCmd())
 	return cmd
 }
 
@@ -107,6 +107,76 @@ func listCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func inventoryCmd() *cobra.Command {
+	var scan bool
+	cmd := &cobra.Command{
+		Use:     "inventory",
+		Aliases: []string{"inv"},
+		Short:   "Print a local inventory of cmux sessions and worktrees",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if scan {
+				if _, err := agent.ScanWithOptions(agent.ScanOptions{RefreshLinear: false}); err != nil {
+					return err
+				}
+			}
+			sessions, err := state.List()
+			if err != nil {
+				return err
+			}
+			tmuxSessions, err := tmux.List()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "warning:", err)
+				tmuxSessions = nil
+			}
+			active := map[string]tmux.Session{}
+			for _, s := range tmuxSessions {
+				active[s.Name] = s
+			}
+			seen := map[string]bool{}
+			fmt.Printf("%-16s %-17s %-13s %-8s %-8s %-26s %-34s %s\n", "ID", "STATUS", "TYPE", "TMUX", "GIT", "BRANCH", "WORKSPACE", "TITLE")
+			for _, s := range sessions {
+				tmuxState := "down"
+				if _, ok := active[s.TmuxSession]; ok {
+					tmuxState = "up"
+					seen[s.TmuxSession] = true
+				}
+				workspace := valueOr(s.WorktreePath, s.RepoPath)
+				fmt.Printf("%-16s %-17s %-13s %-8s %-8s %-26s %-34s %s\n",
+					format.Trunc(s.ID, 16),
+					format.Trunc(string(s.Status), 17),
+					format.Trunc(inventoryType(s), 13),
+					tmuxState,
+					inventoryGitState(s),
+					format.Trunc(valueOr(s.Branch, "current"), 26),
+					format.Trunc(valueOr(workspace, "-"), 34),
+					s.Title,
+				)
+			}
+			for _, s := range tmuxSessions {
+				if seen[s.Name] {
+					continue
+				}
+				fmt.Printf("%-16s %-17s %-13s %-8s %-8s %-26s %-34s %s\n",
+					format.Trunc(tmux.Child(s.Name), 16),
+					format.Trunc(tmux.InferStatus(s.Name), 17),
+					"tmux",
+					"up",
+					inventoryPathGitState(s.Dir),
+					"-",
+					format.Trunc(valueOr(s.Dir, "-"), 34),
+					displayName(s),
+				)
+			}
+			if len(sessions) == 0 && len(tmuxSessions) == 0 {
+				fmt.Println("No cmux sessions")
+			}
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&scan, "scan", false, "refresh local runtime state before printing")
+	return cmd
 }
 
 func attachCmd() *cobra.Command {
@@ -267,7 +337,7 @@ func agentCmd() *cobra.Command {
 
 func agentStartCmd() *cobra.Command {
 	var title, agentCommand string
-	var worktree, noWorktree, prepare, scoping bool
+	var worktree, noWorktree, prepare, scoping, fresh bool
 	cmd := &cobra.Command{
 		Use:   "start [ISSUE]",
 		Short: "Start a Linear issue-backed or task-backed agent",
@@ -276,7 +346,7 @@ func agentStartCmd() *cobra.Command {
 			if len(args) > 0 {
 				issue = args[0]
 			}
-			s, err := agent.Start(agent.StartOptions{Cwd: ".", IssueKey: issue, Title: title, Agent: agentCommand, Scoping: scoping, Worktree: worktree, NoWorktree: noWorktree, PrepareOnly: prepare})
+			s, err := agent.Start(agent.StartOptions{Cwd: ".", IssueKey: issue, Title: title, Agent: agentCommand, Scoping: scoping, Fresh: fresh, Worktree: worktree, NoWorktree: noWorktree, PrepareOnly: prepare})
 			if err != nil {
 				return err
 			}
@@ -290,6 +360,7 @@ func agentStartCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&noWorktree, "no-worktree", false, "do not create worktree for issue")
 	cmd.Flags().BoolVar(&prepare, "prepare", false, "prepare state/worktree without launching")
 	cmd.Flags().BoolVar(&scoping, "scope", false, "start a scoping session for a Linear issue")
+	cmd.Flags().BoolVar(&fresh, "fresh", false, "start without pasting a cmux runbook prompt")
 	return cmd
 }
 
@@ -688,6 +759,51 @@ func displayName(s tmux.Session) string {
 		return s.Title
 	}
 	return tmux.Child(s.Name)
+}
+
+func inventoryType(s types.AgentSession) string {
+	base := string(s.Type)
+	if s.Phase == "" || s.Phase == types.PhaseWork {
+		return base
+	}
+	return base + "/" + s.Phase
+}
+
+func inventoryGitState(s types.AgentSession) string {
+	workspace := valueOr(s.WorktreePath, s.RepoPath)
+	if workspace == "" {
+		return "-"
+	}
+	if _, err := os.Stat(workspace); err != nil {
+		if os.IsNotExist(err) {
+			return "missing"
+		}
+		return "error"
+	}
+	if s.RepoPath != "" && s.WorktreePath != "" && s.RepoPath != s.WorktreePath && !gitx.WorktreeListed(s.RepoPath, s.WorktreePath) {
+		return "unlisted"
+	}
+	return inventoryPathGitState(workspace)
+}
+
+func inventoryPathGitState(path string) string {
+	if strings.TrimSpace(path) == "" {
+		return "-"
+	}
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return "missing"
+		}
+		return "error"
+	}
+	dirty, summary := gitx.StatusSummary(path)
+	if dirty {
+		return "dirty"
+	}
+	if summary == "clean" {
+		return "clean"
+	}
+	return "-"
 }
 
 func printAgent(s types.AgentSession) {

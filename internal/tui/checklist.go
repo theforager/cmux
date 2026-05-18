@@ -65,6 +65,10 @@ func (m checklistModel) Init() tea.Cmd { return nil }
 func (m checklistModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		if isSpaceToggleKey(msg) {
+			m.toggle()
+			return m, nil
+		}
 		switch msg.String() {
 		case "ctrl+c", "esc":
 			m.canceled = true
@@ -80,8 +84,6 @@ func (m checklistModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.cursor < len(m.items)-1 {
 				m.cursor++
 			}
-		case " ":
-			m.toggle()
 		case "a":
 			m.selectAll()
 		case "x":

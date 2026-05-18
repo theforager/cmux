@@ -2,8 +2,10 @@ package tui
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/theforager/cmux/internal/types"
 )
 
@@ -51,6 +53,73 @@ func TestResolvedAgentModeFromLinearState(t *testing.T) {
 	if got := resolvedAgentMode(row{linearState: "Backlog", queueIssue: "REB-1"}, agentModeImplementation); got != agentModeImplementation {
 		t.Fatalf("override mode = %s, want Implementation", agentModeLabel(got))
 	}
+	if got := resolvedAgentMode(row{linearState: "Todo", queueIssue: "REB-1"}, agentModeFresh); got != agentModeFresh {
+		t.Fatalf("fresh mode = %s, want Fresh", agentModeLabel(got))
+	}
+}
+
+func TestRenderAgentTabsShowsOnlyConcreteModes(t *testing.T) {
+	r := row{linearState: "Backlog", queueIssue: "REB-1"}
+	got := renderAgentTabs(r, agentModeScoping)
+	if strings.Contains(got, "Auto") {
+		t.Fatalf("tabs should not show an Auto tab: %q", got)
+	}
+	for _, want := range []string{"Fresh", "Scoping", "Implementation"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("tabs missing %q: %q", want, got)
+		}
+	}
+}
+
+func TestFreshAgentModeUsesFreshCreation(t *testing.T) {
+	m := model{filtered: []row{{id: "REB-1", kind: "queue", queueIssue: "REB-1", repo: "/tmp/repo"}}, agentMode: agentModeFresh}
+	if err := m.prepareAgentStart(); err != nil {
+		t.Fatal(err)
+	}
+	if m.create != "queueFresh" {
+		t.Fatalf("create = %q, want queueFresh", m.create)
+	}
+}
+
+func TestAgentPanelStartPromptsForRepo(t *testing.T) {
+	m := model{filtered: []row{{id: "REB-1", kind: "queue", queueIssue: "REB-1", repo: "/tmp/repo"}}, agentMode: agentModeImplementation}
+	if err := m.startAgentFromPanel("codex"); err != nil {
+		t.Fatal(err)
+	}
+	if m.mode != "repoPick" {
+		t.Fatalf("mode = %q, want repoPick", m.mode)
+	}
+	if m.createAgent != "codex" {
+		t.Fatalf("createAgent = %q, want codex", m.createAgent)
+	}
+	if m.create != "queue" || m.target != "REB-1" || m.createRepo != "/tmp/repo" {
+		t.Fatalf("create state = %q/%q/%q", m.create, m.target, m.createRepo)
+	}
+}
+
+func TestShiftSpaceTogglesQueueSelection(t *testing.T) {
+	m := model{
+		filtered:      []row{{id: "REB-1", kind: "queue", queueIssue: "REB-1"}},
+		fullQueue:     true,
+		mode:          "browse",
+		selectedQueue: map[string]bool{},
+	}
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'\u00a0'}})
+	got := next.(model)
+	if !got.selectedQueue["REB-1"] {
+		t.Fatalf("shift-space-like key did not toggle queue selection")
+	}
+}
+
+func TestDashboardGroupKeepsAttentionAsRowStatus(t *testing.T) {
+	for _, status := range []types.AgentStatus{types.StatusWaiting, types.StatusBlocked, types.StatusReadyForReview, types.StatusRunning} {
+		if got := dashboardGroup(status); got != "Agent sessions" {
+			t.Fatalf("%s group = %q, want Agent sessions", status, got)
+		}
+	}
+	if got := dashboardGroup(types.StatusDone); got != "Done / other" {
+		t.Fatalf("done group = %q", got)
+	}
 }
 
 func TestStructuredActionsAreSimple(t *testing.T) {
@@ -77,9 +146,35 @@ func TestStructuredActionsAreSimple(t *testing.T) {
 	}
 }
 
+func TestSubmitActionRunsAsBusyCommand(t *testing.T) {
+	m := model{
+		filtered: []row{{
+			id:         "REB-1",
+			status:     string(types.StatusRunning),
+			workspace:  "/tmp/cmux-worktree",
+			repo:       "/tmp/repo",
+			structured: true,
+			active:     true,
+		}},
+		mode:           "actionMenu",
+		actionSelected: 2,
+		selectedQueue:  map[string]bool{},
+	}
+	cmd, err := m.chooseAction()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cmd == nil {
+		t.Fatal("submit action should return a command")
+	}
+	if m.mode != "busy" || !strings.Contains(m.message, "Submitting") {
+		t.Fatalf("mode/message = %q/%q, want busy submitting", m.mode, m.message)
+	}
+}
+
 func TestLocalStateClusterKeepsBadgesWithCmuxState(t *testing.T) {
 	r := row{status: string(types.StatusWaiting), workspaceShells: []string{"cmux@workspace@REB-1"}}
-	if got := localStateCluster(r); got != "◐ waiting ⧉" {
+	if got := localStateCluster(r); got != "▲ waiting ⧉" {
 		t.Fatalf("localStateCluster = %q, want waiting with workspace badge", got)
 	}
 	r = row{kind: "queue", status: "queued", queueIssue: "REB-2"}

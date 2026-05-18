@@ -129,10 +129,14 @@ func Create(o CreateOptions) error {
 		_ = SetEnv(o.Name, "CMUX_TITLE", o.Title)
 	}
 	if o.Command != "" {
-		_, err := process.Run("tmux", "send-keys", "-t", o.Name, "exec "+o.Command, "Enter")
+		_, err := process.Run("tmux", "send-keys", "-t", o.Name, startCommand(o.Command), "Enter")
 		return err
 	}
 	return nil
+}
+
+func startCommand(command string) string {
+	return strings.TrimSpace(command)
 }
 
 func EnsureKeyOptions() error {
@@ -325,21 +329,8 @@ func InferStatus(session string) string {
 		return "crashed"
 	}
 	idle := time.Now().Unix() - info.LastActivityUnix
-	preview := Capture(session, 5)
-	lastLine := ""
-	lines := strings.Split(preview, "\n")
-	if len(lines) > 0 {
-		lastLine = strings.TrimSpace(lines[len(lines)-1])
-	}
-	lower := strings.ToLower(lastLine)
-	if strings.Contains(lower, "error") || strings.Contains(lower, "failed") || strings.Contains(lower, "fatal") {
-		return "crashed"
-	}
 	if idle < 2 {
 		return "running"
-	}
-	if strings.HasPrefix(lastLine, ">") || strings.HasSuffix(lastLine, "$") || strings.HasSuffix(lastLine, "%") || strings.HasSuffix(lastLine, "❯") {
-		return "waiting_for_input"
 	}
 	return "idle"
 }

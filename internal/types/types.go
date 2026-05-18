@@ -8,16 +8,32 @@ const (
 	TypeScratch     AgentSessionType = "scratch"
 )
 
+type AgentProfile string
+
 const (
-	PhaseWork    = "work"
-	PhaseScoping = "scoping"
-	PhaseFresh   = "fresh"
+	ProfileGeneral   AgentProfile = "general"
+	ProfilePlan      AgentProfile = "plan"
+	ProfileImplement AgentProfile = "implement"
+	ProfileDebug     AgentProfile = "debug"
+	ProfileReview    AgentProfile = "review"
+	ProfileCustom    AgentProfile = "custom"
+)
+
+type BriefKind string
+
+const (
+	BriefGeneral        BriefKind = "general"
+	BriefPlan           BriefKind = "plan"
+	BriefImplementation BriefKind = "implementation"
+	BriefDebug          BriefKind = "debug"
+	BriefReview         BriefKind = "review"
 )
 
 type AgentStatus string
 
 const (
 	StatusRunning        AgentStatus = "running"
+	StatusStopped        AgentStatus = "stopped"
 	StatusIdle           AgentStatus = "idle"
 	StatusWaiting        AgentStatus = "waiting_for_input"
 	StatusBlocked        AgentStatus = "blocked"
@@ -54,6 +70,21 @@ type RuntimeData struct {
 	GitSummary     string `json:"gitSummary,omitempty"`
 }
 
+type BriefData struct {
+	Kind                   BriefKind `json:"kind,omitempty"`
+	SourcePath             string    `json:"sourcePath,omitempty"`
+	PublishedHash          string    `json:"publishedHash,omitempty"`
+	PublishedAt            string    `json:"publishedAt,omitempty"`
+	PublishedLinearIssueID string    `json:"publishedLinearIssueId,omitempty"`
+	PublishedBlockVersion  string    `json:"publishedBlockVersion,omitempty"`
+	LastPublishError       string    `json:"lastPublishError,omitempty"`
+	LastSyncAt             string    `json:"lastSyncAt,omitempty"`
+	LastSyncError          string    `json:"lastSyncError,omitempty"`
+	PublishedGitHead       string    `json:"publishedGitHead,omitempty"`
+	PublishedGitDiffHash   string    `json:"publishedGitDiffHash,omitempty"`
+	PublishedBranch        string    `json:"publishedBranch,omitempty"`
+}
+
 type AgentSession struct {
 	SchemaVersion int              `json:"schemaVersion"`
 	ID            string           `json:"id"`
@@ -66,8 +97,9 @@ type AgentSession struct {
 	WorktreePath  string           `json:"worktreePath,omitempty"`
 	Branch        string           `json:"branch,omitempty"`
 	Linear        LinearData       `json:"linear,omitempty"`
-	Phase         string           `json:"phase,omitempty"`
+	Profile       AgentProfile     `json:"profile,omitempty"`
 	Runtime       RuntimeData      `json:"runtime,omitempty"`
+	Brief         BriefData        `json:"brief,omitempty"`
 	Status        AgentStatus      `json:"status"`
 	LastSummary   string           `json:"lastSummary,omitempty"`
 	NeedsHuman    bool             `json:"needsHuman"`
@@ -134,21 +166,6 @@ type RepoConfig struct {
 	Path string `json:"path"`
 }
 
-type LinearTransition struct {
-	State        string   `json:"state,omitempty"`
-	AddLabels    []string `json:"addLabels,omitempty"`
-	RemoveLabels []string `json:"removeLabels,omitempty"`
-	PlaceAtTop   bool     `json:"placeAtTop,omitempty"`
-}
-
-type LinearWorkflowConfig struct {
-	Transitions map[string]LinearTransition `json:"transitions,omitempty"`
-}
-
-type LinearConfig struct {
-	Workflow LinearWorkflowConfig `json:"workflow,omitempty"`
-}
-
 type Config struct {
 	DefaultAgent         string        `json:"defaultAgent,omitempty"`
 	DefaultRepoPath      string        `json:"defaultRepoPath,omitempty"`
@@ -158,5 +175,4 @@ type Config struct {
 	EditorCommands       []string      `json:"editorCommands,omitempty"`
 	QueuePresets         []QueuePreset `json:"queuePresets,omitempty"`
 	DefaultQueuePreset   string        `json:"defaultQueuePreset,omitempty"`
-	Linear               LinearConfig  `json:"linear,omitempty"`
 }

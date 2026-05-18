@@ -1,6 +1,10 @@
 package linear
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/theforager/cmux/internal/types"
+)
 
 func TestBuildIssueFilter(t *testing.T) {
 	filter := BuildIssueFilter(IssueFilterOptions{
@@ -27,5 +31,30 @@ func TestBuildIssueFilterOpenOnly(t *testing.T) {
 	filter := BuildIssueFilter(IssueFilterOptions{OpenOnly: true})
 	if filter["state"] == nil {
 		t.Fatalf("missing state filter: %+v", filter)
+	}
+}
+
+func TestResolveWorkflowStateIDPrefersTeamMatch(t *testing.T) {
+	states := []types.LinearWorkflowState{
+		{ID: "review-a", Name: "Review", TeamID: "team-a"},
+		{ID: "review-b", Name: "Review", TeamID: "team-b"},
+	}
+	got, err := ResolveWorkflowStateIDFromStates(states, "review", "team-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "review-b" {
+		t.Fatalf("state id = %q, want review-b", got)
+	}
+}
+
+func TestResolveWorkflowStateIDAcceptsID(t *testing.T) {
+	states := []types.LinearWorkflowState{{ID: "todo-id", Name: "Todo"}}
+	got, err := ResolveWorkflowStateIDFromStates(states, "todo-id", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "todo-id" {
+		t.Fatalf("state id = %q, want todo-id", got)
 	}
 }

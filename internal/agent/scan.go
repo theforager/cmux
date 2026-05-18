@@ -5,10 +5,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/theforager/cmux/internal/brief"
 	"github.com/theforager/cmux/internal/format"
 	"github.com/theforager/cmux/internal/gitx"
+	"github.com/theforager/cmux/internal/home"
 	"github.com/theforager/cmux/internal/linear"
-	"github.com/theforager/cmux/internal/runbook"
 	"github.com/theforager/cmux/internal/state"
 	"github.com/theforager/cmux/internal/tmux"
 	"github.com/theforager/cmux/internal/types"
@@ -80,9 +81,15 @@ func scanSession(s types.AgentSession, now time.Time, o ScanOptions) types.Agent
 	if workspace != "" {
 		runtime.GitDirty, runtime.GitSummary = gitx.StatusSummary(workspace)
 	}
-	notes := runbook.Read(s.ID)
+	notes := brief.Read(s.ID)
 	if preview := notes.Preview(); preview != "" {
 		s.LastSummary = preview
+	}
+	if s.Brief.SourcePath == "" {
+		s.Brief.SourcePath = home.BriefPath(s.ID)
+	}
+	if s.Brief.Kind == "" {
+		s.Brief.Kind = types.BriefGeneral
 	}
 	s.Runtime = runtime
 	s.Status = ClassifyRuntimeStatus(s.Status, runtime, now)
@@ -134,7 +141,7 @@ func ClassifyRuntimeStatus(current types.AgentStatus, runtime types.RuntimeData,
 		return types.StatusCrashed
 	}
 	if !runtime.TmuxAlive {
-		if current == types.StatusIdle || isManualStatus(current) {
+		if current == types.StatusIdle || current == types.StatusStopped || isManualStatus(current) {
 			return current
 		}
 		return types.StatusCrashed

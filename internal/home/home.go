@@ -31,8 +31,8 @@ func SessionPath(id string) string {
 	return filepath.Join(SessionDir(id), "session.json")
 }
 
-func RunbookPath(id string) string {
-	return filepath.Join(SessionDir(id), "RUNBOOK.md")
+func BriefPath(id string) string {
+	return filepath.Join(SessionDir(id), "BRIEF.md")
 }
 
 func WorktreesDir() string {

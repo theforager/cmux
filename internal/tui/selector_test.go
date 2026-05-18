@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/theforager/cmux/internal/queue"
 	"github.com/theforager/cmux/internal/types"
 )
 
@@ -43,14 +44,14 @@ func TestShellQuote(t *testing.T) {
 	}
 }
 
-func TestResolvedAgentModeFromLinearState(t *testing.T) {
-	if got := resolvedAgentMode(row{linearState: "Backlog", queueIssue: "REB-1"}, agentModeAuto); got != agentModeScoping {
-		t.Fatalf("Backlog mode = %s, want Scoping", agentModeLabel(got))
+func TestResolvedAgentModeFromProfile(t *testing.T) {
+	if got := resolvedAgentMode(row{profile: string(types.ProfilePlan), queueIssue: "REB-1"}, agentModeAuto); got != agentModePlan {
+		t.Fatalf("plan profile mode = %s, want Plan", agentModeLabel(got))
 	}
-	if got := resolvedAgentMode(row{linearState: "Todo", queueIssue: "REB-1"}, agentModeAuto); got != agentModeImplementation {
-		t.Fatalf("Todo mode = %s, want Implementation", agentModeLabel(got))
+	if got := resolvedAgentMode(row{linearState: "Backlog", queueIssue: "REB-1"}, agentModeAuto); got != agentModeImplementation {
+		t.Fatalf("Linear state should not infer profile, got %s", agentModeLabel(got))
 	}
-	if got := resolvedAgentMode(row{linearState: "Backlog", queueIssue: "REB-1"}, agentModeImplementation); got != agentModeImplementation {
+	if got := resolvedAgentMode(row{profile: string(types.ProfilePlan), queueIssue: "REB-1"}, agentModeImplementation); got != agentModeImplementation {
 		t.Fatalf("override mode = %s, want Implementation", agentModeLabel(got))
 	}
 	if got := resolvedAgentMode(row{linearState: "Todo", queueIssue: "REB-1"}, agentModeFresh); got != agentModeFresh {
@@ -60,11 +61,11 @@ func TestResolvedAgentModeFromLinearState(t *testing.T) {
 
 func TestRenderAgentTabsShowsOnlyConcreteModes(t *testing.T) {
 	r := row{linearState: "Backlog", queueIssue: "REB-1"}
-	got := renderAgentTabs(r, agentModeScoping)
+	got := renderAgentTabs(r, agentModePlan)
 	if strings.Contains(got, "Auto") {
 		t.Fatalf("tabs should not show an Auto tab: %q", got)
 	}
-	for _, want := range []string{"Fresh", "Scoping", "Implementation"} {
+	for _, want := range []string{"Fresh", "Plan", "Implement", "Debug", "Review"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("tabs missing %q: %q", want, got)
 		}
@@ -97,6 +98,43 @@ func TestAgentPanelStartPromptsForRepo(t *testing.T) {
 	}
 }
 
+func TestStructuredAgentPanelOffersRuntimeControls(t *testing.T) {
+	r := row{
+		id:         "REB-1",
+		agent:      "codex",
+		active:     true,
+		structured: true,
+		linear:     "https://linear.app/acme/issue/REB-1",
+		queueIssue: "REB-1",
+		profile:    string(types.ProfileImplement),
+	}
+	choices := agentActionChoices(r, agentModeReview)
+	got := make([]string, 0, len(choices))
+	for _, choice := range choices {
+		got = append(got, choice.id)
+	}
+	want := []string{"openExisting", "stopExisting", "restartExisting", "startFreshExisting"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("agentActionChoices = %#v, want %#v", got, want)
+	}
+	if choices[3].command != "codex" || !strings.Contains(choices[3].description, "Review") {
+		t.Fatalf("fresh choice = %+v, want codex review", choices[3])
+	}
+}
+
+func TestStoppedStructuredAgentPanelOffersRestartAndFresh(t *testing.T) {
+	r := row{id: "REB-1", agent: "claude", structured: true, queueIssue: "REB-1"}
+	choices := agentActionChoices(r, agentModePlan)
+	got := make([]string, 0, len(choices))
+	for _, choice := range choices {
+		got = append(got, choice.id)
+	}
+	want := []string{"restartExisting", "startFreshExisting"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("agentActionChoices = %#v, want %#v", got, want)
+	}
+}
+
 func TestShiftSpaceTogglesQueueSelection(t *testing.T) {
 	m := model{
 		filtered:      []row{{id: "REB-1", kind: "queue", queueIssue: "REB-1"}},
@@ -108,6 +146,25 @@ func TestShiftSpaceTogglesQueueSelection(t *testing.T) {
 	got := next.(model)
 	if !got.selectedQueue["REB-1"] {
 		t.Fatalf("shift-space-like key did not toggle queue selection")
+	}
+}
+
+func TestDashboardQueueRowsFillAfterSkippingStarted(t *testing.T) {
+	rows := []queue.Row{
+		{Issue: types.LinearIssue{Identifier: "REB-1"}, Started: true, Session: &types.AgentSession{ID: "REB-1"}},
+		{Issue: types.LinearIssue{Identifier: "REB-2"}, Started: true, Session: &types.AgentSession{ID: "REB-2"}},
+		{Issue: types.LinearIssue{Identifier: "REB-3"}},
+		{Issue: types.LinearIssue{Identifier: "REB-4"}},
+		{Issue: types.LinearIssue{Identifier: "REB-5"}},
+	}
+	got := queueRowsFromLinearRows(rows, types.QueuePreset{Name: "test"}, false, nil, 3)
+	ids := make([]string, 0, len(got))
+	for _, row := range got {
+		ids = append(ids, row.id)
+	}
+	want := []string{"REB-3", "REB-4", "REB-5"}
+	if !reflect.DeepEqual(ids, want) {
+		t.Fatalf("queue rows = %#v, want %#v", ids, want)
 	}
 }
 
@@ -137,16 +194,16 @@ func TestStructuredActionsAreSimple(t *testing.T) {
 	for _, action := range actions {
 		got = append(got, action.id)
 	}
-	want := []string{"agentOpen", "workspaceOpen", "submit", "abandon", "detail", "title", "deleteWorktree"}
+	want := []string{"agentOpen", "workspaceOpen", "briefPublish", "linearMove", "detail", "title", "close", "forget", "deleteWorktree"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("actionsFor structured = %#v, want %#v", got, want)
 	}
-	if actionSection("agentOpen") != "Open" || actionSection("workspaceOpen") != "Open" {
-		t.Fatalf("agent and workspace actions should share the Open section")
+	if actionSection("agentOpen") != "Agent" || actionSection("workspaceOpen") != "Workspace" || actionSection("briefPublish") != "Brief" || actionSection("linearMove") != "Linear" {
+		t.Fatalf("actions should use stable sections")
 	}
 }
 
-func TestSubmitActionRunsAsBusyCommand(t *testing.T) {
+func TestPublishBriefActionRunsAsBusyCommand(t *testing.T) {
 	m := model{
 		filtered: []row{{
 			id:         "REB-1",
@@ -165,10 +222,10 @@ func TestSubmitActionRunsAsBusyCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cmd == nil {
-		t.Fatal("submit action should return a command")
+		t.Fatal("publish action should return a command")
 	}
-	if m.mode != "busy" || !strings.Contains(m.message, "Submitting") {
-		t.Fatalf("mode/message = %q/%q, want busy submitting", m.mode, m.message)
+	if m.mode != "busy" || !strings.Contains(m.message, "Publishing") {
+		t.Fatalf("mode/message = %q/%q, want busy publishing", m.mode, m.message)
 	}
 }
 

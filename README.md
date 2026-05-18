@@ -12,9 +12,9 @@ sync with the parts of the workflow that should outlive the terminal.
 - Linear issue-backed agent sessions
 - Task-backed and scratch sessions
 - Per-session git worktrees
-- Local runbooks for durable agent context
+- Local session briefs for durable handoff context
 - Linear worklist presets and queue browsing
-- Session lifecycle actions: scope, review, done, close, forget, reset
+- Explicit session actions: publish brief, move Linear status, close, forget, reset
 
 Most day-to-day use starts with:
 
@@ -54,10 +54,10 @@ go build -o ./cmux-dev ./cmd/cmux
 1. Run `cmux`.
 2. Triage agent sessions first, then Linear worklist rows, then done / other.
 3. Use `tab` to open the full Linear worklist.
-4. Start one Linear issue, start a scoping session, or select up to 3 issues for
-   a capped batch start.
-5. Use `.` on a row for open, submit, abandon, inspect, rename, and advanced
-   worktree cleanup actions.
+4. Start one Linear issue with a selected agent profile, or select up to 3
+   issues for a capped batch start.
+5. Use `.` on a row for agent, workspace, brief, Linear, session, and recovery
+   actions.
 
 The main dashboard shows only a bounded Linear section. The full Linear
 worklist lives behind `tab` or `cmux queue`.
@@ -164,68 +164,54 @@ scratch sessions can use non-git folders.
 If a Linear issue already has a cmux session, cmux opens or recovers that
 session instead of starting duplicate work.
 
-## Session Lifecycle
+## Session Actions
 
 The action menu is opened with `.` on a selected row.
 
 Common actions:
 
 - `Agent...`: open or restart an existing session, or start a new Linear agent.
-  Use left/right or h/l to switch Fresh, Scoping, and Implementation modes. The
-  initially selected mode is derived from the Linear state. Fresh starts an
-  empty tracked agent without pasting the cmux runbook prompt.
+  Use left/right or h/l to choose Fresh, Plan, Implement, Debug, or Review. The
+  profile changes agent instructions and the default brief template; it does
+  not imply a Linear workflow state.
 - `Open workspace...`: switch between Terminal, Editor, and Remote modes with
   left/right or h/l. Terminal opens tmux shells, Editor runs local editor
   commands, and Remote shows copyable `cursor --remote`, `code --remote`, or SSH
   cd commands. If no SSH target is saved, cmux prompts once and remembers it.
-- `Submit work`: publish the right Linear handoff for the current mode, then
-  close the local cmux session. Dirty workspaces are refused so changes are not
-  lost.
-- `Abandon`: move this attempt back to its queue state and close the local cmux
-  session. cmux-owned worktrees are discarded.
+- `Publish brief`: publish the rendered session brief to Linear. This does not
+  move Linear status or close the session.
+- `Move issue to...`: explicitly move the Linear issue to a selected workflow
+  state by name or id.
+- `Close session`: stop the agent and remove a clean cmux-owned worktree.
+  Dirty workspaces and unpublished Linear-backed briefs are refused.
+- `Forget session`: remove local cmux state while keeping the workspace.
 - `Rename session`: change the cmux display name.
 - `Delete worktree`: advanced escape hatch for removing a cmux-owned worktree.
   Clean worktrees require `y`; dirty worktrees require typing the session id.
 
-## Runbooks And Scoping
+## Session Briefs
 
-Every structured session has a local runbook:
-
-```text
-~/.cmux/sessions/<session-id>/RUNBOOK.md
-```
-
-The runbook is local durable context for the agent. Implementation sessions keep
-it lean: current state, decisions, tests, next action, and review notes. It
-should contain technical context, not a mirror of Linear status.
-
-For scoping sessions, the runbook becomes the handoff. When `Submit work` or
-`cmux agent scoped` runs, cmux reads the useful runbook sections and writes a
-replaceable `cmux scoped handoff` block into the Linear issue description. That
-lets the next coding agent start from Linear alone, even if the scoping tmux
-session is gone.
-
-Scoping runbooks use a handoff-focused shape:
+Every structured session has a local session brief:
 
 ```text
-Goal
-Current understanding
-Key decisions
-Proposed plan
-Acceptance criteria
-Open questions / risks
-User confirmation
-Next coding steps
+~/.cmux/sessions/<session-id>/BRIEF.md
 ```
 
-Before a scoping session can be marked scoped, the runbook must record user
-confirmation. The agent should walk through key decisions, open questions, and
-the proposed plan with the user, then record the approval under
-`## User confirmation`. This is separate from merely approving the command to
-run.
+The brief is the current user-facing deliverable for the session. It should
+stay concise and useful for handoff, publication, review, and future context.
+It should contain technical context, not a mirror of Linear status.
 
-The Linear scoped handoff preserves markdown and skips local/status-only
-placeholders such as `- None.`.
+Agent profiles choose the default brief shape:
+
+- Plan: goal, current understanding, decisions, plan, open questions, next steps.
+- Implement: summary, changes made, tests run, risks/follow-up, reviewer notes,
+  branch/PR.
+- Debug: symptom, findings, root cause, fix, verification.
+- Review: summary, findings, changes requested, tests run, reviewer notes.
+
+Publishing writes a cmux-owned Linear comment block and records the rendered
+brief hash. Republish updates the cmux-owned comment. Manual Linear content
+outside cmux-owned content is not changed.
 
 ## Runtime Scan
 
@@ -266,7 +252,7 @@ Session metadata lives at:
 
 ```text
 ~/.cmux/sessions/<session-id>/session.json
-~/.cmux/sessions/<session-id>/RUNBOOK.md
+~/.cmux/sessions/<session-id>/BRIEF.md
 ```
 
 ## Configuration
@@ -285,24 +271,11 @@ Important fields:
 - `editorCommands`: remembered editor commands and executable paths.
 - `defaultSshTarget`: remembered SSH target for remote workspace commands.
 - `queuePresets`: saved Linear worklist presets.
-- `linear.workflow.transitions`: Linear lifecycle mapping for start, scoped,
-  review, done, and abandon actions.
-
-Default Linear workflow behavior:
-
-- Start scoping -> `Scoping`, add `cmux`, remove `needs-review`
-- Submit scoping -> `Todo`, add `cmux`, remove `needs-review`
-- Start work -> `In Progress`, add `cmux`, remove `needs-review`
-- Submit implementation -> add `cmux` and `needs-review`
-- Submit review -> `Done`, remove `needs-review`, place at top of Done
-- Abandon -> original queue state, remove `needs-review`
-
-Workflow names are configurable so cmux can adapt to different Linear boards.
 
 ## CLI Reference
 
 The TUI is the normal workflow, but CLI hooks are useful for scripting and
-agent-invoked lifecycle updates.
+agent-invoked cmux actions.
 
 ```text
 cmux
@@ -317,22 +290,27 @@ cmux info
 cmux doctor
 cmux debug
 
-cmux agent start [ISSUE] [--scope] [--fresh] [--agent <cmd>] [--title <text>] [--worktree] [--no-worktree] [--prepare]
+cmux agent start [ISSUE] [--profile <profile>] [--agent <cmd>] [--title <text>] [--worktree] [--no-worktree] [--prepare]
+cmux agent fresh <ISSUE> [--profile <profile>] [--agent <cmd>]
 cmux agent scratch [--agent <cmd>] [--title <text>]
 cmux agent list
 cmux agent open <id>
 cmux agent path <id>
 cmux agent scan
 cmux agent restart <id>
-cmux agent cleanup <id> [--force]
-cmux agent reset <id> --confirm <id>
-cmux agent scoped <id> [summary]
-cmux agent needs-review <id> [summary]
-cmux agent abandon <id> [summary]
+cmux agent stop <id>
 cmux agent status <id> <status> [summary]
 cmux agent block <id> [summary]
-cmux agent review <id> [summary]
-cmux agent done <id> [summary]
+
+cmux brief open <id>
+cmux brief preview <id>
+cmux brief publish <id>
+cmux brief diff <id>
+
+cmux linear move <id> <state>
+
+cmux session close <id>
+cmux session forget <id>
 
 cmux queue
 cmux queue list [preset]

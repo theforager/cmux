@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	"github.com/theforager/cmux/internal/agent"
+	"github.com/theforager/cmux/internal/brief"
 	"github.com/theforager/cmux/internal/config"
 	"github.com/theforager/cmux/internal/format"
 	"github.com/theforager/cmux/internal/gitx"
@@ -44,7 +45,7 @@ func rootCmd() *cobra.Command {
 		},
 	}
 	cmd.Version = version
-	cmd.AddCommand(newCmd(), listCmd(), inventoryCmd(), attachCmd(), switchCmd(), killCmd(), titleCmd(), infoCmd(), sshCmd(), debugCmd(), agentCmd(), queueCmd(), doctorCmd())
+	cmd.AddCommand(newCmd(), listCmd(), inventoryCmd(), attachCmd(), switchCmd(), killCmd(), titleCmd(), infoCmd(), sshCmd(), debugCmd(), agentCmd(), briefCmd(), linearCmd(), sessionCmd(), queueCmd(), doctorCmd())
 	return cmd
 }
 
@@ -331,13 +332,13 @@ func doctorCmd() *cobra.Command {
 
 func agentCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "agent", Short: "Structured agent orchestration"}
-	cmd.AddCommand(agentStartCmd(), agentScratchCmd(), agentListCmd(), agentOpenCmd(), agentPathCmd(), agentScanCmd(), agentRestartCmd(), agentCleanupCmd(), agentResetCmd(), agentNeedsReviewCmd(), agentScopedCmd(), agentAbandonCmd(), agentStatusCmd("status"), agentStatusCmd("block"), agentStatusCmd("review"), agentStatusCmd("done"))
+	cmd.AddCommand(agentStartCmd(), agentFreshCmd(), agentScratchCmd(), agentListCmd(), agentOpenCmd(), agentPathCmd(), agentScanCmd(), agentRestartCmd(), agentStopCmd(), agentStatusCmd("status"), agentStatusCmd("block"))
 	return cmd
 }
 
 func agentStartCmd() *cobra.Command {
-	var title, agentCommand string
-	var worktree, noWorktree, prepare, scoping, fresh bool
+	var title, agentCommand, profile string
+	var worktree, noWorktree, prepare bool
 	cmd := &cobra.Command{
 		Use:   "start [ISSUE]",
 		Short: "Start a Linear issue-backed or task-backed agent",
@@ -346,7 +347,7 @@ func agentStartCmd() *cobra.Command {
 			if len(args) > 0 {
 				issue = args[0]
 			}
-			s, err := agent.Start(agent.StartOptions{Cwd: ".", IssueKey: issue, Title: title, Agent: agentCommand, Scoping: scoping, Fresh: fresh, Worktree: worktree, NoWorktree: noWorktree, PrepareOnly: prepare})
+			s, err := agent.Start(agent.StartOptions{Cwd: ".", IssueKey: issue, Title: title, Agent: agentCommand, Profile: parseProfile(profile), Worktree: worktree, NoWorktree: noWorktree, PrepareOnly: prepare})
 			if err != nil {
 				return err
 			}
@@ -356,21 +357,43 @@ func agentStartCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVarP(&title, "title", "t", "", "task title")
 	cmd.Flags().StringVarP(&agentCommand, "agent", "a", "", "agent command")
+	cmd.Flags().StringVar(&profile, "profile", string(types.ProfileGeneral), "agent profile: general, plan, implement, debug, review, custom")
 	cmd.Flags().BoolVar(&worktree, "worktree", false, "create worktree for task")
 	cmd.Flags().BoolVar(&noWorktree, "no-worktree", false, "do not create worktree for issue")
 	cmd.Flags().BoolVar(&prepare, "prepare", false, "prepare state/worktree without launching")
-	cmd.Flags().BoolVar(&scoping, "scope", false, "start a scoping session for a Linear issue")
-	cmd.Flags().BoolVar(&fresh, "fresh", false, "start without pasting a cmux runbook prompt")
+	return cmd
+}
+
+func agentFreshCmd() *cobra.Command {
+	var agentCommand, profile string
+	cmd := &cobra.Command{
+		Use:   "fresh <ISSUE>",
+		Short: "Start a fresh agent with the selected profile and current context",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			s, err := agent.Fresh(args[0], agentCommand, parseProfile(profile))
+			if err != nil {
+				s, err = agent.Start(agent.StartOptions{Cwd: ".", IssueKey: args[0], Agent: agentCommand, Profile: parseProfile(profile), Fresh: true})
+			}
+			if err != nil {
+				return err
+			}
+			printAgent(s)
+			return nil
+		},
+	}
+	cmd.Flags().StringVarP(&agentCommand, "agent", "a", "", "agent command")
+	cmd.Flags().StringVar(&profile, "profile", string(types.ProfileImplement), "agent profile: general, plan, implement, debug, review, custom")
 	return cmd
 }
 
 func agentScratchCmd() *cobra.Command {
-	var title, agentCommand string
+	var title, agentCommand, profile string
 	cmd := &cobra.Command{
 		Use:   "scratch",
 		Short: "Start a scratch agent",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			s, err := agent.Start(agent.StartOptions{Cwd: ".", Scratch: true, Title: title, Agent: agentCommand})
+			s, err := agent.Start(agent.StartOptions{Cwd: ".", Scratch: true, Title: title, Agent: agentCommand, Profile: parseProfile(profile)})
 			if err != nil {
 				return err
 			}
@@ -380,6 +403,7 @@ func agentScratchCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVarP(&title, "title", "t", "Scratch session", "scratch title")
 	cmd.Flags().StringVarP(&agentCommand, "agent", "a", "", "agent command")
+	cmd.Flags().StringVar(&profile, "profile", string(types.ProfileGeneral), "agent profile: general, plan, implement, debug, review, custom")
 	return cmd
 }
 
@@ -473,43 +497,19 @@ func agentRestartCmd() *cobra.Command {
 	}
 }
 
-func agentCleanupCmd() *cobra.Command {
-	var force bool
-	cmd := &cobra.Command{
-		Use:   "cleanup <id>",
-		Short: "Remove a structured agent worktree if it is clean",
+func agentStopCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "stop <id>",
+		Short: "Stop an agent tmux session without closing the cmux session",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := agent.CleanupWorktree(args[0], force); err != nil {
+			if err := agent.Kill(args[0]); err != nil {
 				return err
 			}
-			fmt.Println("Cleaned up worktree and deleted session:", args[0])
+			fmt.Println("Stopped agent:", args[0])
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&force, "force", false, "force cleanup dirty or external worktree")
-	return cmd
-}
-
-func agentResetCmd() *cobra.Command {
-	var confirm string
-	cmd := &cobra.Command{
-		Use:   "reset <id>",
-		Short: "Reset a cmux-owned worktree with git reset --hard and git clean -fd",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			if confirm != args[0] {
-				return fmt.Errorf("refusing reset; pass --confirm %s", args[0])
-			}
-			if err := agent.ResetWorkspace(args[0]); err != nil {
-				return err
-			}
-			fmt.Println("Reset workspace:", args[0])
-			return nil
-		},
-	}
-	cmd.Flags().StringVar(&confirm, "confirm", "", "session id required to confirm destructive reset")
-	return cmd
 }
 
 func queueCmd() *cobra.Command {
@@ -654,10 +654,6 @@ func agentStatusCmd(kind string) *cobra.Command {
 			switch kind {
 			case "block":
 				status = types.StatusBlocked
-			case "review":
-				status = types.StatusReadyForReview
-			case "done":
-				status = types.StatusDone
 			case "status":
 				if len(args) < 2 {
 					return fmt.Errorf("usage: cmux agent status <id> <status> [summary]")
@@ -667,13 +663,7 @@ func agentStatusCmd(kind string) *cobra.Command {
 					summary = joinArgs(args[2:])
 				}
 			}
-			var s types.AgentSession
-			var err error
-			if kind == "done" {
-				s, err = agent.Complete(id, summary)
-			} else {
-				s, err = agent.SetStatus(id, status, summary)
-			}
+			s, err := agent.SetStatus(id, status, summary)
 			if err != nil {
 				return err
 			}
@@ -683,62 +673,128 @@ func agentStatusCmd(kind string) *cobra.Command {
 	}
 }
 
-func agentScopedCmd() *cobra.Command {
+func briefCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "brief", Short: "Preview and publish the session brief"}
+	cmd.AddCommand(briefOpenCmd(), briefPreviewCmd(), briefPublishCmd(), briefDiffCmd())
+	return cmd
+}
+
+func briefOpenCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "scoped <id> [summary]",
-		Short: "Mark a scoping session scoped and move the Linear issue to its ready state",
-		Args:  cobra.MinimumNArgs(1),
+		Use:   "open <id>",
+		Short: "Print the session brief path",
+		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			summary := ""
-			if len(args) > 1 {
-				summary = joinArgs(args[1:])
-			}
-			s, err := agent.MarkScoped(args[0], summary)
+			s, err := state.Read(args[0])
 			if err != nil {
 				return err
 			}
-			printAgent(s)
+			fmt.Println(valueOr(s.Brief.SourcePath, home.BriefPath(s.ID)))
 			return nil
 		},
 	}
 }
 
-func agentNeedsReviewCmd() *cobra.Command {
+func briefPreviewCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "needs-review <id> [summary]",
-		Short: "Promote a session to the Linear needs-review queue",
-		Args:  cobra.MinimumNArgs(1),
+		Use:   "preview <id>",
+		Short: "Render the session brief",
+		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			summary := ""
-			if len(args) > 1 {
-				summary = joinArgs(args[1:])
-			}
-			s, err := agent.MarkNeedsReview(args[0], summary)
+			rendered, err := agent.PreviewBrief(args[0])
 			if err != nil {
 				return err
 			}
-			printAgent(s)
+			fmt.Println(rendered)
 			return nil
 		},
 	}
 }
 
-func agentAbandonCmd() *cobra.Command {
+func briefPublishCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "abandon <id> [summary]",
-		Short: "Abandon active work and move the Linear issue back to its original queue state",
-		Args:  cobra.MinimumNArgs(1),
+		Use:   "publish <id>",
+		Short: "Publish the session brief to Linear without moving status or closing",
+		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			summary := ""
-			if len(args) > 1 {
-				summary = joinArgs(args[1:])
-			}
-			s, err := agent.Abandon(args[0], summary)
+			_, hash, err := agent.PublishBrief(args[0])
 			if err != nil {
 				return err
 			}
-			printAgent(s)
+			fmt.Println("Published brief:", hash)
 			return nil
+		},
+	}
+}
+
+func briefDiffCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "diff <id>",
+		Short: "Show brief publication state and hashes",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			s, err := state.Read(args[0])
+			if err != nil {
+				return err
+			}
+			rendered, err := agent.PreviewBrief(args[0])
+			if err != nil {
+				return err
+			}
+			fmt.Println("state:", brief.State(s))
+			fmt.Println("current:", brief.Hash(rendered))
+			fmt.Println("published:", valueOr(s.Brief.PublishedHash, "-"))
+			return nil
+		},
+	}
+}
+
+func linearCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "linear", Short: "Linear synchronization and explicit status moves"}
+	cmd.AddCommand(linearMoveCmd())
+	return cmd
+}
+
+func linearMoveCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "move <id> <state>",
+		Short: "Move a Linear issue to an explicitly selected workflow state name or id",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			s, err := agent.MoveLinear(args[0], args[1])
+			if err != nil {
+				return err
+			}
+			fmt.Println("Linear:", valueOr(s.Linear.State, s.Linear.StateID))
+			return nil
+		},
+	}
+}
+
+func sessionCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "session", Short: "Close or forget local cmux sessions"}
+	cmd.AddCommand(sessionCloseCmd(), sessionForgetCmd())
+	return cmd
+}
+
+func sessionCloseCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "close <id>",
+		Short: "Safely close a local session without changing Linear",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return agent.Close(args[0])
+		},
+	}
+}
+
+func sessionForgetCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "forget <id>",
+		Short: "Forget a local session without deleting the workspace",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return agent.Delete(args[0])
 		},
 	}
 }
@@ -763,10 +819,10 @@ func displayName(s tmux.Session) string {
 
 func inventoryType(s types.AgentSession) string {
 	base := string(s.Type)
-	if s.Phase == "" || s.Phase == types.PhaseWork {
+	if s.Profile == "" || s.Profile == types.ProfileGeneral {
 		return base
 	}
-	return base + "/" + s.Phase
+	return base + "/" + string(s.Profile)
 }
 
 func inventoryGitState(s types.AgentSession) string {
@@ -808,12 +864,13 @@ func inventoryPathGitState(path string) string {
 
 func printAgent(s types.AgentSession) {
 	fmt.Printf("%s  %s  %s\n", s.ID, s.Status, s.Title)
-	if s.Phase != "" {
-		fmt.Println("phase:", s.Phase)
+	if s.Profile != "" {
+		fmt.Println("profile:", s.Profile)
 	}
 	fmt.Println("tmux:", s.TmuxSession)
 	fmt.Println("branch:", valueOr(s.Branch, "current"))
 	fmt.Println("workspace:", valueOr(s.WorktreePath, s.RepoPath))
+	fmt.Println("brief:", valueOr(s.Brief.SourcePath, home.BriefPath(s.ID)))
 	if s.Linear.URL != "" {
 		fmt.Println("linear:", s.Linear.URL)
 	}
@@ -828,6 +885,23 @@ func joinArgs(args []string) string {
 		out += arg
 	}
 	return out
+}
+
+func parseProfile(value string) types.AgentProfile {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "plan", "scope", "scoping":
+		return types.ProfilePlan
+	case "implement", "implementation":
+		return types.ProfileImplement
+	case "debug":
+		return types.ProfileDebug
+	case "review", "fix", "review-fix":
+		return types.ProfileReview
+	case "custom":
+		return types.ProfileCustom
+	default:
+		return types.ProfileGeneral
+	}
 }
 
 func resolveSSHHost(target string) ([]string, error) {

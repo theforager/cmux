@@ -74,9 +74,6 @@ func JoinWithPreset(issues []types.LinearIssue, sessions []types.AgentSession, p
 	byIdentifier := map[string]*types.AgentSession{}
 	for i := range sessions {
 		s := sessions[i]
-		if s.Phase == types.PhaseScoping && s.Status == types.StatusDone {
-			continue
-		}
 		if s.Linear.IssueID != "" {
 			byIssueID[s.Linear.IssueID] = &sessions[i]
 		}

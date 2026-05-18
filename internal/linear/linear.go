@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/theforager/cmux/internal/types"
 )
@@ -124,6 +125,43 @@ func ListWorkflowStates() ([]types.LinearWorkflowState, error) {
 		out = append(out, types.LinearWorkflowState{ID: node.ID, Name: node.Name, Type: node.Type, TeamID: node.Team.ID})
 	}
 	return out, nil
+}
+
+func ResolveWorkflowStateID(value, teamID string) (string, error) {
+	states, err := ListWorkflowStates()
+	if err != nil {
+		return "", err
+	}
+	return ResolveWorkflowStateIDFromStates(states, value, teamID)
+}
+
+func ResolveWorkflowStateIDFromStates(states []types.LinearWorkflowState, value, teamID string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	for _, state := range states {
+		if state.ID == value {
+			return state.ID, nil
+		}
+	}
+	var matches []types.LinearWorkflowState
+	for _, state := range states {
+		if strings.EqualFold(strings.TrimSpace(state.Name), value) {
+			matches = append(matches, state)
+		}
+	}
+	if len(matches) == 0 {
+		return "", fmt.Errorf("Linear workflow state not found: %s", value)
+	}
+	if teamID != "" {
+		for _, state := range matches {
+			if state.TeamID == teamID {
+				return state.ID, nil
+			}
+		}
+	}
+	return matches[0].ID, nil
 }
 
 func ListLabels() ([]types.LinearLabel, error) {

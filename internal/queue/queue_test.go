@@ -68,15 +68,15 @@ func TestJoinWithPresetSortsByStateOrderThenManualOrder(t *testing.T) {
 	}
 }
 
-func TestJoinIgnoresDoneScopingSession(t *testing.T) {
+func TestJoinKeepsExistingSessionIndependentOfStatus(t *testing.T) {
 	rows := Join(
 		[]types.LinearIssue{{ID: "issue-id", Identifier: "REB-126"}},
-		[]types.AgentSession{{ID: "REB-126-scope", Phase: types.PhaseScoping, Linear: types.LinearData{IssueID: "issue-id", Identifier: "REB-126"}, Status: types.StatusDone}},
+		[]types.AgentSession{{ID: "REB-126-plan", Profile: types.ProfilePlan, Linear: types.LinearData{IssueID: "issue-id", Identifier: "REB-126"}, Status: types.StatusDone}},
 	)
 	if len(rows) != 1 {
 		t.Fatalf("rows = %d, want 1", len(rows))
 	}
-	if rows[0].Started {
-		t.Fatalf("done scoping session should not claim coding queue row: %+v", rows[0])
+	if !rows[0].Started {
+		t.Fatalf("existing session should claim queue row independently of status: %+v", rows[0])
 	}
 }

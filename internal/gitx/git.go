@@ -1,6 +1,8 @@
 package gitx
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"strings"
@@ -30,6 +32,24 @@ func StatusSummary(cwd string) (bool, string) {
 		summary = strings.Join(lines[:8], "\n") + "\n..."
 	}
 	return true, summary
+}
+
+func Head(cwd string) (string, error) {
+	out, err := process.RunDir(cwd, "git", "rev-parse", "HEAD")
+	return strings.TrimSpace(out), err
+}
+
+func DiffHash(cwd string) (string, error) {
+	out, err := process.RunDir(cwd, "git", "diff", "--binary")
+	if err != nil {
+		return "", err
+	}
+	staged, err := process.RunDir(cwd, "git", "diff", "--cached", "--binary")
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256([]byte(out + "\n" + staged))
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 
 func WorktreeListed(repo, worktree string) bool {

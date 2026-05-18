@@ -20,40 +20,7 @@ func Default() types.Config {
 			{Name: "My Active", AssigneeMode: "viewer", Limit: 8},
 			{Name: "Needs Review", Limit: 8},
 		},
-		Linear: types.LinearConfig{Workflow: DefaultLinearWorkflow()},
 	}
-}
-
-func DefaultLinearWorkflow() types.LinearWorkflowConfig {
-	return types.LinearWorkflowConfig{Transitions: map[string]types.LinearTransition{
-		"start_scoping": {
-			State:        "Scoping",
-			AddLabels:    []string{"cmux"},
-			RemoveLabels: []string{"needs-review"},
-		},
-		"mark_scoped": {
-			State:        "Todo",
-			AddLabels:    []string{"cmux"},
-			RemoveLabels: []string{"needs-review"},
-		},
-		"start_work": {
-			State:        "In Progress",
-			AddLabels:    []string{"cmux"},
-			RemoveLabels: []string{"needs-review"},
-		},
-		"mark_needs_review": {
-			AddLabels: []string{"cmux", "needs-review"},
-		},
-		"done": {
-			State:        "Done",
-			RemoveLabels: []string{"needs-review"},
-			PlaceAtTop:   true,
-		},
-		"abandon": {
-			State:        "$previous_queue_state",
-			RemoveLabels: []string{"needs-review"},
-		},
-	}}
 }
 
 func Load() (types.Config, error) {
@@ -79,9 +46,6 @@ func LoadOrDefault() (types.Config, error) {
 	if len(cfg.QueuePresets) == 0 {
 		def := Default()
 		cfg.QueuePresets = def.QueuePresets
-	}
-	if len(cfg.Linear.Workflow.Transitions) == 0 {
-		cfg.Linear.Workflow = DefaultLinearWorkflow()
 	}
 	if cfg.DefaultQueuePreset == "" && len(cfg.QueuePresets) > 0 {
 		cfg.DefaultQueuePreset = cfg.QueuePresets[0].Name
@@ -218,12 +182,4 @@ func Preset(cfg types.Config, name string) (types.QueuePreset, bool) {
 		}
 	}
 	return types.QueuePreset{}, false
-}
-
-func Transition(cfg types.Config, event string) (types.LinearTransition, bool) {
-	if cfg.Linear.Workflow.Transitions == nil {
-		return types.LinearTransition{}, false
-	}
-	transition, ok := cfg.Linear.Workflow.Transitions[event]
-	return transition, ok
 }

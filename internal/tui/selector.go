@@ -12,12 +12,12 @@ import (
 	"unicode"
 
 	"github.com/theforager/cmux/internal/agent"
+	"github.com/theforager/cmux/internal/brief"
 	"github.com/theforager/cmux/internal/config"
 	"github.com/theforager/cmux/internal/format"
 	"github.com/theforager/cmux/internal/gitx"
 	"github.com/theforager/cmux/internal/home"
 	"github.com/theforager/cmux/internal/queue"
-	"github.com/theforager/cmux/internal/runbook"
 	"github.com/theforager/cmux/internal/state"
 	"github.com/theforager/cmux/internal/tmux"
 	"github.com/theforager/cmux/internal/types"
@@ -39,9 +39,10 @@ type row struct {
 	workspace       string
 	branch          string
 	agent           string
-	runbook         string
+	brief           string
 	linear          string
-	phase           string
+	profile         string
+	briefState      string
 	lastSummary     string
 	linearState     string
 	currentState    string
@@ -144,12 +145,14 @@ type actionDoneMsg struct {
 const (
 	agentModeAuto = iota
 	agentModeFresh
-	agentModeScoping
+	agentModePlan
 	agentModeImplementation
+	agentModeDebug
+	agentModeReview
 )
 
-var agentModeNames = []string{"Fresh", "Scoping", "Implementation"}
-var agentModeValues = []int{agentModeFresh, agentModeScoping, agentModeImplementation}
+var agentModeNames = []string{"Fresh", "Plan", "Implement", "Debug", "Review"}
+var agentModeValues = []int{agentModeFresh, agentModePlan, agentModeImplementation, agentModeDebug, agentModeReview}
 
 const (
 	workspaceModeTerminal = iota
@@ -275,7 +278,11 @@ func queueRows(fullQueue bool, activeTmux map[string]bool) []row {
 	if fullQueue {
 		limit = 50
 	}
-	rows, preset, err := queue.Rows("", limit)
+	fetchLimit := limit
+	if !fullQueue {
+		fetchLimit = 250
+	}
+	rows, preset, err := queue.Rows("", fetchLimit)
 	if err != nil {
 		return []row{{
 			id:     "linear-error",
@@ -289,7 +296,10 @@ func queueRows(fullQueue bool, activeTmux map[string]bool) []row {
 	if len(rows) == 0 {
 		return []row{{id: "linear-empty", title: "No matching Linear issues in " + preset.Name, status: "empty", group: "Linear worklist", kind: "notice"}}
 	}
-	displayLimit := limit
+	return queueRowsFromLinearRows(rows, preset, fullQueue, activeTmux, limit)
+}
+
+func queueRowsFromLinearRows(rows []queue.Row, preset types.QueuePreset, fullQueue bool, activeTmux map[string]bool, displayLimit int) []row {
 	out := make([]row, 0, len(rows))
 	for rank, qr := range rows {
 		if !fullQueue && qr.Started {
@@ -386,7 +396,7 @@ func rawTmuxRow(s tmux.Session) row {
 }
 
 func agentRow(s types.AgentSession, active bool) row {
-	notes := runbook.Read(s.ID)
+	notes := brief.Read(s.ID)
 	preview := notes.Preview()
 	if preview == "" {
 		preview = s.LastSummary
@@ -394,7 +404,7 @@ func agentRow(s types.AgentSession, active bool) row {
 	detail := strings.Join(nonEmpty([]string{
 		"repo: " + s.RepoPath,
 		"workspace: " + valueOr(s.WorktreePath, s.RepoPath),
-		"runbook: " + home.RunbookPath(s.ID),
+		"brief: " + valueOr(s.Brief.SourcePath, home.BriefPath(s.ID)),
 		"linear: " + s.Linear.URL,
 	}), "\n")
 	return row{
@@ -409,10 +419,11 @@ func agentRow(s types.AgentSession, active bool) row {
 		workspace:       valueOr(s.WorktreePath, s.RepoPath),
 		branch:          s.Branch,
 		agent:           valueOr(s.AgentCommand, s.Provider),
-		runbook:         home.RunbookPath(s.ID),
+		brief:           valueOr(s.Brief.SourcePath, home.BriefPath(s.ID)),
 		linear:          s.Linear.URL,
 		linearState:     s.Linear.State,
-		phase:           s.Phase,
+		profile:         string(s.Profile),
+		briefState:      brief.State(s),
 		lastSummary:     s.LastSummary,
 		currentState:    notes.CurrentState,
 		nextAction:      notes.NextAction,
@@ -425,6 +436,7 @@ func agentRow(s types.AgentSession, active bool) row {
 		active:          active,
 		kind:            "session",
 		structured:      true,
+		queueIssue:      s.Linear.Identifier,
 	}
 }
 
@@ -462,10 +474,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		switch msg.id {
-		case "submit":
-			m.message = "Submitted work"
-		case "abandon":
-			m.message = "Abandoned work"
+		case "briefPublish":
+			m.message = "Published brief"
+		case "close":
+			m.message = "Closed session"
+		case "forget":
+			m.message = "Forgot session"
 		default:
 			m.message = ""
 		}
@@ -697,6 +711,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if r, ok := m.current(); ok {
 						selectedID = r.id
 					}
+					m.message = ""
 					if err := m.commitAction(); err != nil {
 						m.message = err.Error()
 					} else {
@@ -727,7 +742,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				} else if m.chosen != "" {
 					return m, tea.Quit
 				} else {
-					m.message = ""
 					if m.mode == before {
 						m.mode = "browse"
 						m.input = ""
@@ -982,8 +996,11 @@ func previewFooterLine(r row) (previewLine, bool) {
 		if r.status == string(types.StatusCrashed) || r.status == string(types.StatusStale) || r.status == string(types.StatusWaiting) {
 			parts = append(parts, r.status)
 		}
-		if r.phase != "" && r.phase != types.PhaseWork {
-			parts = append(parts, r.phase)
+		if r.profile != "" && r.profile != string(types.ProfileGeneral) {
+			parts = append(parts, r.profile)
+		}
+		if r.briefState != "" {
+			parts = append(parts, "brief "+r.briefState)
 		}
 		if r.workspace != "" {
 			parts = append(parts, filepath.Base(r.workspace))
@@ -1018,17 +1035,17 @@ func previewContentLines(r row, max int) []previewLine {
 		return previewTextLines("desc", r.preview, max, false, "")
 	case r.structured:
 		termBudget := terminalPreviewBudget(max, r)
-		runbookBudget := max - termBudget
-		runbookLines := previewRunbookLines(r, runbookBudget)
-		remaining := max - len(runbookLines)
-		if len(runbookLines) > 0 && remaining > termBudget {
+		briefBudget := max - termBudget
+		briefLines := previewBriefLines(r, briefBudget)
+		remaining := max - len(briefLines)
+		if len(briefLines) > 0 && remaining > termBudget {
 			remaining = termBudget
 		}
 		termLines := previewTextLines("term", r.terminalPreview, remaining, true, "dim")
-		if len(runbookLines) == 0 && len(termLines) == 0 {
-			return []previewLine{{label: "summary", value: "No runbook or terminal preview yet.", style: "dim"}}
+		if len(briefLines) == 0 && len(termLines) == 0 {
+			return []previewLine{{label: "summary", value: "No brief or terminal preview yet.", style: "dim"}}
 		}
-		return append(runbookLines, termLines...)
+		return append(briefLines, termLines...)
 	default:
 		return previewTextLines("term", r.terminalPreview, max, true, "")
 	}
@@ -1044,7 +1061,7 @@ func terminalPreviewBudget(max int, r row) int {
 	return min(4, max/3)
 }
 
-func previewRunbookLines(r row, max int) []previewLine {
+func previewBriefLines(r row, max int) []previewLine {
 	lines := []previewLine{}
 	add := func(label, value string) {
 		if len(lines) >= max {
@@ -1196,6 +1213,8 @@ func localStatusLabel(status string) string {
 	switch status {
 	case "not-running":
 		return "stopped"
+	case "stopped":
+		return "stopped"
 	case "waiting_for_input":
 		return "waiting"
 	case "ready_for_review":
@@ -1344,6 +1363,19 @@ func (m *model) commitAction() error {
 			})
 		}
 		return nil
+	case "linearMove":
+		if !hasRow || !isAgentRow(r) {
+			return fmt.Errorf("select a structured agent session")
+		}
+		if value == "" {
+			return fmt.Errorf("enter a Linear state name or id")
+		}
+		s, err := agent.MoveLinear(r.id, value)
+		if err != nil {
+			return err
+		}
+		m.message = "Linear: " + valueOr(s.Linear.State, s.Linear.StateID)
+		return nil
 	case "delete":
 		if !hasRow {
 			return fmt.Errorf("no session selected")
@@ -1380,30 +1412,6 @@ func (m *model) commitAction() error {
 		}
 		_, err := agent.SetStatus(r.id, m.pending, value)
 		return err
-	case "scopedSummary":
-		if !hasRow || !isAgentRow(r) {
-			return fmt.Errorf("select a structured agent session")
-		}
-		_, err := agent.MarkScoped(r.id, value)
-		return err
-	case "needsReviewSummary":
-		if !hasRow || !isAgentRow(r) {
-			return fmt.Errorf("select a structured agent session")
-		}
-		_, err := agent.MarkNeedsReview(r.id, value)
-		return err
-	case "doneSummary":
-		if !hasRow || !isAgentRow(r) {
-			return fmt.Errorf("select a structured agent session")
-		}
-		_, err := agent.Complete(r.id, value)
-		return err
-	case "abandonSummary":
-		if !hasRow || !isAgentRow(r) {
-			return fmt.Errorf("select a structured agent session")
-		}
-		_, err := agent.Abandon(r.id, value)
-		return err
 	default:
 		return nil
 	}
@@ -1418,7 +1426,7 @@ func (m *model) createWithAgent(agentCommand string) error {
 		}
 		abs, _ := filepath.Abs(target)
 		title := filepath.Base(abs)
-		_, err := agent.Start(agent.StartOptions{Cwd: abs, Scratch: true, Title: title, Agent: agentCommand})
+		_, err := agent.Start(agent.StartOptions{Cwd: abs, Scratch: true, Title: title, Agent: agentCommand, Profile: types.ProfileGeneral})
 		return err
 	case "start":
 		target := strings.TrimSpace(m.target)
@@ -1426,10 +1434,10 @@ func (m *model) createWithAgent(agentCommand string) error {
 			return fmt.Errorf("enter a Linear issue key or task title")
 		}
 		if issuePattern.MatchString(target) {
-			_, err := agent.Start(agent.StartOptions{Cwd: ".", IssueKey: target, Agent: agentCommand})
+			_, err := agent.Start(agent.StartOptions{Cwd: ".", IssueKey: target, Agent: agentCommand, Profile: types.ProfileImplement})
 			return err
 		}
-		_, err := agent.Start(agent.StartOptions{Cwd: ".", Title: target, Worktree: true, Agent: agentCommand})
+		_, err := agent.Start(agent.StartOptions{Cwd: ".", Title: target, Worktree: true, Agent: agentCommand, Profile: types.ProfileImplement})
 		return err
 	case "queue":
 		targets := splitTargets(m.target)
@@ -1442,7 +1450,7 @@ func (m *model) createWithAgent(agentCommand string) error {
 		cwd := valueOr(m.createRepo, ".")
 		var first types.AgentSession
 		for _, target := range targets {
-			s, err := agent.Start(agent.StartOptions{Cwd: cwd, IssueKey: target, Agent: agentCommand})
+			s, err := agent.Start(agent.StartOptions{Cwd: cwd, IssueKey: target, Agent: agentCommand, Profile: types.ProfileImplement})
 			if err != nil {
 				return err
 			}
@@ -1465,7 +1473,7 @@ func (m *model) createWithAgent(agentCommand string) error {
 		cwd := valueOr(m.createRepo, ".")
 		var first types.AgentSession
 		for _, target := range targets {
-			s, err := agent.Start(agent.StartOptions{Cwd: cwd, IssueKey: target, Agent: agentCommand, Fresh: true})
+			s, err := agent.Start(agent.StartOptions{Cwd: cwd, IssueKey: target, Agent: agentCommand, Profile: profileForAgentMode(m.agentMode), Fresh: true})
 			if err != nil {
 				return err
 			}
@@ -1477,7 +1485,7 @@ func (m *model) createWithAgent(agentCommand string) error {
 			m.chosen = first.TmuxSession
 		}
 		return nil
-	case "queueScope":
+	case "queuePlan":
 		targets := splitTargets(m.target)
 		if len(targets) == 0 {
 			return fmt.Errorf("select a Linear issue")
@@ -1488,7 +1496,7 @@ func (m *model) createWithAgent(agentCommand string) error {
 		cwd := valueOr(m.createRepo, ".")
 		var first types.AgentSession
 		for _, target := range targets {
-			s, err := agent.Start(agent.StartOptions{Cwd: cwd, IssueKey: target, Agent: agentCommand, Scoping: true})
+			s, err := agent.Start(agent.StartOptions{Cwd: cwd, IssueKey: target, Agent: agentCommand, Profile: types.ProfilePlan})
 			if err != nil {
 				return err
 			}
@@ -1615,16 +1623,20 @@ func (m model) actionMenu() string {
 
 func actionSection(id string) string {
 	switch id {
-	case "agentOpen", "workspaceOpen", "startSelected":
-		return "Open"
-	case "submit", "abandon":
-		return "Finish"
-	case "detail", "path":
+	case "agentOpen", "startSelected":
+		return "Agent"
+	case "workspaceOpen":
+		return "Workspace"
+	case "briefPublish":
+		return "Brief"
+	case "linearMove":
+		return "Linear"
+	case "detail":
 		return "Inspect"
-	case "title", "rename":
+	case "close", "forget", "title", "rename":
 		return "Session"
 	case "deleteWorktree", "delete":
-		return "Advanced"
+		return "Recovery"
 	default:
 		return ""
 	}
@@ -1786,7 +1798,7 @@ func (m model) detailView() string {
 		label := fmt.Sprintf("%-10s", item[0]+":")
 		b.WriteString(cyan.Render(label) + item[1] + "\n")
 	}
-	b.WriteString("\n" + dim.Render("── runbook ─────────────────────────────────────────") + "\n")
+	b.WriteString("\n" + dim.Render("── brief ───────────────────────────────────────────") + "\n")
 	writeDetailSection(&b, "Current", r.currentState)
 	writeDetailSection(&b, "Next", r.nextAction)
 	writeDetailSection(&b, "Blockers", r.blockers)
@@ -1847,13 +1859,15 @@ func (m model) prompt() string {
 		return renderPromptInput("session name", m.input) + dim.Render("enter save · esc cancel")
 	case "title":
 		return renderPromptInput("display name", m.input) + dim.Render("enter save · esc cancel")
+	case "linearMove":
+		return renderPromptInput("Linear state", m.input) + dim.Render("state name or id · enter move · esc cancel")
 	case "delete":
 		if r, ok := m.current(); ok && !isAgentRow(r) {
 			return m.confirmPrompt("Kill session", []string{"Close this unmanaged tmux session."})
 		}
-		return m.confirmPrompt("Stop session", []string{"Stop the agent session.", "Keep the workspace and branch."})
+		return m.confirmPrompt("Forget session", []string{"Stop the agent session.", "Keep the workspace and branch.", "Do not change Linear."})
 	case "close":
-		return m.confirmPrompt("Stop and clean up", []string{"Stop the agent session.", "Remove a clean cmux-owned worktree.", "Refuse if the workspace has uncommitted changes."})
+		return m.confirmPrompt("Stop and clean up", []string{"Stop the agent session.", "Remove a clean cmux-owned worktree.", "Refuse if workspace is dirty or brief has unpublished changes."})
 	case "cleanup":
 		return red.Render("delete worktree? enter y if clean, or type session id to force  ") + dim.Render("dirty worktrees are refused unless forced · esc cancel")
 	case "reset":
@@ -1876,14 +1890,6 @@ func (m model) prompt() string {
 		}, "\n")
 	case "statusSummary":
 		return renderPromptInput("summary for "+string(m.pending), m.input) + dim.Render("enter save · esc cancel")
-	case "scopedSummary":
-		return renderPromptInput("scoped handoff", m.input) + dim.Render("updates Linear with scope and moves forward · esc cancel")
-	case "needsReviewSummary":
-		return renderPromptInput("review handoff", m.input) + dim.Render("updates Linear for review · esc cancel")
-	case "doneSummary":
-		return renderPromptInput("completion summary", m.input) + dim.Render("moves Linear issue to Done · esc cancel")
-	case "abandonSummary":
-		return renderPromptInput("abandon summary", m.input) + dim.Render("moves Linear back to original queue state · esc cancel")
 	default:
 		return ""
 	}
@@ -2129,20 +2135,23 @@ func (m *model) chooseAction() (tea.Cmd, error) {
 		m.workspaceMode = workspaceModeTerminal
 		m.workspacePick = 0
 		m.message = ""
-	case "submit":
+	case "briefPublish":
 		if !isAgentRow(r) {
 			return nil, fmt.Errorf("select a structured agent session")
 		}
 		m.mode = "busy"
-		m.message = "Submitting work..."
-		return m.runLongAction("submit", r), nil
-	case "abandon":
+		m.message = "Publishing brief..."
+		return m.runLongAction("briefPublish", r), nil
+	case "close":
 		if !isAgentRow(r) {
 			return nil, fmt.Errorf("select a structured agent session")
 		}
 		m.mode = "busy"
-		m.message = "Abandoning work..."
-		return m.runLongAction("abandon", r), nil
+		m.message = "Closing session..."
+		return m.runLongAction("close", r), nil
+	case "forget":
+		m.mode = "delete"
+		m.input = ""
 	case "rename":
 		if !r.active {
 			return nil, fmt.Errorf("session is not running")
@@ -2155,6 +2164,12 @@ func (m *model) chooseAction() (tea.Cmd, error) {
 		}
 		m.mode = "title"
 		m.input = r.title
+	case "linearMove":
+		if !isAgentRow(r) || r.linear == "" {
+			return nil, fmt.Errorf("select a Linear-backed session")
+		}
+		m.mode = "linearMove"
+		m.input = ""
 	case "delete":
 		m.mode = "delete"
 		m.input = ""
@@ -2169,46 +2184,15 @@ func (m *model) runLongAction(id string, r row) tea.Cmd {
 	return func() tea.Msg {
 		var err error
 		switch id {
-		case "submit":
-			err = m.submitAndClose(r)
-		case "abandon":
-			err = m.abandonAndClose(r)
+		case "briefPublish":
+			_, _, err = agent.PublishBrief(r.id)
+		case "close":
+			err = agent.Close(r.id)
 		default:
 			err = fmt.Errorf("unknown action: %s", id)
 		}
 		return actionDoneMsg{id: id, selectID: r.id, err: err}
 	}
-}
-
-func (m *model) submitAndClose(r row) error {
-	if err := preflightSubmitClose(r); err != nil {
-		return err
-	}
-	switch submitMode(r) {
-	case "scopedSummary":
-		if _, err := agent.MarkScoped(r.id, ""); err != nil {
-			return err
-		}
-	case "doneSummary":
-		if _, err := agent.Complete(r.id, ""); err != nil {
-			return err
-		}
-	default:
-		if _, err := agent.MarkNeedsReview(r.id, ""); err != nil {
-			return err
-		}
-	}
-	return agent.Close(r.id)
-}
-
-func (m *model) abandonAndClose(r row) error {
-	if _, err := agent.Abandon(r.id, ""); err != nil {
-		return err
-	}
-	if isCmuxOwnedSeparateWorktree(r) {
-		return agent.CleanupWorktree(r.id, true)
-	}
-	return agent.Delete(r.id)
 }
 
 func preflightSubmitClose(r row) error {
@@ -2219,7 +2203,7 @@ func preflightSubmitClose(r row) error {
 		}
 	}
 	if r.workspace != "" && r.repo != "" && r.workspace != r.repo && !isCmuxOwnedSeparateWorktree(r) {
-		return fmt.Errorf("worktree is outside cmux worktrees; submit will not close it: %s", r.workspace)
+		return fmt.Errorf("worktree is outside cmux worktrees; close will not remove it: %s", r.workspace)
 	}
 	return nil
 }
@@ -2270,7 +2254,7 @@ func (m *model) startQueueFlow(useSelected bool, scoping bool) error {
 	}
 	m.create = "queue"
 	if scoping {
-		m.create = "queueScope"
+		m.create = "queuePlan"
 	}
 	m.createRepo = r.repo
 	m.target = strings.Join(selected, ",")
@@ -2382,12 +2366,12 @@ func (m *model) chooseAgentAction() error {
 			return fmt.Errorf("session is not running")
 		}
 		m.chosen = r.session
+	case "stopExisting":
+		return m.stopCurrent()
 	case "restartExisting":
-		s, err := m.restartCurrent()
-		if err != nil {
-			return err
-		}
-		m.chosen = s.TmuxSession
+		return m.restartCurrent()
+	case "startFreshExisting":
+		return m.startFreshCurrent(choice.command)
 	case "startAgent":
 		return m.startAgentFromPanel(choice.command)
 	default:
@@ -2404,6 +2388,21 @@ func (m *model) startAgentFromPanel(command string) error {
 	m.mode = "repoPick"
 	m.repoSelected = 0
 	m.message = ""
+	return nil
+}
+
+func (m *model) startFreshCurrent(command string) error {
+	r, ok := m.current()
+	if !ok || !isAgentRow(r) {
+		return fmt.Errorf("select a structured agent session")
+	}
+	_, err := agent.Fresh(r.id, command, profileForAgentMode(m.agentMode))
+	if err != nil {
+		return err
+	}
+	m.mode = "browse"
+	m.message = "Started fresh agent"
+	m.reloadRows(r.id)
 	return nil
 }
 
@@ -2426,8 +2425,10 @@ func (m *model) prepareAgentStart() error {
 	m.create = "queue"
 	if mode == agentModeFresh {
 		m.create = "queueFresh"
-	} else if mode == agentModeScoping {
-		m.create = "queueScope"
+	} else if mode == agentModePlan {
+		m.create = "queuePlan"
+	} else {
+		m.create = "queue"
 	}
 	m.createRepo = valueOr(r.repo, ".")
 	m.target = issue
@@ -2592,10 +2593,20 @@ func editorLabel(command string) string {
 
 func agentActionChoices(r row, mode int) []agentActionChoice {
 	if r.structured {
+		resolved := agentModeLabel(resolvedAgentMode(r, mode))
+		agentCommand := valueOr(r.agent, "claude")
 		if r.active {
-			return []agentActionChoice{{id: "openExisting", label: "Current agent", description: "attach to running agent"}}
+			return []agentActionChoice{
+				{id: "openExisting", label: "Open agent", description: "attach to running agent"},
+				{id: "stopExisting", label: "Stop agent", description: "stop tmux agent, keep session and workspace"},
+				{id: "restartExisting", label: "Restart agent", description: "restart in the existing workspace"},
+				{id: "startFreshExisting", label: "Start fresh agent", command: agentCommand, description: agentCommand + " · " + resolved},
+			}
 		}
-		return []agentActionChoice{{id: "restartExisting", label: "Restart agent", description: "restart in the existing workspace"}}
+		return []agentActionChoice{
+			{id: "restartExisting", label: "Restart agent", description: "restart in the existing workspace"},
+			{id: "startFreshExisting", label: "Start fresh agent", command: agentCommand, description: agentCommand + " · " + resolved},
+		}
 	}
 	if r.kind != "queue" {
 		if r.active {
@@ -2624,28 +2635,24 @@ func agentActionChoices(r row, mode int) []agentActionChoice {
 }
 
 func resolvedAgentMode(r row, selected int) int {
-	if selected == agentModeFresh || selected == agentModeScoping || selected == agentModeImplementation {
+	if selected == agentModeFresh || selected == agentModePlan || selected == agentModeImplementation || selected == agentModeDebug || selected == agentModeReview {
 		return selected
 	}
 	return autoAgentMode(r)
 }
 
 func autoAgentMode(r row) int {
-	if r.phase == types.PhaseScoping {
-		return agentModeScoping
-	}
-	state := strings.ToLower(strings.TrimSpace(r.linearState))
-	switch state {
-	case "backlog", "scoping":
-		return agentModeScoping
-	case "todo", "in progress", "in_progress", "started", "review", "needs review", "needs-review":
-		return agentModeImplementation
-	default:
-		if r.queueIssue != "" {
-			return agentModeScoping
-		}
+	switch types.AgentProfile(r.profile) {
+	case types.ProfilePlan:
+		return agentModePlan
+	case types.ProfileDebug:
+		return agentModeDebug
+	case types.ProfileReview:
+		return agentModeReview
+	case types.ProfileImplement:
 		return agentModeImplementation
 	}
+	return agentModeImplementation
 }
 
 func agentModeIndex(mode int) int {
@@ -2661,12 +2668,29 @@ func agentModeLabel(mode int) string {
 	switch mode {
 	case agentModeFresh:
 		return "Fresh"
-	case agentModeScoping:
-		return "Scoping"
+	case agentModePlan:
+		return "Plan"
 	case agentModeImplementation:
-		return "Implementation"
+		return "Implement"
+	case agentModeDebug:
+		return "Debug"
+	case agentModeReview:
+		return "Review"
 	default:
 		return "Auto"
+	}
+}
+
+func profileForAgentMode(mode int) types.AgentProfile {
+	switch mode {
+	case agentModePlan:
+		return types.ProfilePlan
+	case agentModeDebug:
+		return types.ProfileDebug
+	case agentModeReview:
+		return types.ProfileReview
+	default:
+		return types.ProfileImplement
 	}
 }
 
@@ -2744,10 +2768,12 @@ func actionsFor(r row, fullQueue bool) []menuChoice {
 			actions = append(actions, menuChoice{id: "workspaceOpen", label: "Open workspace...", description: "terminal, editor, and remote commands"})
 		}
 		actions = append(actions,
-			menuChoice{id: "submit", label: "Submit work", description: submitDescription(r)},
-			menuChoice{id: "abandon", label: "Abandon", description: "move this attempt back to the queue", danger: true},
-			menuChoice{id: "detail", label: "Details", description: "show runbook and output"},
+			menuChoice{id: "briefPublish", label: "Publish brief", description: briefPublishDescription(r)},
+			menuChoice{id: "linearMove", label: "Move issue to...", description: "explicit Linear status change"},
+			menuChoice{id: "detail", label: "Details", description: "show brief and output"},
 			menuChoice{id: "title", label: "Rename session", description: "change display name"},
+			menuChoice{id: "close", label: "Close session", description: "safe close without changing Linear"},
+			menuChoice{id: "forget", label: "Forget session", description: "forget local state and keep workspace", danger: true},
 		)
 		if r.workspace != "" && r.repo != "" && r.workspace != r.repo {
 			actions = append(actions, menuChoice{id: "deleteWorktree", label: "Delete worktree", description: "remove the cmux worktree only", danger: true})
@@ -2767,30 +2793,11 @@ func actionsFor(r row, fullQueue bool) []menuChoice {
 	)
 }
 
-func submitDescription(r row) string {
-	switch submitMode(r) {
-	case "scopedSummary":
-		return "publish scoped handoff and move forward"
-	case "doneSummary":
-		return "complete the issue"
-	default:
-		return "publish handoff for review"
+func briefPublishDescription(r row) string {
+	if r.briefState == "" {
+		return "publish without moving Linear or closing"
 	}
-}
-
-func submitMode(r row) string {
-	if r.phase == types.PhaseScoping {
-		return "scopedSummary"
-	}
-	status := strings.ToLower(string(r.status))
-	state := strings.ToLower(strings.TrimSpace(r.linearState))
-	if status == string(types.StatusReadyForReview) || status == string(types.StatusPROpened) || state == "ready for review" || state == "review" {
-		return "doneSummary"
-	}
-	if r.linear == "" {
-		return "doneSummary"
-	}
-	return "needsReviewSummary"
+	return r.briefState
 }
 
 func newChoices() []menuChoice {
@@ -3005,15 +3012,17 @@ func isSpaceToggleKey(msg tea.KeyMsg) bool {
 	return false
 }
 
-func (m *model) restartCurrent() (types.AgentSession, error) {
+func (m *model) restartCurrent() error {
 	r, ok := m.current()
 	if !ok || !isAgentRow(r) {
-		return types.AgentSession{}, fmt.Errorf("select a structured agent session")
+		return fmt.Errorf("select a structured agent session")
 	}
 	s, err := agent.Restart(r.id)
 	if err != nil {
-		return s, err
+		return err
 	}
+	m.mode = "browse"
+	m.message = "Restarted agent"
 	rows, err := loadRows(m.fullQueue, false)
 	if err == nil {
 		m.rows = rows
@@ -3025,7 +3034,21 @@ func (m *model) restartCurrent() (types.AgentSession, error) {
 			}
 		}
 	}
-	return s, nil
+	return nil
+}
+
+func (m *model) stopCurrent() error {
+	r, ok := m.current()
+	if !ok || !isAgentRow(r) {
+		return fmt.Errorf("select a structured agent session")
+	}
+	if err := agent.Kill(r.id); err != nil {
+		return err
+	}
+	m.message = "Stopped agent"
+	m.mode = "browse"
+	m.reloadRows(r.id)
+	return nil
 }
 
 func (m *model) applyFilter() {
@@ -3117,11 +3140,12 @@ func detailItems(r row) [][2]string {
 	values := [][2]string{
 		{"session", r.session},
 		{"agent", r.agent},
-		{"phase", r.phase},
+		{"profile", r.profile},
 		{"branch", valueOr(r.branch, "current")},
 		{"workspace", r.workspace},
 		{"repo", r.repo},
-		{"runbook", r.runbook},
+		{"brief", r.brief},
+		{"brief state", r.briefState},
 		{"linear", r.linear},
 		{"summary", r.lastSummary},
 	}
@@ -3156,7 +3180,7 @@ func cleanDetail(value string) string {
 }
 
 func renderMessage(message string) string {
-	if strings.HasPrefix(message, "Workspace:") || strings.HasPrefix(message, "Opened in editor:") || strings.HasPrefix(message, "Command:") || strings.HasPrefix(message, "SSH target:") {
+	if strings.HasPrefix(message, "Workspace:") || strings.HasPrefix(message, "Opened in editor:") || strings.HasPrefix(message, "Command:") || strings.HasPrefix(message, "SSH target:") || strings.HasPrefix(message, "Linear:") || strings.HasPrefix(message, "Published") || strings.HasPrefix(message, "Closed") || strings.HasPrefix(message, "Forgot") || strings.HasPrefix(message, "Stopped") || strings.HasPrefix(message, "Restarted") || strings.HasPrefix(message, "Started") || strings.HasPrefix(message, "Title") {
 		return cyan.Render(message)
 	}
 	return red.Render("Error: " + message)

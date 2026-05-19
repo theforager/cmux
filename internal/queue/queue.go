@@ -75,13 +75,21 @@ func JoinWithPreset(issues []types.LinearIssue, sessions []types.AgentSession, p
 	for i := range sessions {
 		s := sessions[i]
 		if s.Linear.IssueID != "" {
-			byIssueID[s.Linear.IssueID] = &sessions[i]
+			if _, exists := byIssueID[s.Linear.IssueID]; !exists {
+				byIssueID[s.Linear.IssueID] = &sessions[i]
+			}
 		}
 		if s.Linear.Identifier != "" {
-			byIdentifier[strings.ToUpper(s.Linear.Identifier)] = &sessions[i]
+			key := strings.ToUpper(s.Linear.Identifier)
+			if _, exists := byIdentifier[key]; !exists {
+				byIdentifier[key] = &sessions[i]
+			}
 		}
 		if s.ID != "" {
-			byIdentifier[strings.ToUpper(s.ID)] = &sessions[i]
+			key := strings.ToUpper(s.ID)
+			if _, exists := byIdentifier[key]; !exists {
+				byIdentifier[key] = &sessions[i]
+			}
 		}
 	}
 	rows := make([]Row, 0, len(issues))

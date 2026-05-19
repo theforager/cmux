@@ -347,7 +347,7 @@ func agentStartCmd() *cobra.Command {
 			if len(args) > 0 {
 				issue = args[0]
 			}
-			s, err := agent.Start(agent.StartOptions{Cwd: ".", IssueKey: issue, Title: title, Agent: agentCommand, Profile: parseProfile(profile), Worktree: worktree, NoWorktree: noWorktree, PrepareOnly: prepare})
+			s, err := agent.Start(agent.StartOptions{Cwd: ".", IssueKey: issue, Title: title, Agent: agentCommand, AgentSet: cmd.Flags().Changed("agent"), Profile: parseProfile(profile), ProfileSet: cmd.Flags().Changed("profile"), Worktree: worktree, NoWorktree: noWorktree, PrepareOnly: prepare})
 			if err != nil {
 				return err
 			}
@@ -371,11 +371,18 @@ func agentFreshCmd() *cobra.Command {
 		Short: "Start a fresh agent with the selected profile and current context",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			s, err := agent.Fresh(args[0], agentCommand, parseProfile(profile))
-			if err != nil {
-				s, err = agent.Start(agent.StartOptions{Cwd: ".", IssueKey: args[0], Agent: agentCommand, Profile: parseProfile(profile), Fresh: true})
-			}
-			if err != nil {
+			var s types.AgentSession
+			if _, err := state.Read(args[0]); err == nil {
+				s, err = agent.Fresh(args[0], agentCommand, parseProfile(profile))
+				if err != nil {
+					return err
+				}
+			} else if os.IsNotExist(err) {
+				s, err = agent.Start(agent.StartOptions{Cwd: ".", IssueKey: args[0], Agent: agentCommand, AgentSet: cmd.Flags().Changed("agent"), Profile: parseProfile(profile), ProfileSet: cmd.Flags().Changed("profile"), Fresh: true})
+				if err != nil {
+					return err
+				}
+			} else {
 				return err
 			}
 			printAgent(s)
@@ -393,7 +400,7 @@ func agentScratchCmd() *cobra.Command {
 		Use:   "scratch",
 		Short: "Start a scratch agent",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			s, err := agent.Start(agent.StartOptions{Cwd: ".", Scratch: true, Title: title, Agent: agentCommand, Profile: parseProfile(profile)})
+			s, err := agent.Start(agent.StartOptions{Cwd: ".", Scratch: true, Title: title, Agent: agentCommand, AgentSet: cmd.Flags().Changed("agent"), Profile: parseProfile(profile), ProfileSet: cmd.Flags().Changed("profile")})
 			if err != nil {
 				return err
 			}

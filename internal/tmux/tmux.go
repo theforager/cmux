@@ -175,6 +175,24 @@ func EnsurePopupBinding() error {
 	return err
 }
 
+func SuspendMouse() func() {
+	if !Inside() || !Exists() {
+		return func() {}
+	}
+	previous, err := process.Run("tmux", "show-option", "-gqv", "mouse")
+	if err != nil {
+		return func() {}
+	}
+	previous = strings.TrimSpace(previous)
+	if previous == "" {
+		previous = "off"
+	}
+	_, _ = process.Run("tmux", "set-option", "-gq", "mouse", "off")
+	return func() {
+		_, _ = process.Run("tmux", "set-option", "-gq", "mouse", previous)
+	}
+}
+
 func AttachOrSwitch(name string) error {
 	_ = EnsureKeyOptions()
 	if Inside() {

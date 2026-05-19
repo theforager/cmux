@@ -25,10 +25,12 @@ type StartOptions struct {
 	Scratch     bool
 	Fresh       bool
 	Profile     types.AgentProfile
+	ProfileSet  bool
 	Worktree    bool
 	NoWorktree  bool
 	PrepareOnly bool
 	Agent       string
+	AgentSet    bool
 }
 
 func Provider(command string) string {
@@ -55,9 +57,6 @@ func Start(o StartOptions) (types.AgentSession, error) {
 	if o.Agent == "" {
 		o.Agent = "claude"
 	}
-	if !process.Exists(firstWord(o.Agent)) {
-		return types.AgentSession{}, fmt.Errorf("agent command not found: %s", firstWord(o.Agent))
-	}
 	if o.Scratch {
 		return startScratch(o)
 	}
@@ -81,12 +80,15 @@ func startIssue(o StartOptions) (types.AgentSession, error) {
 		sessionID = issue.Identifier + "-fresh"
 	}
 	if existing, err := state.Read(sessionID); err == nil {
-		if strings.TrimSpace(o.Agent) != "" {
+		existing = normalizeExistingSession(existing)
+		if o.AgentSet {
 			existing.AgentCommand = o.Agent
 			existing.Provider = Provider(o.Agent)
 		}
-		existing.Profile = profile
-		existing.Brief.Kind = briefKindForProfile(profile)
+		if o.ProfileSet {
+			existing.Profile = profile
+			existing.Brief.Kind = briefKindForProfile(profile)
+		}
 		existing.Brief.SourcePath = home.BriefPath(existing.ID)
 		existing.Title = issue.Title
 		existing.Linear.IssueID = issue.ID
@@ -98,6 +100,9 @@ func startIssue(o StartOptions) (types.AgentSession, error) {
 			existing.Branch = issue.BranchName
 		}
 		existing = normalizeExistingSession(existing)
+		if err := ensureBrief(existing, issue); err != nil {
+			return existing, err
+		}
 		if o.PrepareOnly || sessionAlive(existing.TmuxSession) {
 			_ = state.Write(existing)
 			return existing, nil
@@ -107,6 +112,11 @@ func startIssue(o StartOptions) (types.AgentSession, error) {
 	repo := o.Cwd
 	worktree := o.Cwd
 	branch := ""
+	if !o.PrepareOnly {
+		if err := ensureAgentCommandAvailable(o.Agent); err != nil {
+			return types.AgentSession{}, err
+		}
+	}
 	if !o.NoWorktree {
 		repo, branch, worktree, err = gitx.EnsureWorktree(o.Cwd, sessionID, issue.Title, issue.BranchName)
 		if err != nil {
@@ -145,13 +155,33 @@ func startTask(o StartOptions) (types.AgentSession, error) {
 	id := "task-" + format.Slug(o.Title)
 	if existing, err := state.Read(id); err == nil {
 		existing = normalizeExistingSession(existing)
-		_ = state.Write(existing)
-		return existing, nil
+		if o.AgentSet {
+			existing.AgentCommand = o.Agent
+			existing.Provider = Provider(o.Agent)
+		}
+		if o.ProfileSet {
+			existing.Profile = normalizeProfile(o.Profile)
+			existing.Brief.Kind = briefKindForProfile(existing.Profile)
+		}
+		existing = normalizeExistingSession(existing)
+		if err := ensureBrief(existing, types.LinearIssue{}); err != nil {
+			return existing, err
+		}
+		if o.PrepareOnly || sessionAlive(existing.TmuxSession) {
+			_ = state.Write(existing)
+			return existing, nil
+		}
+		return restartSession(existing, types.LinearIssue{})
 	}
 	repo := o.Cwd
 	worktree := o.Cwd
 	branch := ""
 	var err error
+	if !o.PrepareOnly {
+		if err := ensureAgentCommandAvailable(o.Agent); err != nil {
+			return types.AgentSession{}, err
+		}
+	}
 	if o.Worktree {
 		repo, branch, worktree, err = gitx.EnsureWorktree(o.Cwd, id, o.Title, "")
 		if err != nil {
@@ -187,6 +217,9 @@ func startTask(o StartOptions) (types.AgentSession, error) {
 }
 
 func startScratch(o StartOptions) (types.AgentSession, error) {
+	if err := ensureAgentCommandAvailable(o.Agent); err != nil {
+		return types.AgentSession{}, err
+	}
 	id, err := state.NextScratchID()
 	if err != nil {
 		return types.AgentSession{}, err
@@ -219,6 +252,9 @@ func startScratch(o StartOptions) (types.AgentSession, error) {
 }
 
 func launch(s types.AgentSession, issue types.LinearIssue) error {
+	if err := ensureAgentCommandAvailable(s.AgentCommand); err != nil {
+		return err
+	}
 	if err := tmux.Create(tmux.CreateOptions{Name: s.TmuxSession, Dir: s.WorktreePath, Command: s.AgentCommand, Title: s.Title, Agent: s.Provider}); err != nil {
 		return err
 	}
@@ -369,7 +405,8 @@ func Close(id string) error {
 	}
 	if s.Linear.IssueID != "" {
 		switch state := brief.State(s); state {
-		case "not published", "changed since publish", "publish failed":
+		case "published":
+		default:
 			return fmt.Errorf("brief %s; publish brief or forget session to keep local state", state)
 		}
 	}
@@ -486,8 +523,8 @@ func CleanupWorktree(id string, force bool) error {
 	if !hasSeparateWorktree(s) {
 		return fmt.Errorf("session has no separate worktree")
 	}
-	if !worktreeOwnedByCmux(s) && !force {
-		return fmt.Errorf("worktree is outside cmux worktrees; refusing cleanup without force: %s", s.WorktreePath)
+	if !worktreeOwnedByCmux(s) {
+		return fmt.Errorf("worktree is outside cmux worktrees; refusing cleanup: %s", s.WorktreePath)
 	}
 	if other, ok := otherSessionUsingWorktree(s); ok {
 		return fmt.Errorf("worktree is also used by session %s", other)
@@ -681,6 +718,12 @@ func normalizeExistingSession(s types.AgentSession) types.AgentSession {
 }
 
 func normalizeAgentCommandForSession(s types.AgentSession) types.AgentSession {
+	if strings.TrimSpace(s.AgentCommand) == "" {
+		s.AgentCommand = os.Getenv("CMUX_AGENT")
+	}
+	if strings.TrimSpace(s.AgentCommand) == "" {
+		s.AgentCommand = "claude"
+	}
 	detected := Provider(s.AgentCommand)
 	if detected != "custom" {
 		s.Provider = detected
@@ -794,12 +837,28 @@ func truncPromptContext(value string, max int) string {
 }
 
 func firstWord(command string) string {
+	command = strings.TrimSpace(command)
 	for i, r := range command {
 		if r == ' ' || r == '\t' {
 			return command[:i]
 		}
 	}
 	return command
+}
+
+func commandExecutable(command string) string {
+	return strings.Trim(strings.TrimSpace(firstWord(command)), `"'`)
+}
+
+func ensureAgentCommandAvailable(command string) error {
+	executable := commandExecutable(command)
+	if executable == "" {
+		return fmt.Errorf("agent command is required")
+	}
+	if !process.Exists(executable) {
+		return fmt.Errorf("agent command not found: %s", executable)
+	}
+	return nil
 }
 
 func normalizeProfile(profile types.AgentProfile) types.AgentProfile {

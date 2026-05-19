@@ -82,6 +82,27 @@ func TestFreshAgentModeUsesFreshCreation(t *testing.T) {
 	}
 }
 
+func TestDebugReviewAgentModeIsPreservedForQueueStart(t *testing.T) {
+	m := model{filtered: []row{{id: "REB-1", kind: "queue", queueIssue: "REB-1", repo: "/tmp/repo"}}, agentMode: agentModeDebug}
+	if err := m.prepareAgentStart(); err != nil {
+		t.Fatal(err)
+	}
+	if m.create != "queue" {
+		t.Fatalf("create = %q, want queue", m.create)
+	}
+	if got := profileForAgentMode(m.agentMode); got != types.ProfileDebug {
+		t.Fatalf("profile = %s, want debug", got)
+	}
+
+	m.agentMode = agentModeReview
+	if err := m.prepareAgentStart(); err != nil {
+		t.Fatal(err)
+	}
+	if got := profileForAgentMode(m.agentMode); got != types.ProfileReview {
+		t.Fatalf("profile = %s, want review", got)
+	}
+}
+
 func TestAgentPanelStartPromptsForRepo(t *testing.T) {
 	m := model{filtered: []row{{id: "REB-1", kind: "queue", queueIssue: "REB-1", repo: "/tmp/repo"}}, agentMode: agentModeImplementation}
 	if err := m.startAgentFromPanel("codex"); err != nil {
@@ -95,6 +116,20 @@ func TestAgentPanelStartPromptsForRepo(t *testing.T) {
 	}
 	if m.create != "queue" || m.target != "REB-1" || m.createRepo != "/tmp/repo" {
 		t.Fatalf("create state = %q/%q/%q", m.create, m.target, m.createRepo)
+	}
+}
+
+func TestManualIssueOrTaskStartPromptsForRepoBeforeAgent(t *testing.T) {
+	t.Setenv("LINEAR_API_KEY", "test")
+	m := model{mode: "start", input: "REB-1"}
+	if err := m.commitAction(); err != nil {
+		t.Fatal(err)
+	}
+	if m.mode != "repoPick" {
+		t.Fatalf("mode = %q, want repoPick", m.mode)
+	}
+	if m.create != "start" || m.target != "REB-1" {
+		t.Fatalf("create state = %q/%q", m.create, m.target)
 	}
 }
 
@@ -113,12 +148,15 @@ func TestStructuredAgentPanelOffersRuntimeControls(t *testing.T) {
 	for _, choice := range choices {
 		got = append(got, choice.id)
 	}
-	want := []string{"openExisting", "stopExisting", "restartExisting", "startFreshExisting"}
+	want := []string{"openExisting", "stopExisting", "restartExisting", "startFreshExisting", "startFreshExisting", "startFreshExisting"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("agentActionChoices = %#v, want %#v", got, want)
 	}
-	if choices[3].command != "codex" || !strings.Contains(choices[3].description, "Review") {
-		t.Fatalf("fresh choice = %+v, want codex review", choices[3])
+	if choices[3].command != "codex" || choices[3].label != "Fresh current" || !strings.Contains(choices[3].description, "Review") {
+		t.Fatalf("fresh current choice = %+v, want codex review", choices[3])
+	}
+	if choices[len(choices)-1].label != "Fresh custom" || !choices[len(choices)-1].custom {
+		t.Fatalf("last fresh choice = %+v, want custom", choices[len(choices)-1])
 	}
 }
 
@@ -129,9 +167,39 @@ func TestStoppedStructuredAgentPanelOffersRestartAndFresh(t *testing.T) {
 	for _, choice := range choices {
 		got = append(got, choice.id)
 	}
-	want := []string{"restartExisting", "startFreshExisting"}
+	want := []string{"restartExisting", "startFreshExisting", "startFreshExisting", "startFreshExisting"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("agentActionChoices = %#v, want %#v", got, want)
+	}
+}
+
+func TestStructuredFreshCustomPromptsForAgentCommand(t *testing.T) {
+	m := model{
+		filtered: []row{{
+			id:         "REB-1",
+			agent:      "codex",
+			structured: true,
+			active:     true,
+		}},
+		agentMode: agentModeDebug,
+	}
+	choices := agentActionChoices(m.filtered[0], m.agentMode)
+	customIndex := -1
+	for i, choice := range choices {
+		if choice.custom {
+			customIndex = i
+			break
+		}
+	}
+	if customIndex < 0 {
+		t.Fatal("custom fresh choice not found")
+	}
+	m.agentPick = customIndex
+	if err := m.chooseAgentAction(); err != nil {
+		t.Fatal(err)
+	}
+	if m.mode != "agentCustom" || m.create != "freshExisting" || m.target != "REB-1" {
+		t.Fatalf("mode/create/target = %q/%q/%q, want custom fresh", m.mode, m.create, m.target)
 	}
 }
 
@@ -229,6 +297,39 @@ func TestPublishBriefActionRunsAsBusyCommand(t *testing.T) {
 	}
 }
 
+func TestCloseActionRequiresConfirmation(t *testing.T) {
+	r := row{
+		id:         "REB-1",
+		status:     string(types.StatusRunning),
+		workspace:  "/tmp/cmux-worktree",
+		repo:       "/tmp/repo",
+		structured: true,
+		active:     true,
+	}
+	actions := actionsFor(r, false)
+	closeIndex := -1
+	for i, action := range actions {
+		if action.id == "close" {
+			closeIndex = i
+			break
+		}
+	}
+	if closeIndex < 0 {
+		t.Fatal("close action not found")
+	}
+	m := model{filtered: []row{r}, mode: "actionMenu", actionSelected: closeIndex, selectedQueue: map[string]bool{}}
+	cmd, err := m.chooseAction()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cmd != nil {
+		t.Fatal("close should not run before confirmation")
+	}
+	if m.mode != "close" {
+		t.Fatalf("mode = %q, want close confirmation", m.mode)
+	}
+}
+
 func TestLocalStateClusterKeepsBadgesWithCmuxState(t *testing.T) {
 	r := row{status: string(types.StatusWaiting), workspaceShells: []string{"cmux@workspace@REB-1"}}
 	if got := localStateCluster(r); got != "▲ waiting ⧉" {
@@ -244,5 +345,13 @@ func TestCmuxOwnedSeparateWorktree(t *testing.T) {
 	r := row{repo: "/tmp/repo", workspace: "/not/cmux/worktree"}
 	if isCmuxOwnedSeparateWorktree(r) {
 		t.Fatal("external worktree should not be treated as cmux-owned")
+	}
+}
+
+func TestQueuePathActionShowsLinearURL(t *testing.T) {
+	m := model{filtered: []row{{id: "REB-1", kind: "queue", queueIssue: "REB-1", linear: "https://linear.app/acme/issue/REB-1"}}}
+	m.showWorkspacePath()
+	if m.message != "Linear: https://linear.app/acme/issue/REB-1" {
+		t.Fatalf("message = %q", m.message)
 	}
 }

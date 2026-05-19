@@ -80,3 +80,22 @@ func TestJoinKeepsExistingSessionIndependentOfStatus(t *testing.T) {
 		t.Fatalf("existing session should claim queue row independently of status: %+v", rows[0])
 	}
 }
+
+func TestJoinPrefersFirstMatchingSession(t *testing.T) {
+	rows := Join(
+		[]types.LinearIssue{{ID: "issue-id", Identifier: "REB-127"}},
+		[]types.AgentSession{
+			{ID: "REB-127", Linear: types.LinearData{IssueID: "issue-id", Identifier: "REB-127"}, Status: types.StatusRunning},
+			{ID: "REB-127-old", Linear: types.LinearData{IssueID: "issue-id", Identifier: "REB-127"}, Status: types.StatusDone},
+		},
+	)
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(rows))
+	}
+	if rows[0].Session == nil || rows[0].Session.ID != "REB-127" {
+		t.Fatalf("session = %+v, want first matching session", rows[0].Session)
+	}
+	if rows[0].Status != types.StatusRunning {
+		t.Fatalf("status = %s, want running", rows[0].Status)
+	}
+}

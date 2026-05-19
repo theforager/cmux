@@ -26,6 +26,8 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+const resetMouseReporting = "\x1b[?9l\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l"
+
 type row struct {
 	id              string
 	title           string
@@ -177,6 +179,8 @@ func Run(popup bool) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	restoreMouse := prepareCopyFriendlyTerminal()
+	defer restoreMouse()
 	m := model{rows: rows, filtered: rows, mode: "browse", width: 80, height: 24, selectedQueue: map[string]bool{}}
 	p := tea.NewProgram(m)
 	final, err := p.Run()
@@ -194,6 +198,8 @@ func RunQueue() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	restoreMouse := prepareCopyFriendlyTerminal()
+	defer restoreMouse()
 	m := model{rows: rows, filtered: rows, mode: "browse", width: 80, height: 24, fullQueue: true, selectedQueue: map[string]bool{}}
 	p := tea.NewProgram(m)
 	final, err := p.Run()
@@ -204,6 +210,14 @@ func RunQueue() (string, error) {
 		return m.chosen, nil
 	}
 	return "", nil
+}
+
+func prepareCopyFriendlyTerminal() func() {
+	// cmux does not use mouse input. Disabling inherited mouse-reporting and
+	// tmux mouse mode while the selector is open keeps normal drag-to-select
+	// copying available inside the popup/menu.
+	fmt.Fprint(os.Stdout, resetMouseReporting)
+	return tmux.SuspendMouse()
 }
 
 func loadRows(fullQueue bool, refreshLinear bool) ([]row, error) {
@@ -1277,32 +1291,24 @@ func (m *model) commitAction() error {
 		}
 		m.target = value
 		m.create = "start"
-		m.mode = "agentPick"
-		m.agentSelected = 0
+		m.createRepo = defaultRepoPath()
+		m.agentMode = agentModeImplementation
+		m.mode = "repoPick"
+		m.repoSelected = 0
 		m.input = ""
 		return nil
 	case "repoPath":
 		if value == "" {
 			return fmt.Errorf("enter a repository path")
 		}
-		abs, err := filepath.Abs(value)
+		root, err := normalizeRepoPath(value)
 		if err != nil {
 			return err
 		}
-		info, err := os.Stat(abs)
-		if err != nil {
+		if err := config.RememberRepo(root); err != nil {
 			return err
 		}
-		if !info.IsDir() {
-			return fmt.Errorf("repository path is not a directory: %s", abs)
-		}
-		if _, err := gitx.Root(abs); err != nil {
-			return fmt.Errorf("not a git repository: %s; choose a repo for Linear work or use Scratch session for non-git folders", abs)
-		}
-		if err := config.RememberRepo(abs); err != nil {
-			return err
-		}
-		m.createRepo = abs
+		m.createRepo = root
 		m.mode = "agentPick"
 		m.agentSelected = 0
 		m.input = ""
@@ -1426,18 +1432,20 @@ func (m *model) createWithAgent(agentCommand string) error {
 		}
 		abs, _ := filepath.Abs(target)
 		title := filepath.Base(abs)
-		_, err := agent.Start(agent.StartOptions{Cwd: abs, Scratch: true, Title: title, Agent: agentCommand, Profile: types.ProfileGeneral})
+		_, err := agent.Start(agent.StartOptions{Cwd: abs, Scratch: true, Title: title, Agent: agentCommand, AgentSet: true, Profile: types.ProfileGeneral, ProfileSet: true})
 		return err
 	case "start":
 		target := strings.TrimSpace(m.target)
 		if target == "" {
 			return fmt.Errorf("enter a Linear issue key or task title")
 		}
+		cwd := valueOr(m.createRepo, ".")
+		profile := profileForAgentMode(m.agentMode)
 		if issuePattern.MatchString(target) {
-			_, err := agent.Start(agent.StartOptions{Cwd: ".", IssueKey: target, Agent: agentCommand, Profile: types.ProfileImplement})
+			_, err := agent.Start(agent.StartOptions{Cwd: cwd, IssueKey: target, Agent: agentCommand, AgentSet: true, Profile: profile, ProfileSet: true})
 			return err
 		}
-		_, err := agent.Start(agent.StartOptions{Cwd: ".", Title: target, Worktree: true, Agent: agentCommand, Profile: types.ProfileImplement})
+		_, err := agent.Start(agent.StartOptions{Cwd: cwd, Title: target, Worktree: true, Agent: agentCommand, AgentSet: true, Profile: profile, ProfileSet: true})
 		return err
 	case "queue":
 		targets := splitTargets(m.target)
@@ -1450,7 +1458,7 @@ func (m *model) createWithAgent(agentCommand string) error {
 		cwd := valueOr(m.createRepo, ".")
 		var first types.AgentSession
 		for _, target := range targets {
-			s, err := agent.Start(agent.StartOptions{Cwd: cwd, IssueKey: target, Agent: agentCommand, Profile: types.ProfileImplement})
+			s, err := agent.Start(agent.StartOptions{Cwd: cwd, IssueKey: target, Agent: agentCommand, AgentSet: true, Profile: profileForAgentMode(m.agentMode), ProfileSet: true})
 			if err != nil {
 				return err
 			}
@@ -1473,7 +1481,7 @@ func (m *model) createWithAgent(agentCommand string) error {
 		cwd := valueOr(m.createRepo, ".")
 		var first types.AgentSession
 		for _, target := range targets {
-			s, err := agent.Start(agent.StartOptions{Cwd: cwd, IssueKey: target, Agent: agentCommand, Profile: profileForAgentMode(m.agentMode), Fresh: true})
+			s, err := agent.Start(agent.StartOptions{Cwd: cwd, IssueKey: target, Agent: agentCommand, AgentSet: true, Profile: profileForAgentMode(m.agentMode), ProfileSet: true, Fresh: true})
 			if err != nil {
 				return err
 			}
@@ -1496,7 +1504,7 @@ func (m *model) createWithAgent(agentCommand string) error {
 		cwd := valueOr(m.createRepo, ".")
 		var first types.AgentSession
 		for _, target := range targets {
-			s, err := agent.Start(agent.StartOptions{Cwd: cwd, IssueKey: target, Agent: agentCommand, Profile: types.ProfilePlan})
+			s, err := agent.Start(agent.StartOptions{Cwd: cwd, IssueKey: target, Agent: agentCommand, AgentSet: true, Profile: types.ProfilePlan, ProfileSet: true})
 			if err != nil {
 				return err
 			}
@@ -1507,6 +1515,18 @@ func (m *model) createWithAgent(agentCommand string) error {
 		if len(targets) == 1 && first.TmuxSession != "" {
 			m.chosen = first.TmuxSession
 		}
+		return nil
+	case "freshExisting":
+		target := strings.TrimSpace(m.target)
+		if target == "" {
+			return fmt.Errorf("select a structured agent session")
+		}
+		if _, err := agent.Fresh(target, agentCommand, profileForAgentMode(m.agentMode)); err != nil {
+			return err
+		}
+		m.mode = "browse"
+		m.message = "Started fresh agent"
+		m.reloadRows(target)
 		return nil
 	default:
 		return fmt.Errorf("no pending session creation")
@@ -2146,9 +2166,8 @@ func (m *model) chooseAction() (tea.Cmd, error) {
 		if !isAgentRow(r) {
 			return nil, fmt.Errorf("select a structured agent session")
 		}
-		m.mode = "busy"
-		m.message = "Closing session..."
-		return m.runLongAction("close", r), nil
+		m.mode = "close"
+		m.input = ""
 	case "forget":
 		m.mode = "delete"
 		m.input = ""
@@ -2255,6 +2274,9 @@ func (m *model) startQueueFlow(useSelected bool, scoping bool) error {
 	m.create = "queue"
 	if scoping {
 		m.create = "queuePlan"
+		m.agentMode = agentModePlan
+	} else {
+		m.agentMode = agentModeImplementation
 	}
 	m.createRepo = r.repo
 	m.target = strings.Join(selected, ",")
@@ -2283,7 +2305,11 @@ func (m *model) chooseRepo() error {
 		m.input = defaultRepoPath()
 		return nil
 	}
-	m.createRepo = choice.path
+	root, err := normalizeRepoPath(choice.path)
+	if err != nil {
+		return err
+	}
+	m.createRepo = root
 	if m.createCustom {
 		m.createCustom = false
 		m.mode = "agentCustom"
@@ -2351,6 +2377,14 @@ func (m *model) chooseAgentAction() error {
 		return fmt.Errorf("%s", choice.description)
 	}
 	if choice.custom {
+		if r.structured {
+			m.create = "freshExisting"
+			m.target = r.id
+			m.mode = "agentCustom"
+			m.input = ""
+			m.message = ""
+			return nil
+		}
 		if err := m.prepareAgentStart(); err != nil {
 			return err
 		}
@@ -2422,6 +2456,7 @@ func (m *model) prepareAgentStart() error {
 		return fmt.Errorf("no Linear issue selected")
 	}
 	mode := resolvedAgentMode(r, m.agentMode)
+	m.agentMode = mode
 	m.create = "queue"
 	if mode == agentModeFresh {
 		m.create = "queueFresh"
@@ -2595,18 +2630,19 @@ func agentActionChoices(r row, mode int) []agentActionChoice {
 	if r.structured {
 		resolved := agentModeLabel(resolvedAgentMode(r, mode))
 		agentCommand := valueOr(r.agent, "claude")
+		freshChoices := freshAgentChoices(agentCommand, resolved)
 		if r.active {
-			return []agentActionChoice{
+			choices := []agentActionChoice{
 				{id: "openExisting", label: "Open agent", description: "attach to running agent"},
 				{id: "stopExisting", label: "Stop agent", description: "stop tmux agent, keep session and workspace"},
 				{id: "restartExisting", label: "Restart agent", description: "restart in the existing workspace"},
-				{id: "startFreshExisting", label: "Start fresh agent", command: agentCommand, description: agentCommand + " · " + resolved},
 			}
+			return append(choices, freshChoices...)
 		}
-		return []agentActionChoice{
+		choices := []agentActionChoice{
 			{id: "restartExisting", label: "Restart agent", description: "restart in the existing workspace"},
-			{id: "startFreshExisting", label: "Start fresh agent", command: agentCommand, description: agentCommand + " · " + resolved},
 		}
+		return append(choices, freshChoices...)
 	}
 	if r.kind != "queue" {
 		if r.active {
@@ -2629,6 +2665,34 @@ func agentActionChoices(r row, mode int) []agentActionChoice {
 			label:       choice.label,
 			command:     choice.command,
 			description: choice.command + " · " + resolved,
+		})
+	}
+	return choices
+}
+
+func freshAgentChoices(currentCommand, resolved string) []agentActionChoice {
+	choices := []agentActionChoice{{
+		id:          "startFreshExisting",
+		label:       "Fresh current",
+		command:     currentCommand,
+		description: currentCommand + " · " + resolved,
+	}}
+	seen := map[string]bool{strings.TrimSpace(currentCommand): true}
+	for _, choice := range agentChoices {
+		if choice.custom {
+			choices = append(choices, agentActionChoice{id: "startFreshExisting", label: "Fresh custom", description: "type command · " + resolved, custom: true})
+			continue
+		}
+		command := strings.TrimSpace(choice.command)
+		if command == "" || seen[command] {
+			continue
+		}
+		seen[command] = true
+		choices = append(choices, agentActionChoice{
+			id:          "startFreshExisting",
+			label:       "Fresh " + choice.label,
+			command:     command,
+			description: command + " · " + resolved,
 		})
 	}
 	return choices
@@ -2840,6 +2904,10 @@ func (m model) selectedQueueIssues() []string {
 }
 
 func (m *model) showWorkspacePath() {
+	if r, ok := m.current(); ok && r.kind == "queue" && !r.structured && r.linear != "" {
+		m.message = "Linear: " + r.linear
+		return
+	}
 	path, err := m.workspacePath()
 	if err != nil {
 		m.message = err.Error()
@@ -3290,5 +3358,31 @@ func defaultRepoPath() string {
 	if err != nil {
 		return wd
 	}
+	if root, err := gitx.Root(abs); err == nil && root != "" {
+		return root
+	}
 	return abs
+}
+
+func normalizeRepoPath(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", fmt.Errorf("enter a repository path")
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("repository path is not a directory: %s", abs)
+	}
+	root, err := gitx.Root(abs)
+	if err != nil {
+		return "", fmt.Errorf("not a git repository: %s; choose a repo for Linear work or use Scratch session for non-git folders", abs)
+	}
+	return root, nil
 }
